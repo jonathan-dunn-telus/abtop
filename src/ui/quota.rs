@@ -7,6 +7,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 use super::{btop_block_active, fmt_tokens, grad_at, make_gradient, remaining_bar, styled_label};
 
@@ -30,14 +31,11 @@ pub(crate) fn draw_quota_panel_active(
     let cpu_grad = make_gradient(theme.cpu_grad.start, theme.cpu_grad.mid, theme.cpu_grad.end);
 
     let block = btop_block_active("quota", "²", theme.cpu_box, theme, active);
+    let inner = block.inner(area);
     f.render_widget(block, area);
-
-    let inner = Rect {
-        x: area.x + 1,
-        y: area.y + 1,
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
-    };
+    if inner.is_empty() {
+        return;
+    }
 
     // Bottom summary: total tokens + rate
     let total_tokens: u64 = app.sessions.iter().map(|s| s.total_tokens()).sum();
@@ -50,7 +48,9 @@ pub(crate) fn draw_quota_panel_active(
     // source has no data yet.
     let num_sources = SOURCES.len() as u16;
     let col_w = inner.width / num_sources;
-    let content_h = inner.height.saturating_sub(1); // reserve last row for totals
+    // Keep both quota windows before spending a row on aggregate usage.
+    let show_summary = inner.height >= 4;
+    let content_h = inner.height - u16::from(show_summary);
 
     for (i, source) in SOURCES.iter().enumerate() {
         let col_x = inner.x + (i as u16) * col_w;
@@ -73,7 +73,11 @@ pub(crate) fn draw_quota_panel_active(
         draw_source_column(f, col_area, source, rl, &cpu_grad, theme);
     }
 
-    // Total tokens summary on last row (full width)
+    if !show_summary {
+        return;
+    }
+
+    // Total tokens summary on last row (full width); the rate yields first.
     let bottom_area = Rect {
         x: inner.x,
         y: inner.y + content_h,
@@ -81,19 +85,17 @@ pub(crate) fn draw_quota_panel_active(
         height: 1,
     };
     let total_label = t("quota.total");
-    f.render_widget(
-        Paragraph::new(vec![Line::from(vec![
-            Span::styled(
-                format!(" {} {}", total_label, fmt_tokens(total_tokens)),
-                Style::default().fg(theme.main_fg),
-            ),
-            Span::styled(
-                format!(" {}/min", fmt_tokens(tokens_per_min as u64)),
-                Style::default().fg(theme.graph_text),
-            ),
-        ])]),
-        bottom_area,
-    );
+    let total_text = format!(" {} {}", total_label, fmt_tokens(total_tokens));
+    let rate_text = format!(" {}/min", fmt_tokens(tokens_per_min as u64));
+    let show_rate = total_text.width() + rate_text.width() <= inner.width as usize;
+    let mut spans = vec![Span::styled(total_text, Style::default().fg(theme.main_fg))];
+    if show_rate {
+        spans.push(Span::styled(
+            rate_text,
+            Style::default().fg(theme.graph_text),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), bottom_area);
 }
 
 fn draw_source_column(
@@ -104,9 +106,6 @@ fn draw_source_column(
     cpu_grad: &[ratatui::style::Color; 101],
     theme: &Theme,
 ) {
-    let col_w_usize = area.width as usize;
-    let bar_w = col_w_usize.saturating_sub(10).clamp(2, 8);
-
     let Some(rl) = rl else {
         let hint = if source.eq_ignore_ascii_case("claude") {
             t("quota.abtop_setup")
@@ -165,74 +164,90 @@ fn draw_source_column(
     // get the bar (the % is approximately correct) but no countdown row.
     let show_reset = !is_stale;
 
-    if let Some(used_pct) = rl.five_hour_pct {
+    let compact = area.height < 5;
+    for (used_pct, reset_at, window_minutes, fallback) in [
+        (
+            rl.five_hour_pct,
+            rl.five_hour_resets_at,
+            rl.five_hour_window_minutes,
+            t("quota.5h"),
+        ),
+        (
+            rl.seven_day_pct,
+            rl.seven_day_resets_at,
+            rl.seven_day_window_minutes,
+            t("quota.7d"),
+        ),
+    ] {
+        let Some(used_pct) = used_pct else { continue };
         let remaining = (100.0 - used_pct).clamp(0.0, 100.0);
+        let label = format!(" {}", format_window_label(window_minutes, fallback));
+        let percentage = format!(" {:>3.0}%", remaining);
+        let text_width = label.width() + percentage.width();
+        let width = area.width as usize;
+        let reset_width = if compact {
+            width.saturating_sub(text_width + 2)
+        } else {
+            width.saturating_sub(2)
+        };
         let reset = if show_reset {
-            rl.five_hour_resets_at
-                .map(format_reset_time)
+            reset_at
+                .map(|timestamp| fitting_reset_time(timestamp, reset_width))
                 .unwrap_or_default()
         } else {
             String::new()
         };
-        let c = grad_at(cpu_grad, used_pct);
-        let label_5h = format_window_label(rl.five_hour_window_minutes, t("quota.5h"));
-        let mut s = vec![styled_label(
-            format!(" {}", label_5h).as_str(),
-            theme.graph_text,
-        )];
-        s.extend(remaining_bar(remaining, bar_w, cpu_grad, theme.meter_bg));
-        s.push(Span::styled(
-            format!(" {:>3.0}%", remaining),
-            Style::default().fg(c),
-        ));
-        lines.push(Line::from(s));
-        // Always reserve the row so both columns line up vertically;
-        // when there's nothing meaningful to show (stale source or the
-        // cached reset moment is past), render it blank.
-        lines.push(Line::from(Span::styled(
-            if reset.is_empty() {
-                String::new()
-            } else {
-                format!("  {}", reset)
-            },
-            Style::default().fg(theme.graph_text),
-        )));
-    }
-    if let Some(used_pct) = rl.seven_day_pct {
-        let remaining = (100.0 - used_pct).clamp(0.0, 100.0);
-        let reset = if show_reset {
-            rl.seven_day_resets_at
-                .map(format_reset_time)
-                .unwrap_or_default()
+        let inline_reset = if compact && !reset.is_empty() {
+            format!("  {reset}")
         } else {
             String::new()
         };
+        // Bars yield to complete percentages and inline reset times.
+        let bar_w = width
+            .saturating_sub(text_width + inline_reset.width())
+            .min(8);
         let c = grad_at(cpu_grad, used_pct);
-        let label_7d = format_window_label(rl.seven_day_window_minutes, t("quota.7d"));
-        let mut s = vec![styled_label(
-            format!(" {}", label_7d).as_str(),
-            theme.graph_text,
-        )];
+        let mut s = vec![styled_label(&label, theme.graph_text)];
         s.extend(remaining_bar(remaining, bar_w, cpu_grad, theme.meter_bg));
+        s.push(Span::styled(percentage, Style::default().fg(c)));
         s.push(Span::styled(
-            format!(" {:>3.0}%", remaining),
-            Style::default().fg(c),
+            inline_reset,
+            Style::default().fg(theme.graph_text),
         ));
         lines.push(Line::from(s));
-        // Always reserve the row so both columns line up vertically;
-        // when there's nothing meaningful to show (stale source or the
-        // cached reset moment is past), render it blank.
-        lines.push(Line::from(Span::styled(
-            if reset.is_empty() {
-                String::new()
-            } else {
-                format!("  {}", reset)
-            },
-            Style::default().fg(theme.graph_text),
-        )));
+        if !compact {
+            // Reserve the row for both sources even without fresh reset data.
+            lines.push(Line::from(Span::styled(
+                if reset.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {reset}")
+                },
+                Style::default().fg(theme.graph_text),
+            )));
+        }
     }
 
     f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Prefer the full countdown, then its largest unit; never clip a unit suffix.
+fn fitting_reset_time(reset_ts: u64, width: usize) -> String {
+    let full = format_reset_time(reset_ts);
+    if full.width() <= width {
+        return full;
+    }
+    // format_reset_time emits a prefix and one or two space-separated units.
+    let short = full
+        .split_whitespace()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if short.width() <= width {
+        short
+    } else {
+        String::new()
+    }
 }
 
 fn format_window_label(window_minutes: Option<u64>, fallback: String) -> String {
@@ -280,5 +295,63 @@ pub(crate) fn format_reset_time(reset_ts: u64) -> String {
         let d = diff / 86400;
         let h = (diff % 86400) / 3600;
         format!("{} {}{} {}{}", prefix, d, t("time.d"), h, t("time.h"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn render(app: &App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|f| draw_quota_panel(f, app, f.area(), &app.theme))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn quota_bars_yield_to_complete_percentages_and_reset_units() {
+        let mut app = App::new_with_config(Theme::default(), &[], Default::default());
+        crate::demo::populate_demo(&mut app);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for limit in &mut app.rate_limits {
+            limit.five_hour_pct = Some(0.0);
+            limit.seven_day_pct = Some(100.0);
+            limit.five_hour_resets_at = Some(now + 3 * 3600 + 30 * 60);
+            limit.seven_day_resets_at = Some(now + 5 * 86400 + 12 * 3600);
+            limit.updated_at = Some(now);
+        }
+        // Each source gets only eight columns: labels and percentages fit,
+        // while bars disappear and countdowns shorten to complete units.
+        let rows = render(&app, 18, 8);
+        assert_eq!(rows[2].matches("100%").count(), 2, "{rows:?}");
+        assert_eq!(rows[4].matches("  0%").count(), 2, "{rows:?}");
+        assert_eq!(rows[3].matches("in 3h").count(), 2, "{rows:?}");
+        assert_eq!(rows[5].matches("in 5d").count(), 2, "{rows:?}");
+
+        // At minimum height, resets share rows with their windows and the
+        // aggregate summary disappears before either quota window does.
+        let rows = render(&app, 60, 5);
+        assert_eq!(rows[2].matches("100%").count(), 2, "{rows:?}");
+        assert_eq!(rows[2].matches("in 3h").count(), 2, "{rows:?}");
+        assert_eq!(rows[3].matches("  0%").count(), 2, "{rows:?}");
+        assert_eq!(rows[3].matches("in 5d").count(), 2, "{rows:?}");
+        assert!(!rows.join("\n").contains("total"));
+
+        for limit in &mut app.rate_limits {
+            limit.updated_at = Some(now - STALE_SECS - 1);
+        }
+        let rows = render(&app, 60, 5);
+        assert!(!rows.join("\n").contains("in "));
+        assert_eq!(rows[2].matches("100%").count(), 2);
+        assert_eq!(rows[3].matches("  0%").count(), 2);
     }
 }

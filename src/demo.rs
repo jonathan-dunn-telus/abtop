@@ -1,6 +1,6 @@
 use crate::app::App;
 use crate::model::{
-    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface,
+    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface, ModelUsage,
     OrphanPort, RateLimitInfo, SessionStatus, SubAgent, ToolCall,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -37,6 +37,7 @@ pub fn populate_demo(app: &mut App) {
             total_output_tokens: 12_800,
             total_cache_read: 1_420_000,
             total_cache_create: 185_000,
+            model_usage: Vec::new(),
             turn_count: 34,
             current_tasks: vec!["Edit src/checkout/payment.rs".into()],
             mem_mb: 342,
@@ -269,6 +270,7 @@ pub fn populate_demo(app: &mut App) {
             total_output_tokens: 38_000,
             total_cache_read: 2_100_000,
             total_cache_create: 280_000,
+            model_usage: Vec::new(),
             turn_count: 71,
             current_tasks: vec!["waiting for user input".into()],
             mem_mb: 128,
@@ -327,6 +329,7 @@ pub fn populate_demo(app: &mut App) {
             total_output_tokens: 2_800,
             total_cache_read: 320_000,
             total_cache_create: 45_000,
+            model_usage: Vec::new(),
             turn_count: 12,
             current_tasks: vec!["Bash npm run dev".into()],
             mem_mb: 86,
@@ -432,6 +435,7 @@ pub fn populate_demo(app: &mut App) {
             total_output_tokens: 1_400,
             total_cache_read: 85_000,
             total_cache_create: 12_000,
+            model_usage: Vec::new(),
             turn_count: 6,
             current_tasks: vec!["Write src/charts/heatmap.py".into()],
             mem_mb: 64,
@@ -487,6 +491,7 @@ pub fn populate_demo(app: &mut App) {
             total_output_tokens: 3_800,
             total_cache_read: 0,
             total_cache_create: 0,
+            model_usage: Vec::new(),
             turn_count: 9,
             current_tasks: vec!["thinking...".into()],
             mem_mb: 156,
@@ -515,6 +520,17 @@ pub fn populate_demo(app: &mut App) {
             file_accesses: vec![],
         },
     ];
+
+    for session in &mut app.sessions {
+        let total = session.total_tokens();
+        let child_tokens: u64 = session.subagents.iter().map(|child| child.tokens).sum();
+        ModelUsage::add(
+            &mut session.model_usage,
+            &session.model,
+            total - child_tokens,
+        );
+        ModelUsage::add(&mut session.model_usage, "claude-haiku-4-5", child_tokens);
+    }
 
     // --- Summaries (pre-populated, no LLM calls) ---
     app.summaries.insert(

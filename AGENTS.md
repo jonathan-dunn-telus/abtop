@@ -22,8 +22,8 @@ src/
 ├── app.rs                  # App state, tick logic, key handling, summary generation
 ├── setup.rs                # StatusLine hook installation (abtop --setup)
 ├── ui/
-│   └── mod.rs              # All panels in single file: header, context, quota,
-│                           # tokens, projects, ports, sessions, footer
+│   ├── mod.rs              # Panel layout and rendering orchestration
+│   └── models.rs           # Selected-session model token totals and shares
 ├── collector/
 │   ├── mod.rs              # MultiCollector orchestration, orphan port detection
 │   ├── claude.rs           # Claude Code: session discovery, transcript parsing
@@ -70,14 +70,17 @@ src/
 
 Panel rendering priority (top to bottom):
 1. **Sessions** — always visible, gets priority allocation (min 5 rows, ideal = 2/session + 7)
-2. **Mid-tier** (quota, tokens, projects, ports) — split equally, shown if space allows
+2. **Mid-tier** (quota, tokens, models, projects, ports, MCP) — reserve minimum pane widths, then share surplus equally; switch to tabs when enabled panes cannot fit (134 columns with all enabled)
 3. **Context** — only renders when sessions have ideal height AND surplus >= 5 rows
 4. **Header** (1 row) + **Footer** (1 row) — always present
+
+The narrow Usage tab reserves rows for both quota windows, all token categories, and Models. Context hides first when height is limited without changing persisted visibility. Short quota panes show reset countdowns inline; bars and aggregate summaries yield before quota values. Mouse targeting and keyboard zoom use the visible layout.
 
 Panel descriptions:
 - **¹context**: Left = token rate braille sparkline (200-point history). Right = per-session context % bars with yellow/red warning.
 - **²quota**: Claude + Codex rate limit gauges side-by-side (5h and 7d windows with reset countdown). Quota is intentionally limited to Claude and Codex; do not add an OpenCode row unless OpenCode exposes a reliable account-level provider rate-limit source.
 - **³tokens**: Total token breakdown (in/out/cache) + per-turn sparkline for selected session.
+- **⁸models**: Lifetime token totals and percentage share per model for the selected session. Enabled by default beside Tokens and in the narrow-terminal Usage tab; `8` toggles persisted `show_models`. Includes Claude's tracked subagents and nested workflow agents; Codex and OpenCode retain selected-session-only scope. Model totals match the Tokens pane, including cache tokens. Missing attribution uses `Unknown`; overflow uses `Other (N)`. JSON snapshots expose the complete `model_usage` list.
 - **projects** (always visible): Per-project git branch + added/modified file counts.
 - **⁴ports**: Agent-spawned open ports + orphan ports (from dead sessions). Conflict detection.
 - **⁵sessions**: Full-width panel below mid row. Session list table (top) + selected session detail (bottom), separated by divider.
@@ -279,6 +282,7 @@ Tracks child processes that have open ports. When a parent session dies but the 
 | `X` | Kill all orphan ports |
 | `q` | Quit |
 | `r` | Force refresh |
+| `8` | Toggle Models pane |
 
 ## Tech Stack
 

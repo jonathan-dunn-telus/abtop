@@ -5,6 +5,7 @@ pub struct PanelVisibility {
     pub context: bool,
     pub quota: bool,
     pub tokens: bool,
+    pub models: bool,
     pub projects: bool,
     pub ports: bool,
     pub sessions: bool,
@@ -17,6 +18,7 @@ impl Default for PanelVisibility {
             context: true,
             quota: true,
             tokens: true,
+            models: true,
             projects: true,
             ports: true,
             sessions: true,
@@ -100,6 +102,7 @@ fn parse_config_body(content: &str) -> AppConfig {
                 "show_context" => config.panels.context = parse_bool(val).unwrap_or(true),
                 "show_quota" => config.panels.quota = parse_bool(val).unwrap_or(true),
                 "show_tokens" => config.panels.tokens = parse_bool(val).unwrap_or(true),
+                "show_models" => config.panels.models = parse_bool(val).unwrap_or(true),
                 "show_projects" => config.panels.projects = parse_bool(val).unwrap_or(true),
                 "show_ports" => config.panels.ports = parse_bool(val).unwrap_or(true),
                 "show_sessions" => config.panels.sessions = parse_bool(val).unwrap_or(true),
@@ -163,6 +166,7 @@ pub fn save_panel_visibility(panels: &PanelVisibility) -> Result<(), String> {
         ("show_context", panels.context.to_string()),
         ("show_quota", panels.quota.to_string()),
         ("show_tokens", panels.tokens.to_string()),
+        ("show_models", panels.models.to_string()),
         ("show_projects", panels.projects.to_string()),
         ("show_ports", panels.ports.to_string()),
         ("show_sessions", panels.sessions.to_string()),
@@ -306,6 +310,21 @@ mod tests {
         assert!(!after.contains("show_quota = true"));
         assert!(after.contains("show_projects = false"));
         assert!(after.contains("theme = \"btop\""));
+    }
+
+    #[test]
+    fn models_visibility_defaults_on_and_round_trips_without_changing_other_keys() {
+        assert!(parse_config_body("").panels.models);
+        assert!(parse_config_body("show_models = invalid").panels.models);
+        let before = "theme = \"btop\"\nshow_tokens = false\n";
+        let disabled = rewrite_kv_lines(before, &[("show_models", "false".to_string())]);
+        let config = parse_config_body(&disabled);
+        assert!(!config.panels.models);
+        assert!(!config.panels.tokens);
+        assert_eq!(config.theme, "btop");
+        let enabled = rewrite_kv_lines(&disabled, &[("show_models", "true".to_string())]);
+        assert!(parse_config_body(&enabled).panels.models);
+        assert_eq!(enabled.matches("show_models").count(), 1);
     }
 
     #[test]

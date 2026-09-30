@@ -127,7 +127,7 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("help.toggle_file_audit", "toggle file audit");
     m.insert(
         "help.toggle_panels",
-        "toggle panels (context/quota/tokens/projects/ports/sessions/mcp)",
+        "toggle panels (context/quota/tokens/projects/ports/sessions/mcp/models)",
     );
     m.insert(
         "help.mcp_suppress",
@@ -178,6 +178,14 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("header.load", "L");
     m.insert("header.agents", "agents");
     m.insert("header.ctx", "ctx");
+
+    // Model usage panel
+    m.insert("models.title", "models");
+    m.insert("models.no_session", "No session selected");
+    m.insert("models.no_usage", "No usage yet");
+    m.insert("models.other", "Other");
+    m.insert("view.models_panel", "models panel");
+    m.insert("config.models_panel", "Models panel (8)");
 
     // Tokens panel
     m.insert("tokens.total", "Total");
@@ -426,6 +434,14 @@ static LOCALE_ZH: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("header.load", "负载");
     m.insert("header.agents", "代理");
     m.insert("header.ctx", "上下文");
+
+    // Model usage panel
+    m.insert("models.title", "models");
+    m.insert("models.no_session", "No session selected");
+    m.insert("models.no_usage", "No usage yet");
+    m.insert("models.other", "Other");
+    m.insert("view.models_panel", "models panel");
+    m.insert("config.models_panel", "Models panel (8)");
 
     // Tokens panel
     m.insert("tokens.total", "总计");
