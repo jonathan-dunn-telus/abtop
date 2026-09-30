@@ -61,6 +61,8 @@ abtop --mouse            # Enable mouse click/scroll navigation
 Recommended terminal size: **120x40** or larger. Minimum 80x24 — panels hide gracefully when small.
 Mouse capture is off by default so terminal drag selection and copy keep working. Launch with `--mouse` if you prefer click targets and wheel navigation.
 
+The tokens pane shows the selected session's Input, Output, CacheR, and CacheW totals, followed by tokens per minute over a rolling 60-second window. Claude totals and rates include subagents, including nested workflow agents. Rates count increases observed while abtop runs, start at zero, and return to zero after a minute without new tokens. On narrow panes, meter bars shrink first; rates are hidden if the text still cannot fit.
+
 ### Terminal Jump
 
 Press `Enter` to focus the terminal running the selected agent. abtop supports cmux, tmux, and iTerm2 on macOS.
