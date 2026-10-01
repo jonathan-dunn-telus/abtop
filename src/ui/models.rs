@@ -10,7 +10,9 @@ use ratatui::Frame;
 use std::time::Instant;
 use unicode_width::UnicodeWidthStr;
 
-use super::{btop_block_active, fmt_tokens, stats_panel_title, truncate_str};
+use super::{
+    btop_block_active, fmt_tokens, grad_at, make_gradient, stats_panel_title, truncate_str,
+};
 
 /// Keep the largest models visible and account for all remaining usage in one row.
 fn visible_usage(entries: &[ModelUsage], capacity: usize) -> Vec<ModelUsage> {
@@ -59,6 +61,7 @@ pub(crate) fn draw_models_panel_active(
         return;
     }
 
+    let cpu_grad = make_gradient(theme.cpu_grad.start, theme.cpu_grad.mid, theme.cpu_grad.end);
     let width = inner.width as usize;
     // A single remaining content row still gets a compact summary.
     let two_lines = width < 36 && inner.height >= 2;
@@ -68,15 +71,13 @@ pub(crate) fn draw_models_panel_active(
     for entry in entries {
         let share = entry.total_tokens as f64 / stats.total_tokens() as f64 * 100.0;
         let metrics = format!("{} {:>5.1}%", fmt_tokens(entry.total_tokens), share);
+        let metrics_style = Style::default().fg(grad_at(&cpu_grad, share));
         if two_lines {
             lines.push(Line::from(Span::styled(
                 truncate_str(&entry.model, width),
                 Style::default().fg(theme.main_fg),
             )));
-            lines.push(Line::from(Span::styled(
-                metrics,
-                Style::default().fg(theme.title),
-            )));
+            lines.push(Line::from(Span::styled(metrics, metrics_style)));
         } else {
             let name_width = width.saturating_sub(metrics.width() + 1);
             let name = truncate_str(&entry.model, name_width);
@@ -84,7 +85,7 @@ pub(crate) fn draw_models_panel_active(
             lines.push(Line::from(vec![
                 Span::styled(name, Style::default().fg(theme.main_fg)),
                 Span::raw(" ".repeat(padding)),
-                Span::styled(metrics, Style::default().fg(theme.title)),
+                Span::styled(metrics, metrics_style),
             ]));
         }
     }
