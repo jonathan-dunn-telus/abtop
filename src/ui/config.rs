@@ -11,7 +11,7 @@ pub(crate) fn draw_config_overlay(f: &mut Frame, app: &App, theme: &Theme) {
     let area = f.area();
 
     let popup_w = 50u16.min(area.width.saturating_sub(4));
-    let popup_h = 17u16.min(area.height.saturating_sub(4));
+    let popup_h = 18u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_w)) / 2;
     let y = (area.height.saturating_sub(popup_h)) / 2;
     let popup = Rect::new(x, y, popup_w, popup_h);
@@ -82,6 +82,10 @@ pub(crate) fn draw_config_overlay(f: &mut Frame, app: &App, theme: &Theme) {
         (
             t("config.token_rate_panel"),
             toggle_str(&on_str, &off_str, app.show_token_rate),
+        ),
+        (
+            t("config.cache_read_rate"),
+            toggle_str(&on_str, &off_str, app.show_cache_read_rate),
         ),
     ];
 

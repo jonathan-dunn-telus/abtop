@@ -73,6 +73,10 @@ Aggregate model shares use the combined token total, and average tokens per turn
 
 The top row has two independent panes: **Token rate** (`9`) shows the global token activity chart and tokens/min; **Context** (`1`) shows each session's project name, context usage, window size, and compaction count. Token rate counts input, output, and cache creation across collected sessions, excluding cache reads. It stays global regardless of selection or the Tokens/Models scope toggle. On desktop, the panes share the row at 65%/35%; hiding either lets the other use the full width. Both toggles are available in the View menu and configuration overlay and persist across restarts.
 
+Press **`C` (Shift+C)** to add an optional **Cache reads/min** chart below the existing Token rate chart. It is disabled by default and can also be toggled in the View menu or configuration overlay. The two charts use independent vertical scales, so compare their numeric rates rather than their heights. Both plot synchronized per-refresh activity and retain up to 200 points, including while hidden. Short panes keep a cache-rate and reuse summary when the second chart cannot fit; `9` still controls the whole pane.
+
+Both rate labels use tokens observed during the preceding 60 seconds, based on elapsed time rather than a fixed number of refreshes. Startup usage is not extrapolated, and already-observed activity remains in the window until it expires even after a session closes. **Reuse %** is `100 × cache reads / (input + cache reads + cache writes)` over that same window; output is excluded, and `—` means there were no input-side tokens. This measures the share of reported input-side tokens served from cache. It is not a percentage of money saved: prices depend on the provider, model, and billing arrangement, and abtop does not estimate dollar costs.
+
 The desktop layout reserves minimum widths for enabled panes and switches to tabs when they cannot fit (134 columns with all panes enabled). In the Usage tab, Token rate hides first, then Context, when height is limited, preserving both quota windows and all four token categories. Quota bars shrink before values are clipped, reset countdowns move inline in shorter panes, and Models combines overflow when needed. These automatic layout changes do not alter saved visibility settings.
 
 Model totals include input, output, cache reads, and cache writes, matching the Tokens pane in either scope. Distinct model versions stay separate, and OpenCode entries include the provider. Missing model metadata is counted as `Unknown`. Codex attributes increases in cumulative usage to the current turn's model; if counters decrease, the replacement baseline becomes `Unknown` and subsequent increases resume model attribution.
@@ -148,6 +152,8 @@ show_models = true
 # Independent top-row panes (1: Context, 9: Token rate).
 show_context = true
 show_token_rate = true
+# Optional cache chart and reuse metric inside Token rate (Shift+C).
+show_cache_read_rate = false
 # Hide specific agent CLIs from the TUI (case-insensitive).
 # Useful if you only use one agent and want a cleaner view.
 hidden_agents = ["codex"]

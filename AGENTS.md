@@ -78,7 +78,7 @@ The narrow Usage tab reserves rows for both quota windows, all token categories,
 
 Panel descriptions:
 - **¹context**: Project-labeled per-session context usage bars, percentages, window sizes, and compaction counts. `1` toggles persisted `show_context`.
-- **⁹token rate**: Global token rate braille chart (200-point history) and tokens/min, counting input, output, and cache creation but excluding cache reads. Independent of selection and Tokens/Models stats scope. `9` toggles persisted `show_token_rate`. A missing setting inherits `show_context` for compatibility; fresh configurations enable both. The narrow Usage tab orders Token rate before Context, then Quota, Tokens, and Models.
+- **⁹token rate**: Global token rate braille chart (200-point history) and tokens/min, counting input, output, and cache creation but excluding cache reads. Independent of selection and Tokens/Models stats scope. `9` toggles persisted `show_token_rate`. A missing setting inherits `show_context` for compatibility; fresh configurations enable both. The narrow Usage tab orders Token rate before Context, then Quota, Tokens, and Models. The optional cache-read chart (`C`, persisted `show_cache_read_rate`, default false) appears below the original chart with independent scaling and the theme's cache gradient. Both charts use synchronized per-refresh category deltas and 200-point histories; their numeric tokens/min summaries use timestamped activity from the preceding 60 seconds, retaining observed activity until expiry after sessions close. Reuse is `cache reads / (input + cache reads + cache writes) × 100`, excluding output; show `—` without input-side activity. Short panes retain a cache summary. Enabling it raises the desktop top row's ideal minimum to six rows, with five-row compact fallback; narrow allocation and pane-level controls remain unchanged. It measures token reuse, not dollar savings.
 - **²quota**: Claude + Codex rate limit gauges side-by-side (5h and 7d windows with reset countdown). Quota is intentionally limited to Claude and Codex; do not add an OpenCode row unless OpenCode exposes a reliable account-level provider rate-limit source.
 - **³tokens**: Total token breakdown (in/out/cache) + per-turn sparkline for selected session.
 - **Stats scope (`a`)**: Tokens and Models share `Selected` / `All live`, initially Selected and persisted as `stats_scope`. All live sums lifetime usage of unique, confirmed live sessions, including waiting and rate-limited sessions, independently of session search/selection. Done and Unknown sessions are excluded; totals drop when sessions close. Existing collector subagent rollups are counted once. The aggregate Tokens sparkline uses rolling tokens/min across all four categories, sampled each refresh (200 points); Selected keeps per-turn history. The header control is clickable with `--mouse`, and the View menu exposes the same toggle. Quota, Context, JSON snapshots, and `--once` retain their existing scope.
@@ -287,6 +287,7 @@ Tracks child processes that have open ports. When a parent session dies but the 
 | `1` | Toggle Context pane |
 | `8` | Toggle Models pane |
 | `9` | Toggle Token rate pane |
+| `C` (Shift+C) | Toggle cache-read chart and reuse inside Token rate |
 | `a` | Toggle Tokens/Models scope: selected / all live |
 
 ## Tech Stack

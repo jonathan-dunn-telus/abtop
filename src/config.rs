@@ -33,6 +33,7 @@ impl Default for PanelVisibility {
 pub struct AppConfig {
     pub theme: String,
     pub stats_scope: StatsScope,
+    pub show_cache_read_rate: bool,
     /// Agent CLI names to exclude from the TUI (e.g. ["codex"] to hide Codex).
     /// Matched case-insensitively against each collector's agent_cli identifier.
     pub hidden_agents: Vec<String>,
@@ -50,6 +51,7 @@ impl Default for AppConfig {
         Self {
             theme: "btop".to_string(),
             stats_scope: StatsScope::default(),
+            show_cache_read_rate: false,
             hidden_agents: Vec::new(),
             claude_config_dirs: Vec::new(),
             panels: PanelVisibility::default(),
@@ -111,6 +113,9 @@ fn parse_config_body(content: &str) -> AppConfig {
                 }
                 "theme" => config.theme = val.to_string(),
                 "language" => config.language = val.to_string(),
+                "show_cache_read_rate" => {
+                    config.show_cache_read_rate = parse_bool(val).unwrap_or(false)
+                }
                 "show_token_rate" => token_rate = Some(parse_bool(val).unwrap_or(true)),
                 "show_context" => config.panels.context = parse_bool(val).unwrap_or(true),
                 "show_quota" => config.panels.quota = parse_bool(val).unwrap_or(true),
@@ -180,6 +185,10 @@ pub fn save_stats_scope(scope: StatsScope) -> Result<(), String> {
     write_with_updates(&[("stats_scope", format!("\"{}\"", scope.config_value()))])
 }
 
+pub fn save_cache_read_rate(visible: bool) -> Result<(), String> {
+    write_with_updates(&[("show_cache_read_rate", visible.to_string())])
+}
+
 pub fn save_panel_visibility(panels: &PanelVisibility) -> Result<(), String> {
     write_with_updates(&[
         ("show_context", panels.context.to_string()),
@@ -242,6 +251,30 @@ fn rewrite_kv_lines(content: &str, updates: &[(&str, String)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_chart_defaults_off_and_round_trips_independently() {
+        for content in [
+            "",
+            "show_cache_read_rate = invalid",
+            "show_token_rate = true",
+        ] {
+            assert!(!parse_config_body(content).show_cache_read_rate);
+        }
+        let mut content =
+            "# preferences\nshow_token_rate = false\nshow_context = false\nfuture_key = 42\n"
+                .to_string();
+        for enabled in [true, false, true] {
+            content = rewrite_kv_lines(&content, &[("show_cache_read_rate", enabled.to_string())]);
+            let cfg = parse_config_body(&content);
+            assert_eq!(cfg.show_cache_read_rate, enabled);
+            assert!(!cfg.panels.token_rate);
+            assert!(!cfg.panels.context);
+            assert_eq!(content.matches("show_cache_read_rate").count(), 1);
+            assert!(content.contains("# preferences"));
+            assert!(content.contains("future_key = 42"));
+        }
+    }
 
     #[test]
     fn token_rate_visibility_inherits_context_unless_explicit() {

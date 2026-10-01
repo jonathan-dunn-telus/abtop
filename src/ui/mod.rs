@@ -508,7 +508,12 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
     } else {
         0
     };
-    let top_ideal: u16 = (app.sessions.len() as u16 + 4).clamp(5, 10);
+    let top_min_ideal = if app.show_token_rate && app.show_cache_read_rate {
+        6
+    } else {
+        5
+    };
+    let top_ideal: u16 = (app.sessions.len() as u16 + 4).clamp(top_min_ideal, 10);
 
     let available = area.height.saturating_sub(FIXED);
     // Tokens need five content rows for the total and all four categories.
@@ -1757,6 +1762,69 @@ mod tests {
     }
 
     #[test]
+    fn cache_chart_fits_desktop_and_narrow_layouts_without_changing_pane_controls() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        app.sessions.truncate(1);
+        let area = Rect::new(0, 0, 160, 40);
+        assert_eq!(desktop_layout(&app, area).token_rate.unwrap().height, 5);
+        app.show_cache_read_rate = true;
+        assert_eq!(desktop_layout(&app, area).token_rate.unwrap().height, 6);
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = area_text(
+            terminal.backend().buffer(),
+            desktop_layout(&app, area).token_rate.unwrap(),
+        );
+        assert!(text.contains("Cache reads") && text.contains("independent scales"));
+        // Only five rows are available after reserving Sessions and the middle row.
+        let short = desktop_layout(&app, Rect::new(0, 0, 160, 24));
+        assert_eq!(short.token_rate.unwrap().height, 5);
+
+        app.set_narrow_tab(NarrowTab::Usage);
+        for height in [24, 27, 30, 40] {
+            let area = Rect::new(0, 0, 80, height);
+            let body = narrow_chunks(area)[1];
+            app.show_cache_read_rate = false;
+            let without_cache = narrow_section_areas(&app, NarrowTab::Usage, body);
+            app.show_cache_read_rate = true;
+            assert_eq!(
+                narrow_section_areas(&app, NarrowTab::Usage, body),
+                without_cache
+            );
+            sync_narrow_section(&mut app, area);
+            app.toggle_narrow_section_zoom(NarrowSection::TokenRate);
+            let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
+            terminal.draw(|f| draw(f, &app)).unwrap();
+            let text = area_text(terminal.backend().buffer(), body);
+            assert!(text.contains("Cache reads") && text.contains("Reuse"));
+            assert_eq!(
+                click_target(&app, area, body.x + 1, body.y + 1),
+                Some(ClickTarget::NarrowSection(NarrowSection::TokenRate))
+            );
+            assert_eq!(
+                click_target(&app, area, body.right() - 3, body.y),
+                Some(ClickTarget::NarrowZoom(NarrowSection::TokenRate))
+            );
+            app.restore_narrow_sections();
+        }
+        app.view_open = true;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        assert!(
+            area_text(terminal.backend().buffer(), Rect::new(0, 0, 80, 24))
+                .contains("cache-read chart")
+        );
+        app.view_open = false;
+        app.config_open = true;
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        assert!(
+            area_text(terminal.backend().buffer(), Rect::new(0, 0, 80, 24))
+                .contains("Cache-read chart (C)")
+        );
+    }
+
+    #[test]
     fn token_rate_yields_before_context_with_visible_focus_and_independent_zoom() {
         let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
         crate::demo::populate_demo(&mut app);
@@ -1844,7 +1912,7 @@ mod tests {
             assert_eq!(before, area_text(terminal.backend().buffer(), area));
         }
         app.sessions.clear();
-        app.token_rates.clear();
+        app.clear_global_token_history();
         let area = Rect::new(0, 0, 80, 5);
         let mut terminal = Terminal::new(TestBackend::new(80, 5)).unwrap();
         terminal

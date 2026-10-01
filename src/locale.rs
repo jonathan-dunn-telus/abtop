@@ -198,6 +198,15 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("tokens.tokens_turn", "tokens/turn");
 
     // Token rate panel
+    m.insert("token_rate.cache_reads", "Cache reads");
+    m.insert("token_rate.reuse", "Reuse");
+    m.insert("token_rate.independent_scales", "independent scales");
+    m.insert("view.cache_read_rate", "cache-read chart");
+    m.insert("config.cache_read_rate", "Cache-read chart (C)");
+    m.insert(
+        "help.cache_read_rate",
+        "toggle cache chart and reuse in Token rate",
+    );
     m.insert("token_rate.global", "Global");
     m.insert("view.token_rate_panel", "token rate panel");
     m.insert("config.token_rate_panel", "Token rate panel (9)");
@@ -459,6 +468,15 @@ static LOCALE_ZH: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("tokens.tokens_turn", "词元/轮");
 
     // Token rate panel
+    m.insert("token_rate.cache_reads", "Cache reads");
+    m.insert("token_rate.reuse", "Reuse");
+    m.insert("token_rate.independent_scales", "independent scales");
+    m.insert("view.cache_read_rate", "cache-read chart");
+    m.insert("config.cache_read_rate", "Cache-read chart (C)");
+    m.insert(
+        "help.cache_read_rate",
+        "toggle cache chart and reuse in Token rate",
+    );
     m.insert("token_rate.global", "Global");
     m.insert("view.token_rate_panel", "token rate panel");
     m.insert("config.token_rate_panel", "Token rate panel (9)");

@@ -53,6 +53,11 @@ pub(crate) fn items(app: &App) -> Vec<ViewItem> {
             state: bool_state(app.show_token_rate),
         },
         ViewItem {
+            key: 'C',
+            label: t("view.cache_read_rate").leak(),
+            state: bool_state(app.show_cache_read_rate),
+        },
+        ViewItem {
             key: '1',
             label: t("view.context_panel").leak(),
             state: bool_state(app.show_context),
