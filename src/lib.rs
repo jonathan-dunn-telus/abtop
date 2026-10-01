@@ -80,12 +80,14 @@ use std::time::Duration;
 /// Construct a headless `App` from loaded config + theme. Shared by the
 /// `--json` and `--once` entry points.
 fn build_app(theme: theme::Theme, cfg: &config::AppConfig) -> App {
-    App::new_with_config_and_claude_dirs(
+    let mut app = App::new_with_config_and_claude_dirs(
         theme,
         &cfg.hidden_agents,
         cfg.panels,
         &cfg.claude_config_dirs,
-    )
+    );
+    app.stats_scope = cfg.stats_scope;
+    app
 }
 
 pub fn run() -> io::Result<()> {
@@ -196,15 +198,7 @@ pub fn run() -> io::Result<()> {
     }
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
-    let app_result = run_app(
-        &mut terminal,
-        demo_mode,
-        initial_theme,
-        exit_on_jump,
-        &cfg.hidden_agents,
-        cfg.panels,
-        &cfg.claude_config_dirs,
-    );
+    let app_result = run_app(&mut terminal, demo_mode, initial_theme, exit_on_jump, &cfg);
 
     // Always attempt both cleanup steps regardless of app result
     let r1 = if mouse_capture {
@@ -232,16 +226,9 @@ fn run_app(
     demo_mode: bool,
     initial_theme: Option<theme::Theme>,
     exit_on_jump: bool,
-    hidden_agents: &[String],
-    panels: config::PanelVisibility,
-    claude_config_dirs: &[std::path::PathBuf],
+    cfg: &config::AppConfig,
 ) -> io::Result<()> {
-    let mut app = App::new_with_config_and_claude_dirs(
-        initial_theme.unwrap_or_default(),
-        hidden_agents,
-        panels,
-        claude_config_dirs,
-    );
+    let mut app = build_app(initial_theme.unwrap_or_default(), cfg);
     if demo_mode {
         demo::populate_demo(&mut app);
     } else {
@@ -283,6 +270,9 @@ fn run_app(
             if let Some(front) = app.token_rates.pop_front() {
                 app.token_rates.push_back(front);
             }
+            if let Some(front) = app.live_token_history.pop_front() {
+                app.live_token_history.push_back(front);
+            }
         } else if !had_input && last_tick.elapsed() >= tick_interval {
             // Data tick every 2s — skip when handling input to avoid lag
             app.tick();
@@ -310,6 +300,7 @@ fn handle_key_press(
     } else if app.view_open {
         match key.code {
             KeyCode::Esc | KeyCode::Char('v') => app.view_open = false,
+            KeyCode::Char('a') => app.toggle_stats_scope(),
             KeyCode::Char('T') => app.tree_view = !app.tree_view,
             KeyCode::Char('l') => app.toggle_timeline(),
             KeyCode::Char('f') => app.toggle_file_audit(),
@@ -339,6 +330,7 @@ fn handle_key_press(
     } else {
         match key.code {
             KeyCode::Char('q') => app.quit(),
+            KeyCode::Char('a') => app.toggle_stats_scope(),
             KeyCode::Char('r') if !demo_mode => app.tick(),
             KeyCode::Down | KeyCode::Char('j') => app.select_next(),
             KeyCode::Up | KeyCode::Char('k') => app.select_prev(),
@@ -381,6 +373,7 @@ fn handle_mouse_event(app: &mut App, mouse: MouseEvent, area: Rect) {
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(target) = ui::click_target(app, area, mouse.column, mouse.row) {
                 match target {
+                    ui::ClickTarget::StatsScope => app.toggle_stats_scope(),
                     ui::ClickTarget::NarrowTab(tab) => app.set_narrow_tab(tab),
                     ui::ClickTarget::NarrowSection(section) => {
                         app.set_active_narrow_section(section);
@@ -582,6 +575,65 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn saved_scope_initializes_app_without_changing_snapshot_interface() {
+        let cfg = config::AppConfig {
+            stats_scope: app::StatsScope::AllLive,
+            ..Default::default()
+        };
+        let mut app = build_app(theme::Theme::default(), &cfg);
+        assert_eq!(app.stats_scope, app::StatsScope::AllLive);
+        demo::populate_demo(&mut app);
+        let all = serde_json::to_value(app.to_snapshot(2000)).unwrap();
+        app.stats_scope = app::StatsScope::Selected;
+        let selected = serde_json::to_value(app.to_snapshot(2000)).unwrap();
+        assert_eq!(all["sessions"], selected["sessions"]);
+        assert_eq!(
+            all.as_object().unwrap().keys().collect::<Vec<_>>(),
+            selected.as_object().unwrap().keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn stats_scope_keyboard_menu_filter_and_mouse_share_one_control() {
+        let mut app = App::new_with_config(theme::Theme::default(), &[], Default::default());
+        demo::populate_demo(&mut app);
+        app.save_stats_scope = |_| Ok(());
+        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        handle_key_press(&mut app, key, true, false, |_| panic!("must not jump"));
+        assert_eq!(app.stats_scope, app::StatsScope::AllLive);
+        app.view_open = true;
+        handle_key_press(&mut app, key, true, false, |_| panic!("must not jump"));
+        assert_eq!(app.stats_scope, app::StatsScope::Selected);
+        app.view_open = false;
+        app.filter_active = true;
+        handle_key_press(&mut app, key, true, false, |_| panic!("must not jump"));
+        assert_eq!(app.filter_text, "a");
+        assert_eq!(app.stats_scope, app::StatsScope::Selected);
+        app.clear_filter();
+
+        for width in [80, 160] {
+            let area = Rect::new(0, 0, width, 24);
+            let column = (0..width)
+                .find(|&x| ui::click_target(&app, area, x, 0) == Some(ui::ClickTarget::StatsScope))
+                .unwrap();
+            let before = app.stats_scope;
+            handle_mouse_event(
+                &mut app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                },
+                area,
+            );
+            assert_ne!(app.stats_scope, before);
+            assert_eq!(app.selected, 0);
+            assert!(ui::click_target(&app, area, 0, 0).is_none());
+        }
+    }
 
     #[test]
     fn mouse_capture_is_opt_in() {

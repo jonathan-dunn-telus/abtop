@@ -1,4 +1,4 @@
-use crate::app::App;
+use crate::app::{App, StatsScope};
 use crate::locale::t;
 use crate::model::ModelUsage;
 use crate::theme::Theme;
@@ -7,9 +7,10 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+use std::time::Instant;
 use unicode_width::UnicodeWidthStr;
 
-use super::{btop_block_active, fmt_tokens, truncate_str};
+use super::{btop_block_active, fmt_tokens, stats_panel_title, truncate_str};
 
 /// Keep the largest models visible and account for all remaining usage in one row.
 fn visible_usage(entries: &[ModelUsage], capacity: usize) -> Vec<ModelUsage> {
@@ -34,16 +35,19 @@ pub(crate) fn draw_models_panel_active(
     theme: &Theme,
     active: bool,
 ) {
-    let block = btop_block_active(&t("models.title"), "⁸", theme.mem_box, theme, active);
+    let title = stats_panel_title(app, &t("models.title"), area.width, active);
+    let block = btop_block_active(&title, "⁸", theme.mem_box, theme, active);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.is_empty() {
         return;
     }
 
-    let selected = app.sessions.get(app.selected);
-    let Some(session) = selected.filter(|session| session.total_tokens() > 0) else {
-        let message = if selected.is_none() {
+    let stats = app.usage_stats(Instant::now());
+    if stats.total_tokens() == 0 {
+        let message = if stats.session_count == 0 && app.stats_scope == StatsScope::AllLive {
+            "No live sessions".to_string()
+        } else if stats.session_count == 0 {
             t("models.no_session")
         } else {
             t("models.no_usage")
@@ -53,16 +57,16 @@ pub(crate) fn draw_models_panel_active(
             inner,
         );
         return;
-    };
+    }
 
     let width = inner.width as usize;
     // A single remaining content row still gets a compact summary.
     let two_lines = width < 36 && inner.height >= 2;
     let row_height = if two_lines { 2 } else { 1 };
-    let entries = visible_usage(&session.model_usage, inner.height as usize / row_height);
+    let entries = visible_usage(&stats.model_usage, inner.height as usize / row_height);
     let mut lines = Vec::new();
     for entry in entries {
-        let share = entry.total_tokens as f64 / session.total_tokens() as f64 * 100.0;
+        let share = entry.total_tokens as f64 / stats.total_tokens() as f64 * 100.0;
         let metrics = format!("{} {:>5.1}%", fmt_tokens(entry.total_tokens), share);
         if two_lines {
             lines.push(Line::from(Span::styled(
@@ -126,6 +130,26 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn aggregate_models_use_combined_denominator_and_explicit_scope() {
+        let mut app = app_with_usage();
+        app.sessions.truncate(1);
+        let mut other = app.sessions[0].clone();
+        other.session_id = "other-session".into();
+        other.total_input_tokens = 500;
+        other.model_usage = vec![usage("model-a", 500)];
+        app.sessions.push(other);
+        app.stats_scope = StatsScope::AllLive;
+        for width in [20, 40, 80] {
+            let text = render(&app, width, 10);
+            assert!(text.contains("All live"), "{text}");
+            assert!(text.contains("83.3%"), "{text}");
+            assert!(text.contains("16.7%"), "{text}");
+        }
+        app.sessions.clear();
+        assert!(render(&app, 40, 6).contains("No live sessions"));
     }
 
     #[test]

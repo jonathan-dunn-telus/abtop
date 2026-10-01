@@ -65,9 +65,15 @@ The tokens pane shows the selected session's Input, Output, CacheR, and CacheW t
 
 The models pane shows lifetime token totals and percentage share for each model used by the selected session, sorted by usage. It appears beside Tokens on wide terminals and in the Usage tab on narrow terminals. Press `8` to toggle it, or use the View/config menus; visibility is saved. Narrow panes use two-line entries, with overflow combined into `Other (N)`.
 
+Press `a` to switch Tokens and Models together between **Selected** and **All live**. The header shows the current scope and live-session count; with `--mouse`, click that control to switch. The same action is available in the View menu (`v`). The initial scope is Selected, and your last choice is saved across restarts.
+
+All live adds the lifetime usage of all confirmed live sessions from enabled collectors, including sessions waiting for input or rate limits. Finished sessions and sessions whose process ownership is unknown are excluded. Totals decrease when a session closes. Searching and selecting sessions only affects session navigation and details; it does not change All live totals. Quota remains account-level, and Context keeps its existing cross-session activity and per-session percentages.
+
+Aggregate model shares use the combined token total, and average tokens per turn is the combined total divided by the combined turn count. The aggregate Tokens sparkline shows combined rolling `tokens/min`, including all four token categories, sampled on each refresh for the sessions live at that time (up to 200 samples). History is collected even in Selected mode; discovering a session does not turn its past usage into a rate spike. Existing collector accounting is preserved: Claude session totals already include tracked subagents, while Codex and OpenCode totals cover each session itself.
+
 The desktop layout reserves minimum widths for enabled panes and switches to tabs when they cannot fit (134 columns with all panes enabled). In the Usage tab, Context hides first when height is limited, preserving both quota windows and all four token categories. Quota bars shrink before values are clipped, reset countdowns move inline in shorter panes, and Models combines overflow when needed. These automatic layout changes do not alter saved visibility settings.
 
-Model totals include input, output, cache reads, and cache writes, matching the Tokens pane. Claude includes tracked subagents and nested workflow agents; Codex and OpenCode cover the selected session only. Distinct model versions stay separate, and OpenCode entries include the provider. Missing model metadata is counted as `Unknown`. Codex attributes increases in cumulative usage to the current turn's model; if counters decrease, the replacement baseline becomes `Unknown` and subsequent increases resume model attribution.
+Model totals include input, output, cache reads, and cache writes, matching the Tokens pane in either scope. Distinct model versions stay separate, and OpenCode entries include the provider. Missing model metadata is counted as `Unknown`. Codex attributes increases in cumulative usage to the current turn's model; if counters decrease, the replacement baseline becomes `Unknown` and subsequent increases resume model attribution.
 
 ### Terminal Jump
 
@@ -132,7 +138,10 @@ Light themes (`light` — Solarized cream, `white` — GitHub-style pure white) 
 
 ```toml
 theme = "btop"
-# Show per-model usage for the selected session (enabled by default).
+# Shared Tokens/Models scope: "selected" (default) or "all_live".
+# Updated automatically when you press a or click the header scope control.
+stats_scope = "selected"
+# Show per-model usage for the current stats scope (enabled by default).
 show_models = true
 # Hide specific agent CLIs from the TUI (case-insensitive).
 # Useful if you only use one agent and want a cleaner view.
@@ -161,6 +170,7 @@ When `language` is unset, abtop auto-detects from `LANG` — any value starting 
 | `↑`/`↓` or `k`/`j` | Select session                       |
 | `Enter`            | Jump to session terminal             |
 | `x`                | Kill selected session                |
+| `a`                | Toggle stats: selected / all live     |
 | `X`                | Kill all orphan ports                |
 | `t`                | Cycle theme                          |
 | `1`–`8`            | Toggle panels (`8`: models)           |
@@ -200,6 +210,8 @@ the serialized JSON elsewhere. [abtop-web-ui](https://github.com/XKHoshizora/abt
 is a reference consumer: a local-first web dashboard built on exactly this API.
 
 Each JSON session includes `model_usage`, an array of `{ "model": "...", "total_tokens": 123 }` entries sorted by usage. These entries use the same accounting and subagent scope as that session's `total_tokens`; percentage share is `100 * total_tokens / session.total_tokens` when the session total is nonzero. Library users constructing `AgentSession`, `SessionView`, or `PanelVisibility` literals must supply the new `model_usage` or `models` field as appropriate.
+
+Stats scope affects the TUI only; `--once` and JSON snapshots retain their per-session output. Library users constructing `AppConfig` literals must supply `stats_scope` (or use `..Default::default()`). Existing `App` constructors default to `StatsScope::Selected`; set `app.stats_scope` explicitly to use another scope when rendering the TUI.
 
 ## Privacy
 

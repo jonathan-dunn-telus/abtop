@@ -7,6 +7,9 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+mod stats;
+pub use stats::StatsScope;
+
 /// Maximum data points kept for the live token-rate graph.
 const GRAPH_HISTORY_LEN: usize = 200;
 /// Window for the per-session token rates shown in the tokens pane.
@@ -23,6 +26,19 @@ pub(crate) struct TokenRates {
     pub output: u64,
     pub cache_read: u64,
     pub cache_write: u64,
+}
+
+impl TokenRates {
+    pub(crate) fn total(&self) -> u64 {
+        self.input + self.output + self.cache_read + self.cache_write
+    }
+
+    fn add(&mut self, other: &Self) {
+        self.input += other.input;
+        self.output += other.output;
+        self.cache_read += other.cache_read;
+        self.cache_write += other.cache_write;
+    }
 }
 
 struct TokenRateCounter {
@@ -177,6 +193,12 @@ impl NarrowSection {
 pub struct App {
     pub sessions: Vec<AgentSession>,
     pub selected: usize,
+    /// Shared scope for the Tokens and Models panes.
+    pub stats_scope: StatsScope,
+    /// Combined rolling tokens/min, sampled for the sessions live at each tick.
+    pub(crate) live_token_history: VecDeque<u64>,
+    /// Injectable persistence boundary; tests never write the user's config.
+    pub(crate) save_stats_scope: fn(StatsScope) -> Result<(), String>,
     pub should_quit: bool,
     /// Token rate per tick (delta). Ring buffer for the braille graph.
     pub token_rates: VecDeque<f64>,
@@ -268,6 +290,9 @@ impl App {
         Self {
             sessions: Vec::new(),
             selected: 0,
+            stats_scope: StatsScope::default(),
+            live_token_history: VecDeque::with_capacity(GRAPH_HISTORY_LEN),
+            save_stats_scope: crate::config::save_stats_scope,
             should_quit: false,
             token_rates: VecDeque::with_capacity(GRAPH_HISTORY_LEN),
             rate_limits: Vec::new(),
@@ -658,12 +683,21 @@ impl App {
         // stale session state or attribute a long absence's tokens to one minute.
         self.session_token_rates
             .retain(|_, rates| now.duration_since(rates.last_seen) < TOKEN_RATE_WINDOW);
+        let mut seen = HashSet::new();
         for session in &self.sessions {
             let key = (session.agent_cli.to_string(), session.session_id.clone());
+            if !seen.insert(key.clone()) {
+                continue;
+            }
             self.session_token_rates
                 .entry(key)
                 .or_insert_with(|| SessionTokenRates::new(session, now))
                 .update(session, now);
+        }
+        self.live_token_history
+            .push_back(self.live_token_rates(now).total());
+        if self.live_token_history.len() > GRAPH_HISTORY_LEN {
+            self.live_token_history.pop_front();
         }
     }
 

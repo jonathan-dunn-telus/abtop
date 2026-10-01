@@ -12,7 +12,7 @@ mod sessions;
 mod tokens;
 mod view_menu;
 
-use crate::app::{App, NarrowSection, NarrowTab};
+use crate::app::{App, NarrowSection, NarrowTab, StatsScope};
 use crate::locale::t;
 use crate::theme::Theme;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -278,6 +278,41 @@ pub(crate) fn styled_label(text: &str, graph_text: Color) -> Span<'static> {
     Span::styled(text.to_string(), Style::default().fg(graph_text))
 }
 
+/// Keep scope readable before allocating the rest of a narrow pane's title.
+pub(crate) fn stats_panel_title(app: &App, name: &str, width: u16, active: bool) -> String {
+    let available = width.saturating_sub(5 + if active { 3 } else { 0 }) as usize;
+    let candidates = match app.stats_scope {
+        StatsScope::AllLive => vec![
+            format!("{name} · All live"),
+            format!("{name} All live"),
+            "All live".to_string(),
+        ],
+        StatsScope::Selected => match app.sessions.get(app.selected) {
+            Some(session) => vec![
+                format!(
+                    "{name} ({}/{})",
+                    truncate_str(&session.project_name, 12),
+                    truncate_str(&session.session_id, 8)
+                ),
+                format!("{name} {}", truncate_str(&session.session_id, 8)),
+                format!(
+                    "{name} {}",
+                    truncate_str(
+                        &session.session_id,
+                        available.saturating_sub(name.width() + 1)
+                    )
+                ),
+            ],
+            None => vec![name.to_string()],
+        },
+    };
+    candidates
+        .iter()
+        .find(|title| title.width() <= available)
+        .cloned()
+        .unwrap_or_else(|| truncate_str(candidates.last().unwrap(), available))
+}
+
 // ── main draw ────────────────────────────────────────────────────────────────
 
 const MIN_WIDTH: u16 = 60;
@@ -286,6 +321,7 @@ const DESKTOP_MIN_WIDTH: u16 = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ClickTarget {
+    StatsScope,
     NarrowTab(NarrowTab),
     NarrowSection(NarrowSection),
     NarrowZoom(NarrowSection),
@@ -813,6 +849,12 @@ fn draw_overlays(f: &mut Frame, app: &App, theme: &Theme) {
 }
 
 pub(crate) fn click_target(app: &App, area: Rect, column: u16, row: u16) -> Option<ClickTarget> {
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        return None;
+    }
+    if contains(header::stats_control_area(app, area), column, row) {
+        return Some(ClickTarget::StatsScope);
+    }
     if uses_desktop_layout(app, area.width) {
         let layout = desktop_layout(app, area);
         if let Some(sessions_area) = layout.sessions {
@@ -1387,6 +1429,49 @@ mod tests {
     }
 
     #[test]
+    fn stats_scope_remains_visible_in_wide_narrow_and_zoomed_layouts() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        app.stats_scope = StatsScope::AllLive;
+        app.set_narrow_tab(NarrowTab::Usage);
+        for (width, height) in [(160, 40), (134, 30), (80, 24), (60, 18)] {
+            let area = Rect::new(0, 0, width, height);
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| draw(f, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(
+                text.contains("a Stats: All live ("),
+                "{width}x{height}: {text}"
+            );
+            assert!(
+                text.matches("All live").count() >= 3,
+                "{width}x{height}: {text}"
+            );
+            let control = header::stats_control_area(&app, area);
+            for column in control.x..control.right() {
+                assert_eq!(
+                    click_target(&app, area, column, 0),
+                    Some(ClickTarget::StatsScope)
+                );
+            }
+        }
+        for section in [NarrowSection::Tokens, NarrowSection::Models] {
+            app.toggle_narrow_section_zoom(section);
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|f| draw(f, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(text.matches("All live").count() >= 2, "{text}");
+            assert!(text.contains("All live(*)"), "{text}");
+            app.restore_narrow_sections();
+        }
+        app.view_open = true;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("stats scope") && text.contains("All live"));
+    }
+
+    #[test]
     fn models_layout_visibility_and_narrow_zoom() {
         let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
         crate::demo::populate_demo(&mut app);
@@ -1424,7 +1509,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
         let text = format!("{}", terminal.backend());
-        assert!(text.contains("models(*)"));
+        assert!(text.contains("models (") && text.contains("(*)"));
         assert!(text.contains("claude-opus-4-6"));
         assert!(!text.contains("tokens"));
         app.show_models = false;
