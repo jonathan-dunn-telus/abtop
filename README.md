@@ -71,7 +71,9 @@ All live adds the lifetime usage of all confirmed live sessions from enabled col
 
 Aggregate model shares use the combined token total, and average tokens per turn is the combined total divided by the combined turn count. The aggregate Tokens sparkline shows combined rolling `tokens/min`, including all four token categories, sampled on each refresh for the sessions live at that time (up to 200 samples). History is collected even in Selected mode; discovering a session does not turn its past usage into a rate spike. Existing collector accounting is preserved: Claude session totals already include tracked subagents, while Codex and OpenCode totals cover each session itself.
 
-The desktop layout reserves minimum widths for enabled panes and switches to tabs when they cannot fit (134 columns with all panes enabled). In the Usage tab, Context hides first when height is limited, preserving both quota windows and all four token categories. Quota bars shrink before values are clipped, reset countdowns move inline in shorter panes, and Models combines overflow when needed. These automatic layout changes do not alter saved visibility settings.
+The top row has two independent panes: **Token rate** (`9`) shows the global token activity chart and tokens/min; **Context** (`1`) shows each session's project name, context usage, window size, and compaction count. Token rate counts input, output, and cache creation across collected sessions, excluding cache reads. It stays global regardless of selection or the Tokens/Models scope toggle. On desktop, the panes share the row at 65%/35%; hiding either lets the other use the full width. Both toggles are available in the View menu and configuration overlay and persist across restarts.
+
+The desktop layout reserves minimum widths for enabled panes and switches to tabs when they cannot fit (134 columns with all panes enabled). In the Usage tab, Token rate hides first, then Context, when height is limited, preserving both quota windows and all four token categories. Quota bars shrink before values are clipped, reset countdowns move inline in shorter panes, and Models combines overflow when needed. These automatic layout changes do not alter saved visibility settings.
 
 Model totals include input, output, cache reads, and cache writes, matching the Tokens pane in either scope. Distinct model versions stay separate, and OpenCode entries include the provider. Missing model metadata is counted as `Unknown`. Codex attributes increases in cumulative usage to the current turn's model; if counters decrease, the replacement baseline becomes `Unknown` and subsequent increases resume model attribution.
 
@@ -143,6 +145,9 @@ theme = "btop"
 stats_scope = "selected"
 # Show per-model usage for the current stats scope (enabled by default).
 show_models = true
+# Independent top-row panes (1: Context, 9: Token rate).
+show_context = true
+show_token_rate = true
 # Hide specific agent CLIs from the TUI (case-insensitive).
 # Useful if you only use one agent and want a cleaner view.
 hidden_agents = ["codex"]
@@ -153,6 +158,8 @@ claude_config_dirs = ["~/.claude-personal", "~/.claude-work-team"]
 # UI language. Omit or leave empty to auto-detect from LANG.
 language = "zh"
 ```
+
+If `show_token_rate` is omitted, it inherits `show_context` (which defaults to `true`), preserving the old combined pane preference. Once saved, the two settings are independent.
 
 ### Supported Languages
 

@@ -40,11 +40,11 @@ src/
 ## Layout
 
 ```
-┌─ ¹context (token rate sparkline + per-session context bars) ─────────┐
-│  ▁▃▅▇█▇▅▃▁▃▅▇██                       S1 abtop       ████████ 82%  │
-│  token rate (200pt history)            S2 prediction  █████████91%⚠ │
-│                                        S3 api-server  ███      22%  │
-└──────────────────────────────────────────────────────────────────────┘
+┌─ ⁹token rate ──────────────────────────┐┌─ ¹context ───────────────┐
+│ Global 25k/min                         ││ abtop       ████████ 82% │
+│ ▁▃▅▇█▇▅▃▁▃▅▇██                         ││ prediction  █████████91%⚠│
+│ 200-point history                      ││ api-server  ███      22% │
+└────────────────────────────────────────┘└──────────────────────────┘
 ┌─ ²quota ─────┐┌─ ³tokens ───┐┌─ projects ───┐┌─ ⁴ports ──────────┐
 │ CLAUDE       ││ Total  1.2M ││ abtop        ││ PORT  SESSION  CMD │
 │ 5h ████ 35%  ││ Input  402k ││  main +3 ~18 ││ :3000 api-srv node│
@@ -71,13 +71,14 @@ src/
 Panel rendering priority (top to bottom):
 1. **Sessions** — always visible, gets priority allocation (min 5 rows, ideal = 2/session + 7)
 2. **Mid-tier** (quota, tokens, models, projects, ports, MCP) — reserve minimum pane widths, then share surplus equally; switch to tabs when enabled panes cannot fit (134 columns with all enabled)
-3. **Context** — only renders when sessions have ideal height AND surplus >= 5 rows
+3. **Token rate / Context** — independent panes sharing the top row (65%/35%, or full width when only one is enabled); the row only renders when sessions have ideal height AND surplus >= 5 rows
 4. **Header** (1 row) + **Footer** (1 row) — always present
 
-The narrow Usage tab reserves rows for both quota windows, all token categories, and Models. Context hides first when height is limited without changing persisted visibility. Short quota panes show reset countdowns inline; bars and aggregate summaries yield before quota values. Mouse targeting and keyboard zoom use the visible layout.
+The narrow Usage tab reserves rows for both quota windows, all token categories, and Models. Token rate hides first, then Context, when height is limited without changing persisted visibility. Short quota panes show reset countdowns inline; bars and aggregate summaries yield before quota values. Mouse targeting and keyboard zoom use the visible layout.
 
 Panel descriptions:
-- **¹context**: Left = token rate braille sparkline (200-point history). Right = per-session context % bars with yellow/red warning.
+- **¹context**: Project-labeled per-session context usage bars, percentages, window sizes, and compaction counts. `1` toggles persisted `show_context`.
+- **⁹token rate**: Global token rate braille chart (200-point history) and tokens/min, counting input, output, and cache creation but excluding cache reads. Independent of selection and Tokens/Models stats scope. `9` toggles persisted `show_token_rate`. A missing setting inherits `show_context` for compatibility; fresh configurations enable both. The narrow Usage tab orders Token rate before Context, then Quota, Tokens, and Models.
 - **²quota**: Claude + Codex rate limit gauges side-by-side (5h and 7d windows with reset countdown). Quota is intentionally limited to Claude and Codex; do not add an OpenCode row unless OpenCode exposes a reliable account-level provider rate-limit source.
 - **³tokens**: Total token breakdown (in/out/cache) + per-turn sparkline for selected session.
 - **Stats scope (`a`)**: Tokens and Models share `Selected` / `All live`, initially Selected and persisted as `stats_scope`. All live sums lifetime usage of unique, confirmed live sessions, including waiting and rate-limited sessions, independently of session search/selection. Done and Unknown sessions are excluded; totals drop when sessions close. Existing collector subagent rollups are counted once. The aggregate Tokens sparkline uses rolling tokens/min across all four categories, sampled each refresh (200 points); Selected keeps per-turn history. The header control is clickable with `--mouse`, and the View menu exposes the same toggle. Quota, Context, JSON snapshots, and `--once` retain their existing scope.
@@ -283,7 +284,9 @@ Tracks child processes that have open ports. When a parent session dies but the 
 | `X` | Kill all orphan ports |
 | `q` | Quit |
 | `r` | Force refresh |
+| `1` | Toggle Context pane |
 | `8` | Toggle Models pane |
+| `9` | Toggle Token rate pane |
 | `a` | Toggle Tokens/Models scope: selected / all live |
 
 ## Tech Stack
@@ -409,7 +412,7 @@ abtop reads transcripts, prompts, tool inputs, and memory files. These may conta
 - **Port detection race**: a port can close between lsof and display. Show stale data gracefully.
 - **Subagent directory may not exist**: only created when Agent tool is used. Check existence before scanning.
 - **Undocumented internals**: all data sources are Claude Code/Codex implementation details, not stable APIs. Schema may change without notice. Defensive parsing with `serde(default)` everywhere.
-- **Terminal size**: minimum 80x24. Panels degrade gracefully when small (context panel hidden first).
+- **Terminal size**: minimum 80x24. Panels degrade gracefully when small (top row hidden first on desktop; Token rate then Context yield in the narrow Usage tab).
 - **PID reuse in port cache**: invalidate cached ports when the set of tracked PIDs changes.
 - **Rate limit staleness**: reject rate limit data older than 10 minutes.
 - **`/clear` + multi-PID same cwd**: after `/clear`, Claude Code mints a new `sessionId` + `.jsonl` without rewriting `sessions/{PID}.json`. abtop overrides the stale sid by picking the newest transcript in the project dir, but this heuristic can't disambiguate ownership when two live `claude` PIDs share a cwd — so the override is disabled in that case and both sessions keep their original sid until exit. Use separate worktrees if live tracking is needed on both simultaneously.

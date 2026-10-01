@@ -4,6 +4,7 @@ use std::path::PathBuf;
 #[derive(Clone, Copy)]
 pub struct PanelVisibility {
     pub context: bool,
+    pub token_rate: bool,
     pub quota: bool,
     pub tokens: bool,
     pub models: bool,
@@ -17,6 +18,7 @@ impl Default for PanelVisibility {
     fn default() -> Self {
         Self {
             context: true,
+            token_rate: true,
             quota: true,
             tokens: true,
             models: true,
@@ -76,6 +78,7 @@ pub fn load_config() -> AppConfig {
 
 fn parse_config_body(content: &str) -> AppConfig {
     let mut config = AppConfig::default();
+    let mut token_rate = None;
     for line in content.lines() {
         let line = line.trim();
         if line.starts_with('#') || line.is_empty() {
@@ -108,6 +111,7 @@ fn parse_config_body(content: &str) -> AppConfig {
                 }
                 "theme" => config.theme = val.to_string(),
                 "language" => config.language = val.to_string(),
+                "show_token_rate" => token_rate = Some(parse_bool(val).unwrap_or(true)),
                 "show_context" => config.panels.context = parse_bool(val).unwrap_or(true),
                 "show_quota" => config.panels.quota = parse_bool(val).unwrap_or(true),
                 "show_tokens" => config.panels.tokens = parse_bool(val).unwrap_or(true),
@@ -120,6 +124,8 @@ fn parse_config_body(content: &str) -> AppConfig {
             }
         }
     }
+    // Preserve the old combined pane preference until the new toggle is saved.
+    config.panels.token_rate = token_rate.unwrap_or(config.panels.context);
     config
 }
 
@@ -177,6 +183,7 @@ pub fn save_stats_scope(scope: StatsScope) -> Result<(), String> {
 pub fn save_panel_visibility(panels: &PanelVisibility) -> Result<(), String> {
     write_with_updates(&[
         ("show_context", panels.context.to_string()),
+        ("show_token_rate", panels.token_rate.to_string()),
         ("show_quota", panels.quota.to_string()),
         ("show_tokens", panels.tokens.to_string()),
         ("show_models", panels.models.to_string()),
@@ -235,6 +242,38 @@ fn rewrite_kv_lines(content: &str, updates: &[(&str, String)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_rate_visibility_inherits_context_unless_explicit() {
+        for (content, context, token_rate) in [
+            ("", true, true),
+            ("show_context = false", false, false),
+            ("show_context = true", true, true),
+            ("show_context = invalid", true, true),
+            ("show_context = false\nshow_token_rate = true", false, true),
+            ("show_token_rate = true\nshow_context = false", false, true),
+            ("show_token_rate = false\nshow_context = true", true, false),
+            (
+                "show_context = false\nshow_token_rate = invalid",
+                false,
+                true,
+            ),
+        ] {
+            let panels = parse_config_body(content).panels;
+            assert_eq!((panels.context, panels.token_rate), (context, token_rate));
+        }
+
+        let mut content = "# preferences\nshow_context = false\nfuture_key = 42\n".to_string();
+        for token_rate in [true, false, true] {
+            content = rewrite_kv_lines(&content, &[("show_token_rate", token_rate.to_string())]);
+            let panels = parse_config_body(&content).panels;
+            assert!(!panels.context);
+            assert_eq!(panels.token_rate, token_rate);
+            assert_eq!(content.matches("show_token_rate").count(), 1);
+            assert!(content.contains("# preferences"));
+            assert!(content.contains("future_key = 42"));
+        }
+    }
 
     #[test]
     fn parse_string_array_basic() {

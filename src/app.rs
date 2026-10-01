@@ -173,6 +173,7 @@ pub enum NarrowSection {
     Sessions,
     Projects,
     Context,
+    TokenRate,
     Quota,
     Tokens,
     Models,
@@ -184,7 +185,9 @@ impl NarrowSection {
     pub fn tab(self) -> NarrowTab {
         match self {
             Self::Sessions | Self::Projects => NarrowTab::Work,
-            Self::Context | Self::Quota | Self::Tokens | Self::Models => NarrowTab::Usage,
+            Self::TokenRate | Self::Context | Self::Quota | Self::Tokens | Self::Models => {
+                NarrowTab::Usage
+            }
             Self::Ports | Self::Mcp => NarrowTab::System,
         }
     }
@@ -229,6 +232,9 @@ pub struct App {
     kill_confirm: Option<(usize, Instant)>,
     pub theme: Theme,
     pub show_context: bool,
+    pub show_token_rate: bool,
+    /// Injectable persistence boundary; tests never write the user's config.
+    pub(crate) save_panel_visibility: fn(&crate::config::PanelVisibility) -> Result<(), String>,
     pub show_quota: bool,
     pub show_tokens: bool,
     pub show_models: bool,
@@ -310,6 +316,8 @@ impl App {
             kill_confirm: None,
             theme,
             show_context: panels.context,
+            show_token_rate: panels.token_rate,
+            save_panel_visibility: crate::config::save_panel_visibility,
             show_quota: panels.quota,
             show_tokens: panels.tokens,
             show_models: panels.models,
@@ -362,6 +370,7 @@ impl App {
             6 => self.show_sessions = !self.show_sessions,
             7 => self.show_mcp = !self.show_mcp,
             8 => self.show_models = !self.show_models,
+            9 => self.show_token_rate = !self.show_token_rate,
             _ => return,
         }
         self.persist_panel_visibility();
@@ -385,6 +394,7 @@ impl App {
     fn persist_panel_visibility(&mut self) {
         let panels = crate::config::PanelVisibility {
             context: self.show_context,
+            token_rate: self.show_token_rate,
             quota: self.show_quota,
             tokens: self.show_tokens,
             models: self.show_models,
@@ -393,7 +403,7 @@ impl App {
             sessions: self.show_sessions,
             mcp: self.show_mcp,
         };
-        if let Err(e) = crate::config::save_panel_visibility(&panels) {
+        if let Err(e) = (self.save_panel_visibility)(&panels) {
             self.set_status(format!("panels save failed: {}", e));
         }
     }
@@ -410,7 +420,7 @@ impl App {
     }
 
     pub fn config_item_count(&self) -> usize {
-        9 // theme + 8 panel toggles
+        10 // theme + 9 panel toggles
     }
 
     pub fn config_select_next(&mut self) {
@@ -437,6 +447,7 @@ impl App {
             6 => self.show_sessions = !self.show_sessions,
             7 => self.show_mcp = !self.show_mcp,
             8 => self.show_models = !self.show_models,
+            9 => self.show_token_rate = !self.show_token_rate,
             _ => return,
         }
         self.persist_panel_visibility();
@@ -447,7 +458,11 @@ impl App {
         match tab {
             NarrowTab::Work => self.show_sessions || self.show_projects,
             NarrowTab::Usage => {
-                self.show_context || self.show_quota || self.show_tokens || self.show_models
+                self.show_token_rate
+                    || self.show_context
+                    || self.show_quota
+                    || self.show_tokens
+                    || self.show_models
             }
             NarrowTab::System => self.show_ports || self.show_mcp,
         }
@@ -511,6 +526,7 @@ impl App {
             NarrowSection::Sessions => self.show_sessions,
             NarrowSection::Projects => self.show_projects,
             NarrowSection::Context => self.show_context,
+            NarrowSection::TokenRate => self.show_token_rate,
             NarrowSection::Quota => self.show_quota,
             NarrowSection::Tokens => self.show_tokens,
             NarrowSection::Models => self.show_models,
@@ -523,6 +539,7 @@ impl App {
         let sections: &[NarrowSection] = match tab {
             NarrowTab::Work => &[NarrowSection::Sessions, NarrowSection::Projects],
             NarrowTab::Usage => &[
+                NarrowSection::TokenRate,
                 NarrowSection::Context,
                 NarrowSection::Quota,
                 NarrowSection::Tokens,

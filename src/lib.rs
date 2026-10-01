@@ -304,7 +304,7 @@ fn handle_key_press(
             KeyCode::Char('T') => app.tree_view = !app.tree_view,
             KeyCode::Char('l') => app.toggle_timeline(),
             KeyCode::Char('f') => app.toggle_file_audit(),
-            KeyCode::Char(c @ '1'..='8') => app.toggle_panel(c as u8 - b'0'),
+            KeyCode::Char(c @ '1'..='9') => app.toggle_panel(c as u8 - b'0'),
             KeyCode::Char('M') => app.toggle_mcp_session_suppression(),
             KeyCode::Char('t') => app.cycle_theme(),
             _ => {}
@@ -346,7 +346,7 @@ fn handle_key_press(
             KeyCode::Char('t') => app.cycle_theme(),
             KeyCode::Char('T') => app.tree_view = !app.tree_view,
             KeyCode::Char('l') | KeyCode::Char('L') => app.toggle_timeline(),
-            KeyCode::Char(c @ '1'..='8') => app.toggle_panel(c as u8 - b'0'),
+            KeyCode::Char(c @ '1'..='9') => app.toggle_panel(c as u8 - b'0'),
             KeyCode::Char('M') => app.toggle_mcp_session_suppression(),
             KeyCode::Char('c') => app.toggle_config(),
             KeyCode::Char('v') => app.toggle_view_menu(),
@@ -575,6 +575,59 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn token_rate_keyboard_menu_and_config_persist_independently() {
+        thread_local! {
+            static SAVED: std::cell::RefCell<Vec<(bool, bool)>> = const {
+                std::cell::RefCell::new(Vec::new())
+            };
+        }
+        let mut app = App::new_with_config(theme::Theme::default(), &[], Default::default());
+        app.save_panel_visibility = |panels| {
+            SAVED.with_borrow_mut(|saved| saved.push((panels.context, panels.token_rate)));
+            Ok(())
+        };
+        let key = KeyEvent::new(KeyCode::Char('9'), KeyModifiers::NONE);
+        handle_key_press(&mut app, key, true, false, |_| panic!("must not jump"));
+        assert!(!app.show_token_rate);
+        assert!(app.show_context);
+        app.view_open = true;
+        handle_key_press(&mut app, key, true, false, |_| panic!("must not jump"));
+        assert!(app.show_token_rate);
+        app.view_open = false;
+        app.toggle_config();
+        for _ in 0..app.config_item_count() {
+            app.config_select_next();
+        }
+        handle_key_press(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            true,
+            false,
+            |_| panic!("must not jump"),
+        );
+        assert!(!app.show_token_rate);
+        app.toggle_config();
+        handle_key_press(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+            true,
+            false,
+            |_| panic!("must not jump"),
+        );
+        assert!(!app.show_context);
+        assert!(!app.show_token_rate);
+        app.filter_active = true;
+        handle_key_press(&mut app, key, true, false, |_| panic!("must not jump"));
+        assert_eq!(app.filter_text, "9");
+        SAVED.with_borrow(|saved| {
+            assert_eq!(
+                *saved,
+                [(true, false), (true, true), (true, false), (false, false)]
+            );
+        });
+    }
 
     #[test]
     fn saved_scope_initializes_app_without_changing_snapshot_interface() {
