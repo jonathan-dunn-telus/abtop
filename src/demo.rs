@@ -59,14 +59,17 @@ pub fn populate_demo(app: &mut App) {
             ],
             compaction_count: 2,
             context_window: 200_000,
+            subagent_counts: Default::default(),
             subagents: vec![
                 SubAgent {
+                    activity_key: String::new(),
                     name: "Explore test coverage".into(),
 
                     status: "done".into(),
                     tokens: 12_400,
                 },
                 SubAgent {
+                    activity_key: String::new(),
                     name: "Run integration tests".into(),
 
                     status: "working".into(),
@@ -290,6 +293,7 @@ pub fn populate_demo(app: &mut App) {
             ],
             compaction_count: 1,
             context_window: 200_000,
+            subagent_counts: Default::default(),
             subagents: vec![],
             mem_file_count: 2,
             mem_line_count: 8,
@@ -343,6 +347,7 @@ pub fn populate_demo(app: &mut App) {
             context_history: vec![],
             compaction_count: 0,
             context_window: 200_000,
+            subagent_counts: Default::default(),
             subagents: vec![],
             mem_file_count: 1,
             mem_line_count: 3,
@@ -447,6 +452,7 @@ pub fn populate_demo(app: &mut App) {
             context_history: vec![],
             compaction_count: 0,
             context_window: 200_000,
+            subagent_counts: Default::default(),
             subagents: vec![],
             mem_file_count: 0,
             mem_line_count: 0,
@@ -505,6 +511,7 @@ pub fn populate_demo(app: &mut App) {
             context_history: vec![],
             compaction_count: 0,
             context_window: 200_000,
+            subagent_counts: Default::default(),
             subagents: vec![],
             mem_file_count: 0,
             mem_line_count: 0,
@@ -591,6 +598,16 @@ pub fn populate_demo(app: &mut App) {
         let cache = rate as u64 * (index as u64 % 5 + 2);
         let at = now - Duration::from_secs((rates.len() - 1 - index) as u64 * 2);
         app.record_global_token_delta(at, demo_token_delta(rate as u64, cache));
+        for (i, session) in app.sessions.iter_mut().enumerate() {
+            if matches!(session.agent_cli, "claude" | "codex") {
+                session.subagent_counts.working = if rate == 0.0 {
+                    0
+                } else {
+                    ((index + i) % 5 + 1) as u32
+                };
+            }
+        }
+        app.record_agents(at);
     }
     // Synthetic rolling totals for the aggregate Tokens sparkline.
     app.live_token_history = rates
@@ -631,5 +648,15 @@ pub(crate) fn advance_token_rates(app: &mut App) {
         app.cache_read_rates.pop_front(),
     ) {
         app.record_global_token_delta(Instant::now(), demo_token_delta(rate as u64, cache as u64));
+        for (i, session) in app.sessions.iter_mut().enumerate() {
+            if matches!(session.agent_cli, "claude" | "codex") {
+                session.subagent_counts.working = if rate == 0.0 {
+                    0
+                } else {
+                    ((rate as usize / 100 + i) % 5 + 1) as u32
+                };
+            }
+        }
+        app.record_agents(Instant::now());
     }
 }

@@ -30,6 +30,9 @@ pub struct Snapshot {
     pub host: Option<HostMetrics>,
     /// Aggregate metrics across all sessions.
     pub aggregate: AgentAggregate,
+    pub subagent_counts: crate::model::AgentTotals,
+    /// Working main agents plus their working subagents, independent of UI scope.
+    pub agent_counts: crate::model::AgentTotals,
     /// Most recent per-tick token rate: the delta of *active* tokens, where
     /// active = input + output + cache_create (cache_read is excluded to avoid
     /// inflated rates). It therefore will NOT equal successive `total_tokens`
@@ -154,6 +157,7 @@ pub struct SessionView {
     pub token_history: Vec<u64>,
     /// Spawned subagents, if any.
     pub subagents: Vec<SubAgentView>,
+    pub subagent_counts: crate::model::AgentCounts,
     /// Recent tool-call timeline (trimmed tail, newest last).
     pub tool_calls: Vec<ToolCallView>,
     /// Recent chat transcript tail (user/assistant only).
@@ -238,6 +242,7 @@ impl App {
                 children: s.children.clone(),
                 compaction_count: s.compaction_count,
                 token_history: tail(&s.token_history, 64),
+                subagent_counts: s.subagent_counts,
                 subagents: tail(&s.subagents, 16)
                     .iter()
                     .map(|a| SubAgentView {
@@ -285,6 +290,8 @@ impl App {
             generated_at_ms: epoch_ms(now).unwrap_or(0),
             host: self.host_metrics,
             aggregate: self.agent_aggregate,
+            subagent_counts: self.global_subagent_counts(),
+            agent_counts: self.global_agent_counts(),
             token_rate: self.token_rates.back().copied().unwrap_or(0.0),
             interval_ms,
             sessions,

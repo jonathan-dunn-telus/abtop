@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+mod agents;
 mod stats;
 pub use stats::StatsScope;
 
@@ -186,6 +187,7 @@ pub enum NarrowSection {
     Projects,
     Context,
     TokenRate,
+    Agents,
     Quota,
     Tokens,
     Models,
@@ -196,7 +198,7 @@ pub enum NarrowSection {
 impl NarrowSection {
     pub fn tab(self) -> NarrowTab {
         match self {
-            Self::Sessions | Self::Projects => NarrowTab::Work,
+            Self::Sessions | Self::Projects | Self::Agents => NarrowTab::Work,
             Self::TokenRate | Self::Context | Self::Quota | Self::Tokens | Self::Models => {
                 NarrowTab::Usage
             }
@@ -210,6 +212,10 @@ pub struct App {
     pub selected: usize,
     /// Shared scope for the Tokens and Models panes.
     pub stats_scope: StatsScope,
+    pub agent_scope: StatsScope,
+    pub(crate) agent_history: agents::AgentHistory,
+    pub(crate) save_agent_scope: fn(StatsScope) -> Result<(), String>,
+    pub show_agents: bool,
     /// Combined rolling tokens/min, sampled for the sessions live at each tick.
     pub(crate) live_token_history: VecDeque<u64>,
     /// Injectable persistence boundary; tests never write the user's config.
@@ -313,6 +319,10 @@ impl App {
             sessions: Vec::new(),
             selected: 0,
             stats_scope: StatsScope::default(),
+            agent_scope: StatsScope::AllLive,
+            agent_history: Default::default(),
+            save_agent_scope: crate::config::save_agent_scope,
+            show_agents: panels.agents,
             live_token_history: VecDeque::with_capacity(GRAPH_HISTORY_LEN),
             save_stats_scope: crate::config::save_stats_scope,
             should_quit: false,
@@ -388,6 +398,7 @@ impl App {
 
     pub fn toggle_panel(&mut self, panel: u8) {
         match panel {
+            0 => self.show_agents = !self.show_agents,
             1 => self.show_context = !self.show_context,
             2 => self.show_quota = !self.show_quota,
             3 => self.show_tokens = !self.show_tokens,
@@ -419,6 +430,7 @@ impl App {
 
     fn persist_panel_visibility(&mut self) {
         let panels = crate::config::PanelVisibility {
+            agents: self.show_agents,
             context: self.show_context,
             token_rate: self.show_token_rate,
             quota: self.show_quota,
@@ -446,7 +458,7 @@ impl App {
     }
 
     pub fn config_item_count(&self) -> usize {
-        11 // theme + 9 panel toggles + cache chart
+        12 // theme + 10 panel toggles + cache chart
     }
 
     pub fn config_select_next(&mut self) {
@@ -478,6 +490,7 @@ impl App {
                 self.toggle_cache_read_rate();
                 return;
             }
+            11 => self.show_agents = !self.show_agents,
             _ => return,
         }
         self.persist_panel_visibility();
@@ -486,7 +499,7 @@ impl App {
 
     pub fn narrow_tab_visible(&self, tab: NarrowTab) -> bool {
         match tab {
-            NarrowTab::Work => self.show_sessions || self.show_projects,
+            NarrowTab::Work => self.show_sessions || self.show_projects || self.show_agents,
             NarrowTab::Usage => {
                 self.show_token_rate
                     || self.show_context
@@ -557,6 +570,7 @@ impl App {
             NarrowSection::Projects => self.show_projects,
             NarrowSection::Context => self.show_context,
             NarrowSection::TokenRate => self.show_token_rate,
+            NarrowSection::Agents => self.show_agents,
             NarrowSection::Quota => self.show_quota,
             NarrowSection::Tokens => self.show_tokens,
             NarrowSection::Models => self.show_models,
@@ -567,7 +581,11 @@ impl App {
 
     pub fn visible_narrow_sections(&self, tab: NarrowTab) -> Vec<NarrowSection> {
         let sections: &[NarrowSection] = match tab {
-            NarrowTab::Work => &[NarrowSection::Sessions, NarrowSection::Projects],
+            NarrowTab::Work => &[
+                NarrowSection::Agents,
+                NarrowSection::Sessions,
+                NarrowSection::Projects,
+            ],
             NarrowTab::Usage => &[
                 NarrowSection::TokenRate,
                 NarrowSection::Context,
@@ -705,6 +723,7 @@ impl App {
         }
 
         promote_waiting_to_rate_limited(&mut self.sessions, &self.rate_limits);
+        self.record_agents(Instant::now());
     }
 
     pub(crate) fn update_session_token_rates(&mut self, now: Instant) {
@@ -1273,6 +1292,7 @@ mod tests {
             token_history: vec![],
             context_history: vec![],
             context_window: 0,
+            subagent_counts: Default::default(),
             subagents: vec![],
             mem_file_count: 0,
             mem_line_count: 0,

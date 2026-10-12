@@ -1,7 +1,7 @@
 use super::process::{self, ProcInfo};
 use crate::model::{
-    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface, ModelUsage,
-    SessionFile, SessionStatus, SubAgent, MAX_CHAT_MESSAGES, MAX_FILE_ACCESSES,
+    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface,
+    ModelUsage, SessionFile, SessionStatus, SubAgent, MAX_CHAT_MESSAGES, MAX_FILE_ACCESSES,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -66,6 +66,7 @@ pub struct ClaudeCollector {
     /// Per-session subagent usage, keyed by subagents directory then transcript path.
     /// Keep only counters and offsets, not each workflow agent's full transcript state.
     subagent_cache: HashMap<PathBuf, HashMap<PathBuf, SubagentUsage>>,
+    activity: HashMap<PathBuf, super::activity::ClaudeActivity>,
 }
 
 impl ClaudeCollector {
@@ -80,6 +81,7 @@ impl ClaudeCollector {
             configured_config_dirs,
             transcript_cache: HashMap::new(),
             subagent_cache: HashMap::new(),
+            activity: HashMap::new(),
         }
     }
 
@@ -190,6 +192,11 @@ impl ClaudeCollector {
             sessions.iter().map(|s| s.session_id.as_str()).collect();
         self.transcript_cache
             .retain(|sid, _| active_ids.contains(sid.as_str()));
+        self.activity.retain(|path, _| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|id| active_ids.contains(id))
+        });
         self.subagent_cache.retain(|dir, _| {
             dir.parent()
                 .and_then(Path::file_name)
@@ -477,9 +484,8 @@ impl ClaudeCollector {
                     }
                     prev.compaction_count += delta.compaction_count;
                     prev.turn_count += delta.turn_count;
-                    // Always update current_task from delta — empty means
-                    // latest assistant turn had no tool_use (task cleared)
-                    if delta.turn_count > 0 {
+                    // Assistant turns and completed manual compaction can clear tasks.
+                    if delta.saw_task_state {
                         prev.current_task = delta.current_task;
                     }
                     if !delta.version.is_empty() {
@@ -559,6 +565,7 @@ impl ClaudeCollector {
             last_assistant_ts_ms: 0,
             last_user_ts_ms: 0,
             saw_turn: false,
+            saw_task_state: false,
             file_accesses: Vec::new(),
         };
         let cached = self
@@ -597,10 +604,9 @@ impl ClaudeCollector {
             .and_then(|tp| tp.parent().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| config.projects_dir.join(encode_cwd_path(&sf.cwd)));
 
-        // Collect subagents before deriving the parent status so asynchronous
-        // Agent work keeps the parent active after its tool_result has returned.
+        // Collect child lifecycle state independently of the main agent's work.
         let subagents_dir = project_dir.join(&sf.session_id).join("subagents");
-        let (subagents, subagent_totals) = Self::collect_subagents(
+        let (mut subagents, subagent_totals) = Self::collect_subagents(
             &subagents_dir,
             self.subagent_cache
                 .entry(subagents_dir.clone())
@@ -613,7 +619,22 @@ impl ClaudeCollector {
                 ModelUsage::merge(&mut model_usage, &usage.model_usage);
             }
         }
-        let has_working_subagent = subagents.iter().any(|agent| agent.status == "working");
+        let subagent_counts = if let Some(path) = &transcript_path {
+            let activity = self.activity.entry(path.clone()).or_default();
+            let counts = activity.update(path, &subagents_dir);
+            for agent in &mut subagents {
+                agent.status = activity
+                    .states
+                    .get(&agent.activity_key)
+                    .copied()
+                    .unwrap_or_default()
+                    .label()
+                    .to_owned();
+            }
+            counts
+        } else {
+            Default::default()
+        };
 
         // Status is best-effort. Signals we trust:
         //   1. Active descendant CPU → tool is running.
@@ -621,9 +642,7 @@ impl ClaudeCollector {
         //      tool_use unanswered. Catches I/O-bound tools (Read, Edit)
         //      whose descendants stay under 5% CPU, so the CPU heuristic
         //      alone would flicker to Waiting while the tool runs.
-        //   3. A working subagent → an async Agent call is still running even
-        //      though its tool_result has already returned to the parent.
-        //   4. last_user_ts_ms > 0 → trailing transcript line is a real
+        //   3. last_user_ts_ms > 0 → trailing transcript line is a real
         //      user prompt with no assistant reply yet, so the model is
         //      generating. tool_result wrappers are skipped at the
         //      parser level so this only fires for actual prompts.
@@ -643,7 +662,7 @@ impl ClaudeCollector {
             // between CPU samples, so has_active_descendant alone misses them.
             let pending_tool = !cached.current_task.is_empty();
             let model_generating = cached.last_user_ts_ms > 0;
-            if has_active_descendant || pending_tool || has_working_subagent {
+            if has_active_descendant || pending_tool {
                 SessionStatus::Executing
             } else if model_generating {
                 SessionStatus::Thinking
@@ -653,7 +672,11 @@ impl ClaudeCollector {
         };
 
         let configured_model = read_configured_model(&sf.cwd);
-        let context_window = crate::collector::context_window_for_model(&model, &configured_model, max_context_tokens);
+        let context_window = crate::collector::context_window_for_model(
+            &model,
+            &configured_model,
+            max_context_tokens,
+        );
         let context_percent = if context_window > 0 {
             (last_context_tokens as f64 / context_window as f64) * 100.0
         } else {
@@ -735,6 +758,7 @@ impl ClaudeCollector {
             compaction_count,
             context_window,
             subagents,
+            subagent_counts,
             mem_file_count,
             mem_line_count,
             children,
@@ -824,6 +848,11 @@ impl ClaudeCollector {
                     .ok()
                     .and_then(|mtime| mtime.elapsed().ok());
                 let subagent = SubAgent {
+                    activity_key: super::activity::activity_key(
+                        subagents_dir,
+                        path.parent().unwrap(),
+                        name.trim_start_matches("agent-").trim_end_matches(".jsonl"),
+                    ),
                     name: truncate(description, 30),
                     status: if age.is_some_and(|age| age.as_secs() < 30) {
                         "working".to_string()
@@ -1327,11 +1356,13 @@ struct TranscriptResult {
     /// followed by an assistant turn. Zero when the latest entry was an
     /// assistant turn. Mutually exclusive with `last_assistant_ts_ms`.
     last_user_ts_ms: u64,
-    /// True when this parse observed at least one `user` or `assistant`
-    /// line. When false the timestamp fields above are just defaults and
+    /// True when this parse observed a turn or a manual compaction boundary.
+    /// When false the timestamp fields above are just defaults and
     /// must not overwrite cached state - otherwise a no-new-data tick
     /// would clear the live pending/thinking markers.
     saw_turn: bool,
+    /// A new assistant turn or manual compaction updated the pending tool state.
+    saw_task_state: bool,
     /// File access audit log extracted from tool_use entries.
     file_accesses: Vec<FileAccess>,
 }
@@ -1408,6 +1439,7 @@ fn parse_transcript_with_previous(
         last_assistant_ts_ms: 0,
         last_user_ts_ms: 0,
         saw_turn: false,
+        saw_task_state: false,
         file_accesses: Vec::new(),
     };
 
@@ -1510,6 +1542,7 @@ fn parse_transcript_with_previous(
 
                     match val.get("type").and_then(|t| t.as_str()) {
                         Some("assistant") => {
+                            result.saw_task_state = true;
                             result.turn_count += 1;
                             // Clear previous task on each new turn so stale tasks
                             // don't persist when latest turn has no tool_use
@@ -1681,6 +1714,13 @@ fn parse_transcript_with_previous(
                             }
                         }
                         Some("user") => {
+                            // Transcript-only context is not a new turn, including
+                            // when it arrives in a separate incremental read.
+                            if val["isCompactSummary"] == true
+                                || val["isVisibleInTranscriptOnly"] == true
+                            {
+                                continue;
+                            }
                             // Compute tool call duration: time from assistant turn to this user turn
                             if entry_ts_ms > 0 && result.last_assistant_ts_ms > 0 {
                                 let duration =
@@ -1748,6 +1788,19 @@ fn parse_transcript_with_previous(
                                 }
                             }
                         }
+                        Some("system")
+                            if val["subtype"] == "compact_boundary"
+                                && val["compactMetadata"]["trigger"] == "manual" =>
+                        {
+                            // Manual /compact finishes locally; no assistant reply
+                            // follows to close its thinking window. Auto compaction
+                            // belongs to an ongoing turn and must preserve activity.
+                            result.last_user_ts_ms = 0;
+                            result.last_assistant_ts_ms = 0;
+                            result.current_task.clear();
+                            result.saw_turn = true;
+                            result.saw_task_state = true;
+                        }
                         _ => {}
                     }
                 }
@@ -1773,7 +1826,7 @@ fn parse_transcript_with_previous(
 /// Encode a cwd path to match Claude Code's project directory naming.
 /// Claude Code replaces '/', '_', and '.' with '-'.
 /// True iff a `user`-role transcript entry is *synthetic* — i.e. not a
-/// real human prompt that the model still owes a reply for. Three forms:
+/// real human prompt that the model still owes a reply for. Recognized forms:
 ///
 /// 1. `isMeta: true` — Claude Code's explicit marker for non-prompt
 ///    entries (e.g. the `<local-command-caveat>` line).
@@ -1787,17 +1840,28 @@ fn parse_transcript_with_previous(
 ///    `<bash-input>...`. These are pure local operations that never
 ///    invoke the model, so treating them as a prompt would leave
 ///    `last_user_ts_ms` stuck and pin the session in Thinking forever.
+/// 4. Compaction summaries and transcript-only entries are stored context,
+///    not fresh user input.
 fn is_synthetic_user_msg(entry: &Value) -> bool {
-    if entry.get("isMeta").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if entry["isCompactSummary"] == true || entry["isVisibleInTranscriptOnly"] == true {
         return true;
     }
-    let Some(message) = entry.get("message") else { return false };
+    if entry
+        .get("isMeta")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let Some(message) = entry.get("message") else {
+        return false;
+    };
     match message.get("content") {
         Some(Value::Array(arr)) => {
             !arr.is_empty()
-                && arr.iter().all(|block| {
-                    block.get("type").and_then(|t| t.as_str()) == Some("tool_result")
-                })
+                && arr
+                    .iter()
+                    .all(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
         }
         Some(Value::String(s)) => {
             let t = s.trim_start();
@@ -2304,7 +2368,7 @@ mod tests {
         assert_eq!(session.total_cache_read, 36);
         assert_eq!(session.total_cache_create, 44);
         assert_eq!(session.subagents.len(), 2);
-        assert_eq!(session.status, SessionStatus::Executing);
+        assert_eq!(session.status, SessionStatus::Waiting);
         assert_eq!(
             session.model_usage,
             vec![
@@ -2675,6 +2739,61 @@ mod tests {
     }
 
     #[test]
+    fn manual_compaction_closes_activity_and_auto_compaction_preserves_it() {
+        for trigger in ["manual", "auto"] {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            write_lines(
+                &mut file,
+                &[
+                    r#"{"type":"user","timestamp":"2026-10-12T12:34:07Z","message":{"content":"/compact"}}"#,
+                ],
+            );
+            let offset = fs::metadata(file.path()).unwrap().len();
+            let boundary = serde_json::json!({
+                "type":"system", "subtype":"compact_boundary",
+                "timestamp":"2026-10-12T12:35:03Z",
+                "compactMetadata":{"trigger":trigger,"postTokens":100,"durationMs":1000}
+            })
+            .to_string();
+            write_lines(&mut file, &[&boundary]);
+            for marker in ["isCompactSummary", "isVisibleInTranscriptOnly"] {
+                let summary = serde_json::json!({
+                    "type":"user", "timestamp":"2026-10-12T12:35:02Z",
+                    marker:true,"message":{"content":"stored context"}
+                })
+                .to_string();
+                let summary_offset = fs::metadata(file.path()).unwrap().len();
+                write_lines(&mut file, &[&summary]);
+                let delta = parse_transcript(file.path(), summary_offset);
+                assert!(
+                    !delta.saw_turn,
+                    "stored context must not overwrite cached activity"
+                );
+                assert!(!delta.saw_task_state);
+            }
+            let full = parse_transcript(file.path(), 0);
+            let delta = parse_transcript(file.path(), offset);
+            if trigger == "manual" {
+                assert_eq!(full.last_user_ts_ms, 0);
+                assert_eq!(delta.last_user_ts_ms, 0);
+                assert!(delta.saw_turn);
+                assert!(delta.saw_task_state);
+            } else {
+                assert!(full.last_user_ts_ms > 0);
+                assert!(!delta.saw_turn);
+                assert!(!delta.saw_task_state);
+            }
+            write_lines(
+                &mut file,
+                &[
+                    r#"{"type":"user","timestamp":"2026-10-12T12:36:00Z","message":{"content":"new work"}}"#,
+                ],
+            );
+            assert!(parse_transcript(file.path(), 0).last_user_ts_ms > 0);
+        }
+    }
+
+    #[test]
     fn test_parse_transcript_no_new_bytes_does_not_set_saw_turn() {
         // Regression for the merge fix: a no-op poll (from_offset == file_len)
         // must return saw_turn=false so the cached pending/thinking markers
@@ -2869,15 +2988,18 @@ mod tests {
         // forever (Think generating reply). All three line shapes must be
         // treated as synthetic.
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        write_lines(&mut file, &[
-            // Real prompt + assistant reply to seed a clean Wait state.
-            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"hi"}}"#,
-            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:01Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"hello"}]}}"#,
-            // The three user-role lines `/plugin update` writes:
-            r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat: ...</local-command-caveat>"}}"#,
-            r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<command-name>/plugin</command-name>\n<command-args>update foo</command-args>"}}"#,
-            r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<local-command-stdout>Updated foo</local-command-stdout>"}}"#,
-        ]);
+        write_lines(
+            &mut file,
+            &[
+                // Real prompt + assistant reply to seed a clean Wait state.
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"hi"}}"#,
+                r#"{"type":"assistant","timestamp":"2026-03-28T15:00:01Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"hello"}]}}"#,
+                // The three user-role lines `/plugin update` writes:
+                r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat: ...</local-command-caveat>"}}"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<command-name>/plugin</command-name>\n<command-args>update foo</command-args>"}}"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<local-command-stdout>Updated foo</local-command-stdout>"}}"#,
+            ],
+        );
 
         let result = parse_transcript(file.path(), 0);
 
@@ -2895,11 +3017,14 @@ mod tests {
         // `!ls` and friends serialize as <bash-input>/<bash-stdout> user-role
         // lines with no assistant reply. Same failure mode as /plugin.
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        write_lines(&mut file, &[
-            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:00Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"ok"}]}}"#,
-            r#"{"type":"user","timestamp":"2026-03-28T15:00:05Z","message":{"role":"user","content":"<bash-input>ls</bash-input>"}}"#,
-            r#"{"type":"user","timestamp":"2026-03-28T15:00:05Z","message":{"role":"user","content":"<bash-stdout>a\nb</bash-stdout><bash-stderr></bash-stderr>"}}"#,
-        ]);
+        write_lines(
+            &mut file,
+            &[
+                r#"{"type":"assistant","timestamp":"2026-03-28T15:00:00Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"ok"}]}}"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:05Z","message":{"role":"user","content":"<bash-input>ls</bash-input>"}}"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:05Z","message":{"role":"user","content":"<bash-stdout>a\nb</bash-stdout><bash-stderr></bash-stderr>"}}"#,
+            ],
+        );
 
         let result = parse_transcript(file.path(), 0);
 
@@ -3730,7 +3855,10 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
     #[test]
     fn test_context_window_for_model() {
         // Base model with low token usage → 200K
-        assert_eq!(crate::collector::context_window_for_model("claude-opus-4-6", "", 50_000), 200_000);
+        assert_eq!(
+            crate::collector::context_window_for_model("claude-opus-4-6", "", 50_000),
+            200_000
+        );
         // Explicit [1m] suffix in transcript model → 1M regardless of token count
         assert_eq!(
             crate::collector::context_window_for_model("claude-opus-4-6[1m]", "", 0),
@@ -3745,7 +3873,10 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
             crate::collector::context_window_for_model("claude-sonnet-4-6", "", 100_000),
             200_000
         );
-        assert_eq!(crate::collector::context_window_for_model("unknown-model", "", 0), 200_000);
+        assert_eq!(
+            crate::collector::context_window_for_model("unknown-model", "", 0),
+            200_000
+        );
         // Token usage exceeds 200K → must be 1M window
         assert_eq!(
             crate::collector::context_window_for_model("claude-opus-4-6", "", 250_000),
@@ -4216,10 +4347,9 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
     }
 
     #[test]
-    fn test_load_session_working_async_subagent_is_executing() {
-        // Regression for #156: an async Agent tool returns immediately, so the
-        // parent has no pending tool while its subagent keeps working. The
-        // working subagent must keep the parent Executing instead of Waiting.
+    fn test_load_session_working_async_subagent_counts_independently_of_idle_parent() {
+        // An async Agent tool returns immediately. Once the parent's own turn
+        // finishes, only the child contributes to the working-agent count.
         let temp = tempfile::tempdir().unwrap();
         let profile = temp.path().join(".claude");
         let sessions_dir = profile.join("sessions");
@@ -4283,9 +4413,12 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
         assert_eq!(sessions[0].subagents[0].status, "working");
         assert_eq!(
             sessions[0].status,
-            SessionStatus::Executing,
-            "a working async subagent must keep its parent Executing",
+            SessionStatus::Waiting,
+            "a working async subagent must not count its idle parent as working",
         );
+        let mut totals = crate::model::AgentTotals::default();
+        totals.add_session(&sessions[0]);
+        assert_eq!(totals.claude.working, 1);
     }
 
     #[test]

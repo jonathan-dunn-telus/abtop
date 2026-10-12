@@ -28,6 +28,16 @@ pub(crate) fn items(app: &App) -> Vec<ViewItem> {
     let bool_state = |b: bool| if b { On } else { Off };
     vec![
         ViewItem {
+            key: '0',
+            label: "agents panel",
+            state: bool_state(app.show_agents),
+        },
+        ViewItem {
+            key: 'g',
+            label: "agent scope",
+            state: Value(app.agent_scope.label()),
+        },
+        ViewItem {
             key: 'a',
             label: "stats scope",
             state: Value(app.stats_scope.label()),

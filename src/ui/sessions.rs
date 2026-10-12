@@ -10,6 +10,14 @@ use ratatui::Frame;
 
 use super::{btop_block_active, fmt_mem_kb, fmt_tokens, grad_at, make_gradient, truncate_str};
 
+fn subagent_status_icon(status: &str) -> &'static str {
+    match status {
+        "working" => "●",
+        "unknown" => "?",
+        _ => "✓",
+    }
+}
+
 pub(crate) fn draw_sessions_panel(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     draw_sessions_panel_active(f, app, area, theme, false);
 }
@@ -294,7 +302,13 @@ pub(crate) fn draw_sessions_panel_active(
                 let prefix = if is_last { "└─" } else { "├─" };
                 let is_working = sa.status.eq_ignore_ascii_case("working")
                     || sa.status.eq_ignore_ascii_case("in_progress");
-                let icon = if is_working { "●" } else { "✓" };
+                let icon = if is_working {
+                    "●"
+                } else if sa.status == "unknown" {
+                    "?"
+                } else {
+                    "✓"
+                };
                 let sa_fg = if is_working {
                     theme.proc_misc
                 } else {
@@ -749,7 +763,7 @@ pub(crate) fn draw_sessions_panel_active(
                             for (row_idx, sa) in left_agents.iter().enumerate() {
                                 let mut spans = Vec::new();
                                 // Left column
-                                let icon = if sa.status == "working" { "●" } else { "✓" };
+                                let icon = subagent_status_icon(&sa.status);
                                 let fg = if sa.status == "working" {
                                     theme.main_fg
                                 } else {
@@ -771,11 +785,7 @@ pub(crate) fn draw_sessions_panel_active(
 
                                 // Right column
                                 if let Some(sa_r) = right_agents.get(row_idx) {
-                                    let icon_r = if sa_r.status == "working" {
-                                        "●"
-                                    } else {
-                                        "✓"
-                                    };
+                                    let icon_r = subagent_status_icon(&sa_r.status);
                                     let fg_r = if sa_r.status == "working" {
                                         theme.main_fg
                                     } else {
@@ -800,7 +810,7 @@ pub(crate) fn draw_sessions_panel_active(
                         } else {
                             let name_w = col_w.saturating_sub(12);
                             for sa in &session.subagents {
-                                let icon = if sa.status == "working" { "●" } else { "✓" };
+                                let icon = subagent_status_icon(&sa.status);
                                 let fg = if sa.status == "working" {
                                     theme.main_fg
                                 } else {
@@ -1305,6 +1315,7 @@ mod tests {
             context_history: Vec::new(),
             compaction_count: 0,
             context_window: 258_400,
+            subagent_counts: Default::default(),
             subagents: Vec::new(),
             mem_file_count: 0,
             mem_line_count: 0,
@@ -1507,6 +1518,7 @@ mod tests {
             context_history: Vec::new(),
             compaction_count: 0,
             context_window: 200_000,
+            subagent_counts: Default::default(),
             subagents: Vec::new(),
             mem_file_count: 0,
             mem_line_count: 0,

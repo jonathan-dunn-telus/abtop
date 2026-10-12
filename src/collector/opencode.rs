@@ -221,6 +221,7 @@ impl OpenCodeCollector {
                 context_history: vec![],
                 compaction_count: 0,
                 context_window,
+                subagent_counts: Default::default(),
                 subagents: vec![],
                 mem_file_count: 0,
                 mem_line_count: 0,

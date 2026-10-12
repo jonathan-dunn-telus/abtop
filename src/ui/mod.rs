@@ -1,3 +1,4 @@
+mod agents;
 mod config;
 mod context;
 mod footer;
@@ -323,6 +324,7 @@ const DESKTOP_MIN_WIDTH: u16 = 100;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ClickTarget {
     StatsScope,
+    AgentScope,
     NarrowTab(NarrowTab),
     NarrowSection(NarrowSection),
     NarrowZoom(NarrowSection),
@@ -334,6 +336,7 @@ struct DesktopLayout {
     header: Rect,
     context: Option<Rect>,
     token_rate: Option<Rect>,
+    agents: Option<Rect>,
     mid: Vec<(NarrowSection, Rect)>,
     sessions: Option<Rect>,
     footer: Rect,
@@ -430,6 +433,10 @@ pub fn draw(f: &mut Frame, app: &App) {
         token_rate::draw_token_rate_panel_active(f, app, area, theme, false);
     }
 
+    if let Some(area) = layout.agents {
+        agents::draw(f, app, area, theme, false);
+    }
+
     if let Some(area) = layout.context {
         context::draw_context_panel(f, app, area, theme);
     }
@@ -442,7 +449,10 @@ pub fn draw(f: &mut Frame, app: &App) {
             NarrowSection::Projects => projects::draw_projects_panel(f, app, area, theme),
             NarrowSection::Ports => ports::draw_ports_panel(f, app, area, theme),
             NarrowSection::Mcp => mcp::draw_mcp_panel(f, app, area, theme),
-            NarrowSection::Sessions | NarrowSection::Context | NarrowSection::TokenRate => {}
+            NarrowSection::Agents
+            | NarrowSection::Sessions
+            | NarrowSection::Context
+            | NarrowSection::TokenRate => {}
         }
     }
 
@@ -482,7 +492,10 @@ fn desktop_min_width(section: NarrowSection) -> u16 {
         NarrowSection::Quota | NarrowSection::Ports | NarrowSection::Mcp => 24,
         NarrowSection::Tokens => 22,
         NarrowSection::Models | NarrowSection::Projects => 20,
-        NarrowSection::Sessions | NarrowSection::Context | NarrowSection::TokenRate => 0,
+        NarrowSection::Agents
+        | NarrowSection::Sessions
+        | NarrowSection::Context
+        | NarrowSection::TokenRate => 0,
     }
 }
 
@@ -519,7 +532,12 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
     // Tokens need five content rows for the total and all four categories.
     let mid_min = if app.show_tokens { 7 } else { 6 };
     let mid_reserved = if any_mid { mid_min.min(available) } else { 0 };
-    let sessions_budget = available.saturating_sub(mid_reserved);
+    let agents_min = if app.show_agents {
+        3.min(available.saturating_sub(mid_reserved + if app.show_sessions { 5 } else { 0 }))
+    } else {
+        0
+    };
+    let sessions_budget = available.saturating_sub(mid_reserved + agents_min);
     let sessions_h = if app.show_sessions {
         sessions_ideal
             .min(sessions_budget)
@@ -527,7 +545,12 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
     } else {
         0
     };
-    let after_sessions = available.saturating_sub(sessions_h);
+    let agents_h = if agents_min > 0 {
+        7.min(available.saturating_sub(sessions_h + mid_reserved))
+    } else {
+        0
+    };
+    let after_sessions = available.saturating_sub(sessions_h + agents_h);
     let mid_h = if any_mid {
         mid_h_ideal
             .min(after_sessions)
@@ -535,7 +558,7 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
     } else {
         0
     };
-    let surplus = available.saturating_sub(sessions_h + mid_h);
+    let surplus = available.saturating_sub(sessions_h + mid_h + agents_h);
     let top_enabled = app.show_context || app.show_token_rate;
     let top_h = if top_enabled && sessions_h >= sessions_ideal && surplus >= TOP_MIN {
         top_ideal.min(surplus)
@@ -543,7 +566,7 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
         0
     };
 
-    let mut constraints = [Constraint::Length(0); 5];
+    let mut constraints = [Constraint::Length(0); 6];
     let mut n = 0;
     constraints[n] = Constraint::Length(1);
     n += 1;
@@ -553,6 +576,10 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
     }
     if mid_h > 0 {
         constraints[n] = Constraint::Length(mid_h);
+        n += 1;
+    }
+    if agents_h > 0 {
+        constraints[n] = Constraint::Length(agents_h);
         n += 1;
     }
     if sessions_h > 0 {
@@ -608,6 +635,13 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
         Vec::new()
     };
 
+    let agents = if agents_h > 0 {
+        let area = chunks[idx];
+        idx += 1;
+        Some(area)
+    } else {
+        None
+    };
     let sessions = if sessions_h > 0 {
         let area = chunks[idx];
         idx += 1;
@@ -620,6 +654,7 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
         header,
         context,
         token_rate,
+        agents,
         mid,
         sessions,
         footer: chunks[idx],
@@ -739,6 +774,7 @@ fn narrow_section_areas(app: &App, tab: NarrowTab, area: Rect) -> Vec<(NarrowSec
 
     let constraints = if tab == NarrowTab::Usage {
         let min_height = |section| match section {
+            NarrowSection::Agents => 3,
             NarrowSection::Context | NarrowSection::TokenRate => 5,
             NarrowSection::Quota => 6,
             NarrowSection::Tokens => 7,
@@ -765,6 +801,33 @@ fn narrow_section_areas(app: &App, tab: NarrowTab, area: Rect) -> Vec<(NarrowSec
             }
         }
         minimum_constraints(&minima, area.height)
+    } else if tab == NarrowTab::Work && sections.contains(&NarrowSection::Agents) {
+        let mut heights: Vec<u16> = sections
+            .iter()
+            .map(|s| match s {
+                NarrowSection::Agents => 3,
+                NarrowSection::Sessions => 5,
+                _ => 4,
+            })
+            .collect();
+        let mut spare = area.height.saturating_sub(heights.iter().sum());
+        for target in [
+            NarrowSection::Sessions,
+            NarrowSection::Agents,
+            NarrowSection::Projects,
+        ] {
+            if let Some(i) = sections.iter().position(|s| *s == target) {
+                let ideal = match target {
+                    NarrowSection::Sessions => (app.sessions.len().min(1000) as u16 * 2 + 7).max(8),
+                    NarrowSection::Agents => 7,
+                    _ => area.height,
+                };
+                let extra = spare.min(ideal.saturating_sub(heights[i]));
+                heights[i] += extra;
+                spare -= extra;
+            }
+        }
+        minimum_constraints(&heights, area.height)
     } else {
         let count = sections.len() as u32;
         (0..count).map(|_| Constraint::Ratio(1, count)).collect()
@@ -824,6 +887,7 @@ fn draw_narrow_section(
         NarrowSection::Projects => {
             projects::draw_projects_panel_active(f, app, area, theme, active)
         }
+        NarrowSection::Agents => agents::draw(f, app, area, theme, active),
         NarrowSection::Context => context::draw_context_panel_active(f, app, area, theme, active),
         NarrowSection::TokenRate => {
             token_rate::draw_token_rate_panel_active(f, app, area, theme, active)
@@ -884,6 +948,12 @@ pub(crate) fn click_target(app: &App, area: Rect, column: u16, row: u16) -> Opti
     }
     if uses_desktop_layout(app, area.width) {
         let layout = desktop_layout(app, area);
+        if layout
+            .agents
+            .is_some_and(|a| contains(agents::scope_area(a), column, row))
+        {
+            return Some(ClickTarget::AgentScope);
+        }
         if let Some(sessions_area) = layout.sessions {
             if contains(sessions_area, column, row) {
                 return session_at(app, sessions_area, row).map(ClickTarget::Session);
@@ -911,6 +981,11 @@ pub(crate) fn click_target(app: &App, area: Rect, column: u16, row: u16) -> Opti
         for (section, section_area) in narrow_section_areas(app, tab, chunks[1]) {
             if !contains(section_area, column, row) {
                 continue;
+            }
+            if section == NarrowSection::Agents
+                && contains(agents::scope_area(section_area), column, row)
+            {
+                return Some(ClickTarget::AgentScope);
             }
             if zoom_button_at(section_area, column, row) {
                 return Some(ClickTarget::NarrowZoom(section));
@@ -1177,6 +1252,58 @@ mod tests {
     use ratatui::Terminal;
 
     #[test]
+    fn agents_stay_above_sessions_and_share_visible_mouse_and_zoom_layout() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        for (width, height) in [(160, 40), (160, 24), (80, 24), (60, 18)] {
+            let area = Rect::new(0, 0, width, height);
+            let (agents, sessions) = if uses_desktop_layout(&app, width) {
+                let layout = desktop_layout(&app, area);
+                (layout.agents.unwrap(), layout.sessions.unwrap())
+            } else {
+                let sections = narrow_section_areas(&app, NarrowTab::Work, narrow_chunks(area)[1]);
+                (
+                    sections
+                        .iter()
+                        .find(|(s, _)| *s == NarrowSection::Agents)
+                        .unwrap()
+                        .1,
+                    sections
+                        .iter()
+                        .find(|(s, _)| *s == NarrowSection::Sessions)
+                        .unwrap()
+                        .1,
+                )
+            };
+            assert!(agents.height >= 3);
+            assert!(sessions.height >= 5);
+            assert_eq!(agents.bottom(), sessions.y);
+            assert_eq!(
+                click_target(&app, area, agents.x + 3, agents.y),
+                Some(ClickTarget::AgentScope)
+            );
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| draw(f, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(text.contains("⁰agents") && text.contains("Now") && text.contains("Peak"));
+        }
+        app.toggle_narrow_section_zoom(NarrowSection::Agents);
+        let area = Rect::new(0, 0, 80, 24);
+        let sections = narrow_section_areas(&app, NarrowTab::Work, narrow_chunks(area)[1]);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].0, NarrowSection::Agents);
+        app.agent_scope = StatsScope::Selected;
+        app.selected = app
+            .sessions
+            .iter()
+            .position(|s| s.agent_cli == "opencode")
+            .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        assert!(format!("{}", terminal.backend()).contains("Agent activity unavailable"));
+    }
+
+    #[test]
     fn fmt_age_buckets() {
         // t() defaults to English when ABTOP_LANG is unset, so the strings
         // here match the en-US locale values for `time.{s,m,h,d}_ago`.
@@ -1286,13 +1413,26 @@ mod tests {
         );
         assert_eq!(click_target(&app, area, separator_x, tab_area.y), None);
         assert_eq!(click_target(&app, area, 3, tab_area.y), None);
+        let sections = narrow_section_areas(&app, NarrowTab::Work, chunks[1]);
+        let session_y = sections
+            .iter()
+            .find(|(s, _)| *s == NarrowSection::Sessions)
+            .unwrap()
+            .1
+            .y;
+        let projects_y = sections
+            .iter()
+            .find(|(s, _)| *s == NarrowSection::Projects)
+            .unwrap()
+            .1
+            .y;
         assert_eq!(
-            click_target(&app, area, 3, 4),
+            click_target(&app, area, 3, session_y + 2),
             Some(ClickTarget::Session(0))
         );
 
         assert_eq!(
-            click_target(&app, area, 3, 16),
+            click_target(&app, area, 3, projects_y + 1),
             Some(ClickTarget::NarrowSection(NarrowSection::Projects))
         );
 
@@ -1391,6 +1531,7 @@ mod tests {
         assert_eq!(usage_sections.len(), 4);
         for (section, area) in usage_sections {
             let minimum = match section {
+                NarrowSection::Agents => 3,
                 NarrowSection::Context | NarrowSection::TokenRate => 5,
                 NarrowSection::Quota => 6,
                 NarrowSection::Tokens => 7,
@@ -1590,7 +1731,7 @@ mod tests {
         app.sessions[app.selected].children.clear();
         app.sessions[app.selected].subagents.clear();
 
-        let backend = TestBackend::new(160, 40);
+        let backend = TestBackend::new(160, 47);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
         let text = format!("{}", terminal.backend());
@@ -1765,6 +1906,7 @@ mod tests {
     fn cache_chart_fits_desktop_and_narrow_layouts_without_changing_pane_controls() {
         let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
         crate::demo::populate_demo(&mut app);
+        app.show_agents = false; // Exercise the existing two-pane top-row allocation.
         app.sessions.truncate(1);
         let area = Rect::new(0, 0, 160, 40);
         assert_eq!(desktop_layout(&app, area).token_rate.unwrap().height, 5);

@@ -98,9 +98,60 @@ pub struct OrphanPort {
 
 #[derive(Debug, Clone)]
 pub struct SubAgent {
+    /// Relative transcript identity; not exposed in snapshots.
+    pub activity_key: String,
     pub name: String,
     pub status: String,
     pub tokens: u64,
+}
+
+/// Current agent activity, independent of lifetime token accounting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct AgentCounts {
+    pub working: u32,
+    pub unknown: u32,
+}
+
+impl AgentCounts {
+    pub fn add(&mut self, other: Self) {
+        self.working = self.working.saturating_add(other.working);
+        self.unknown = self.unknown.saturating_add(other.unknown);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct AgentTotals {
+    pub claude: AgentCounts,
+    pub codex: AgentCounts,
+}
+
+impl AgentTotals {
+    pub fn working(self) -> u32 {
+        self.claude.working.saturating_add(self.codex.working)
+    }
+    pub fn unknown(self) -> u32 {
+        self.claude.unknown.saturating_add(self.codex.unknown)
+    }
+    pub fn add_subagents(&mut self, session: &AgentSession) {
+        match session.agent_cli {
+            "claude" => self.claude.add(session.subagent_counts),
+            "codex" => self.codex.add(session.subagent_counts),
+            _ => {}
+        }
+    }
+
+    /// Chart activity includes the working root as well as its working children.
+    pub fn add_session(&mut self, session: &AgentSession) {
+        let counts = match session.agent_cli {
+            "claude" => &mut self.claude,
+            "codex" => &mut self.codex,
+            _ => return,
+        };
+        counts.add(session.subagent_counts);
+        counts.working = counts
+            .working
+            .saturating_add(u32::from(session.status.is_active()));
+    }
 }
 
 /// A single tool invocation from a session transcript.
@@ -242,6 +293,7 @@ pub struct AgentSession {
     /// Context window size for this session's model (e.g. 200K, 1M).
     pub context_window: u64,
     pub subagents: Vec<SubAgent>,
+    pub subagent_counts: AgentCounts,
     pub mem_file_count: u32,
     pub mem_line_count: u32,
     pub children: Vec<ChildProcess>,
@@ -368,6 +420,7 @@ mod tests {
             context_history: Vec::new(),
             compaction_count: 0,
             context_window: 0,
+            subagent_counts: Default::default(),
             subagents: Vec::new(),
             mem_file_count: 0,
             mem_line_count: 0,
