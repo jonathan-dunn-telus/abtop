@@ -14,19 +14,6 @@ use super::{
     stats_panel_title, styled_label,
 };
 
-/// Keep the cache-read exclusion visible even when bars must disappear.
-fn cache_read_label(inner_width: usize, value_width: usize) -> String {
-    let label = t("tokens.cache_r");
-    [
-        format!(" {label} excluded:"),
-        format!(" {label} excl:"),
-        "CR excl".to_string(),
-    ]
-    .into_iter()
-    .find(|label| label.width() + 1 + value_width <= inner_width)
-    .unwrap_or_else(|| "CR excl".to_string())
-}
-
 struct TokenRow<'a> {
     label: String,
     total_text: String,
@@ -130,7 +117,7 @@ pub(crate) fn draw_tokens_panel_active(
     ];
 
     let rates = stats.rates;
-    let mut rows = [
+    let rows = [
         TokenRow::new(
             format!(" {} :", t("tokens.input")),
             total_in,
@@ -146,10 +133,7 @@ pub(crate) fn draw_tokens_panel_active(
             &used_grad,
         ),
         TokenRow::new(
-            cache_read_label(
-                area.width.saturating_sub(2) as usize,
-                fmt_tokens(cache_read).width(),
-            ),
+            format!(" {}:", t("tokens.cache_r")),
             cache_read,
             rates.cache_read,
             cache_r_pct,
@@ -173,18 +157,7 @@ pub(crate) fn draw_tokens_panel_active(
             .max()
             .unwrap_or(0)
     };
-    // Shorten the exclusion label before hiding rates, then restore its fuller
-    // form when even compact labels cannot keep every category's rate visible.
-    if rate_text_w(&rows) > inner_w {
-        rows[2].label = cache_read_label(
-            inner_w,
-            rows[2].total_text.width() - 1 + rows[2].rate_text.width(),
-        );
-    }
     let show_rates = rate_text_w(&rows) <= inner_w;
-    if !show_rates {
-        rows[2].label = cache_read_label(inner_w, rows[2].total_text.width() - 1);
-    }
     let text_w = if show_rates {
         rate_text_w(&rows)
     } else {
@@ -309,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn tokens_exclude_reads_and_keep_the_exclusion_and_values_visible() {
+    fn tokens_exclude_reads_and_keep_labels_and_values_visible() {
         let mut app = app_with_rates([100, 50, 200, 30], [0; 4]);
         app.sessions[0].turn_count = 2;
         for scope in [StatsScope::Selected, StatsScope::AllLive] {
@@ -318,7 +291,7 @@ mod tests {
                 let lines = render(&app, width);
                 assert!(lines[1].contains("180"), "{width}: {}", lines[1]);
                 assert!(lines[4].contains("200"), "{width}: {}", lines[4]);
-                assert!(lines[4].contains("excl"), "{width}: {}", lines[4]);
+                assert!(lines[4].contains("CacheR:"), "{width}: {}", lines[4]);
                 assert!(lines[5].contains("30"), "{width}: {}", lines[5]);
                 if width >= 32 {
                     assert!(lines[7].contains("90/t"));
@@ -336,7 +309,7 @@ mod tests {
             let lines = render(&app, 32);
             assert!(lines[1].contains("Total: 0"));
             assert!(lines[4].contains("200"));
-            assert!(lines[4].contains("excl"));
+            assert!(lines[4].contains("CacheR:"));
             assert!(lines[7].contains("0/t"));
             assert!(!lines.join("\n").contains("NaN"));
         }
@@ -388,7 +361,7 @@ mod tests {
             for (row, label, values) in [
                 (2, "Input", "402k  12.3k/min"),
                 (3, "Output", "89k  4.5k/min"),
-                (4, "excl", "710k  6.8k/min"),
+                (4, "CacheR", "710k  6.8k/min"),
                 (5, "CacheW", "12k  0/min"),
             ] {
                 assert!(lines[row].contains(label), "{}", lines[row]);
