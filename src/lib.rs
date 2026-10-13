@@ -234,7 +234,7 @@ fn run_app(
     if demo_mode {
         demo::populate_demo(&mut app);
     } else {
-        app.tick();
+        app.start_initial_collection()?;
     }
 
     let mut last_tick = std::time::Instant::now();
@@ -267,6 +267,15 @@ fn run_app(
             false
         };
 
+        if app.should_quit {
+            break;
+        }
+        let startup_completed = !demo_mode && app.poll_initial_collection()?;
+        if startup_completed {
+            app.drain_and_retry_summaries();
+            last_tick = std::time::Instant::now();
+        }
+
         if demo_mode {
             if last_tick.elapsed() >= tick_interval {
                 demo::advance_token_rates(&mut app);
@@ -275,7 +284,7 @@ fn run_app(
                 }
                 last_tick = std::time::Instant::now();
             }
-        } else if !had_input && last_tick.elapsed() >= tick_interval {
+        } else if !app.initializing() && !had_input && last_tick.elapsed() >= tick_interval {
             // Data tick every 2s — skip when handling input to avoid lag
             app.tick();
             last_tick = std::time::Instant::now();

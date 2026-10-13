@@ -875,6 +875,10 @@ impl Default for CodexCollector {
     }
 }
 
+// Child counts are finalized across the entire root set. Keep that pass intact
+// before the default startup implementation publishes completed sessions.
+impl super::StartupCollector for CodexCollector {}
+
 impl super::AgentCollector for CodexCollector {
     fn collect(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
         self.collect_sessions(shared)

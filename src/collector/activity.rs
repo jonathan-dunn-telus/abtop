@@ -331,19 +331,104 @@ fn child_event(state: &mut Event, v: &Value) {
     }
 }
 
+/// Lifecycle evidence has no file cursor: Claude's usage reader delivers records.
+#[derive(Default)]
+struct Evidence<T> {
+    data: T,
+    readable: bool,
+    incomplete: bool,
+}
+
+impl<T> Evidence<T> {
+    fn finish(&mut self, readable: bool, skipped: bool) {
+        self.incomplete |= skipped;
+        self.readable = readable && !self.incomplete;
+    }
+}
+
 #[derive(Default)]
 pub(super) struct ClaudeActivity {
-    parent: Tail<Parent>,
-    children: HashMap<PathBuf, Tail<Child>>,
+    parent: Evidence<Parent>,
+    children: HashMap<PathBuf, Evidence<Child>>,
     journals: HashMap<PathBuf, Tail<HashMap<String, State>>>,
     pub states: HashMap<String, State>,
+    #[cfg(test)]
+    cursors: HashMap<PathBuf, (u64, (u64, u64))>,
 }
 
 impl ClaudeActivity {
-    pub fn update(&mut self, parent_path: &Path, directory: &Path) -> AgentCounts {
-        self.parent.update(parent_path, parent_event);
+    #[cfg(test)]
+    fn update(&mut self, parent_path: &Path, directory: &Path) -> AgentCounts {
         let mut paths = Vec::new();
         files_under(directory, &mut paths);
+        for path in std::iter::once(parent_path).chain(
+            paths
+                .iter()
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|s| s.starts_with("agent-") && s.ends_with(".jsonl"))
+                })
+                .map(PathBuf::as_path),
+        ) {
+            let (mut offset, old_id) = self.cursors.get(path).copied().unwrap_or_default();
+            let id = super::claude::file_identity(path);
+            if id != old_id || fs::metadata(path).is_ok_and(|m| m.len() < offset) {
+                offset = 0;
+                if path == parent_path {
+                    self.reset_parent();
+                } else {
+                    self.reset_child(path);
+                }
+            }
+            let read = super::claude::read_records(path, offset, |v| {
+                if path == parent_path {
+                    self.parent_event(v);
+                } else {
+                    self.child_event(path, v);
+                }
+            });
+            if path == parent_path {
+                self.parent_read(read.readable, read.skipped);
+            } else {
+                self.child_read(path, read.readable, read.skipped);
+            }
+            self.cursors.insert(path.to_path_buf(), (read.offset, id));
+        }
+        self.reconcile(directory, &paths)
+    }
+
+    pub fn reset_parent(&mut self) {
+        self.parent = Evidence::default();
+    }
+
+    pub fn parent_event(&mut self, value: &Value) {
+        parent_event(&mut self.parent.data, value);
+    }
+
+    pub fn parent_read(&mut self, readable: bool, skipped: bool) {
+        self.parent.finish(readable, skipped);
+    }
+
+    pub fn reset_child(&mut self, path: &Path) {
+        self.children
+            .insert(path.to_path_buf(), Evidence::default());
+    }
+
+    pub fn child_event(&mut self, path: &Path, value: &Value) {
+        let child = self.children.entry(path.to_path_buf()).or_default();
+        child_event(&mut child.data.own, value);
+        parent_event(&mut child.data.nested, value);
+    }
+
+    pub fn child_read(&mut self, path: &Path, readable: bool, skipped: bool) {
+        self.children
+            .entry(path.to_path_buf())
+            .or_default()
+            .finish(readable, skipped);
+    }
+
+    pub fn reconcile(&mut self, directory: &Path, paths: &[PathBuf]) -> AgentCounts {
         let found: HashSet<_> = paths.iter().cloned().collect();
         // Keep completed lifecycle evidence even if a transcript is removed.
         self.states.clear();
@@ -376,10 +461,6 @@ impl ClaudeActivity {
                 .trim_start_matches("agent-")
                 .to_owned();
             let child = self.children.entry(path.clone()).or_default();
-            child.update(path, |child, value| {
-                child_event(&mut child.own, value);
-                parent_event(&mut child.nested, value);
-            });
             let mut event = child.data.own;
             let key = activity_key(directory, path.parent().unwrap(), &id);
             if let Some(parent) = self.parent.data.agents.get(&key) {
@@ -875,9 +956,9 @@ mod tests {
         );
         let mut activity = ClaudeActivity::default();
         assert_eq!(activity.update(&parent, &children).working, 1);
-        let offset = activity.children[&child].offset;
+        let offset = activity.cursors[&child].0;
         assert_eq!(activity.update(&parent, &children).working, 1);
-        assert_eq!(activity.children[&child].offset, offset);
+        assert_eq!(activity.cursors[&child].0, offset);
         append(
             &child,
             &[message(
