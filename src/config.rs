@@ -1,3 +1,4 @@
+use crate::app::StatsScope;
 use std::path::PathBuf;
 
 #[derive(Clone, Copy)]
@@ -29,6 +30,7 @@ impl Default for PanelVisibility {
 
 pub struct AppConfig {
     pub theme: String,
+    pub stats_scope: StatsScope,
     /// Agent CLI names to exclude from the TUI (e.g. ["codex"] to hide Codex).
     /// Matched case-insensitively against each collector's agent_cli identifier.
     pub hidden_agents: Vec<String>,
@@ -45,6 +47,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             theme: "btop".to_string(),
+            stats_scope: StatsScope::default(),
             hidden_agents: Vec::new(),
             claude_config_dirs: Vec::new(),
             panels: PanelVisibility::default(),
@@ -97,6 +100,12 @@ fn parse_config_body(content: &str) -> AppConfig {
             }
             let val = val.trim_matches('"').trim_matches('\'');
             match key {
+                "stats_scope" => {
+                    config.stats_scope = match val {
+                        "all_live" => StatsScope::AllLive,
+                        _ => StatsScope::Selected,
+                    }
+                }
                 "theme" => config.theme = val.to_string(),
                 "language" => config.language = val.to_string(),
                 "show_context" => config.panels.context = parse_bool(val).unwrap_or(true),
@@ -159,6 +168,10 @@ fn expand_home_path(raw: &str) -> PathBuf {
 
 pub fn save_theme(name: &str) -> Result<(), String> {
     write_with_updates(&[("theme", format!("\"{}\"", name))])
+}
+
+pub fn save_stats_scope(scope: StatsScope) -> Result<(), String> {
+    write_with_updates(&[("stats_scope", format!("\"{}\"", scope.config_value()))])
 }
 
 pub fn save_panel_visibility(panels: &PanelVisibility) -> Result<(), String> {
@@ -310,6 +323,30 @@ mod tests {
         assert!(!after.contains("show_quota = true"));
         assert!(after.contains("show_projects = false"));
         assert!(after.contains("theme = \"btop\""));
+    }
+
+    #[test]
+    fn stats_scope_defaults_and_round_trips_preserving_other_config() {
+        assert_eq!(parse_config_body("").stats_scope, StatsScope::Selected);
+        assert_eq!(
+            parse_config_body("stats_scope = invalid").stats_scope,
+            StatsScope::Selected
+        );
+        let mut content = "# preferences\nfuture_key = 42\nshow_models = false\n".to_string();
+        for scope in [
+            StatsScope::AllLive,
+            StatsScope::Selected,
+            StatsScope::AllLive,
+        ] {
+            content = rewrite_kv_lines(
+                &content,
+                &[("stats_scope", format!("\"{}\"", scope.config_value()))],
+            );
+            assert_eq!(parse_config_body(&content).stats_scope, scope);
+            assert!(!parse_config_body(&content).panels.models);
+            assert!(content.contains("# preferences\nfuture_key = 42"));
+            assert_eq!(content.matches("stats_scope").count(), 1);
+        }
     }
 
     #[test]

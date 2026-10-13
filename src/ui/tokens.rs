@@ -1,4 +1,4 @@
-use crate::app::App;
+use crate::app::{App, StatsScope};
 use crate::locale::t;
 use crate::theme::Theme;
 use ratatui::layout::Rect;
@@ -11,7 +11,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{
     braille_sparkline, btop_block_active, fmt_tokens, grad_at, make_gradient, meter_bar,
-    styled_label, truncate_str,
+    stats_panel_title, styled_label,
 };
 
 struct TokenRow<'a> {
@@ -51,14 +51,30 @@ pub(crate) fn draw_tokens_panel_active(
     theme: &Theme,
     active: bool,
 ) {
-    let selected = app.sessions.get(app.selected);
-    let total_in: u64 = selected.map(|s| s.total_input_tokens).unwrap_or(0);
-    let total_out: u64 = selected.map(|s| s.total_output_tokens).unwrap_or(0);
-    let cache_read: u64 = selected.map(|s| s.total_cache_read).unwrap_or(0);
-    let cache_write: u64 = selected.map(|s| s.total_cache_create).unwrap_or(0);
-    let total: u64 = total_in + total_out + cache_read + cache_write;
-    let turns: u32 = selected.map(|s| s.turn_count).unwrap_or(0);
-    let avg = if turns > 0 { total / turns as u64 } else { 0 };
+    let stats = app.usage_stats(Instant::now());
+    let total_in = stats.input;
+    let total_out = stats.output;
+    let cache_read = stats.cache_read;
+    let cache_write = stats.cache_write;
+    let total = stats.total_tokens();
+    let turns = stats.turns;
+    let avg = stats.average_tokens();
+    let panel_title = stats_panel_title(app, "tokens", area.width, active);
+    let block = btop_block_active(&panel_title, "³", theme.mem_box, theme, active);
+    if app.stats_scope == StatsScope::AllLive && total == 0 {
+        let message = if stats.session_count == 0 {
+            "No live sessions"
+        } else {
+            "No usage yet"
+        };
+        f.render_widget(
+            Paragraph::new(message)
+                .style(Style::default().fg(theme.graph_text))
+                .block(block),
+            area,
+        );
+        return;
+    }
 
     // Compute percentages for mini meter bars
     let (in_pct, out_pct, cache_r_pct, cache_w_pct) = if total > 0 {
@@ -99,10 +115,7 @@ pub(crate) fn draw_tokens_panel_active(
         ),
     ];
 
-    let now = Instant::now();
-    let rates = selected
-        .map(|session| app.session_token_rates(session, now))
-        .unwrap_or_default();
+    let rates = stats.rates;
     let rows = [
         TokenRow::new(
             format!(" {} :", t("tokens.input")),
@@ -154,7 +167,12 @@ pub(crate) fn draw_tokens_panel_active(
     let bar_w = inner_w.saturating_sub(text_w).min(15);
     let [input_line, output_line, cache_r_line, cache_w_line] = rows.map(|row| {
         let mut line = vec![styled_label(&row.label, theme.graph_text)];
-        line.extend(meter_bar(row.percentage, bar_w, row.gradient, theme.meter_bg));
+        line.extend(meter_bar(
+            row.percentage,
+            bar_w,
+            row.gradient,
+            theme.meter_bg,
+        ));
         line.push(Span::styled(
             row.total_text,
             Style::default().fg(grad_at(row.gradient, 80.0)),
@@ -168,13 +186,16 @@ pub(crate) fn draw_tokens_panel_active(
         line
     });
 
-    // Per-turn sparkline from selected session's token_history
+    // Session turns have no shared timeline; aggregate mode uses live rates.
     let cpu_grad = make_gradient(theme.cpu_grad.start, theme.cpu_grad.mid, theme.cpu_grad.end);
-    let all_history: Vec<u64> = app
-        .sessions
-        .get(app.selected)
-        .map(|s| s.token_history.clone())
-        .unwrap_or_default();
+    let all_history: Vec<u64> = match app.stats_scope {
+        StatsScope::Selected => app
+            .sessions
+            .get(app.selected)
+            .map(|s| s.token_history.clone())
+            .unwrap_or_default(),
+        StatsScope::AllLive => app.live_token_history.iter().copied().collect(),
+    };
     let spark_w = (area.width as usize).saturating_sub(16).clamp(5, 20);
     let max_val = all_history.iter().copied().max().unwrap_or(1).max(1);
     let normalized: Vec<f64> = all_history
@@ -188,7 +209,10 @@ pub(crate) fn draw_tokens_panel_active(
         &cpu_grad,
         theme.graph_text,
     ));
-    let tokens_turn_label = t("tokens.tokens_turn");
+    let tokens_turn_label = match app.stats_scope {
+        StatsScope::Selected => t("tokens.tokens_turn"),
+        StatsScope::AllLive => "tokens/min".to_string(),
+    };
     spark_line_spans.push(Span::styled(
         format!(" {}", tokens_turn_label),
         Style::default().fg(theme.graph_text),
@@ -214,16 +238,6 @@ pub(crate) fn draw_tokens_panel_active(
         ]),
     ];
 
-    let panel_title = if let Some(s) = selected {
-        format!(
-            "tokens ({}/{})",
-            truncate_str(&s.project_name, 12),
-            truncate_str(&s.session_id, 8)
-        )
-    } else {
-        "tokens".to_string()
-    };
-    let block = btop_block_active(&panel_title, "³", theme.mem_box, theme, active);
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -263,6 +277,41 @@ mod tests {
         (0..9)
             .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
             .collect()
+    }
+
+    #[test]
+    fn aggregate_tokens_show_combined_categories_and_time_based_history() {
+        let mut app = app_with_rates([100, 200, 300, 400], [1, 2, 3, 4]);
+        let mut other = app.sessions[0].clone();
+        other.session_id = "other-session".into();
+        app.sessions.push(other);
+        app.update_session_token_rates(Instant::now());
+        app.stats_scope = StatsScope::AllLive;
+        let lines = render(&app, 60);
+        assert!(lines[0].contains("tokens · All live"));
+        assert!(lines[1].contains("2k"));
+        for (row, values) in [
+            (2, "200  1/min"),
+            (3, "400  2/min"),
+            (4, "600  3/min"),
+            (5, "800  4/min"),
+        ] {
+            assert!(lines[row].contains(values), "{}", lines[row]);
+        }
+        assert!(lines[6].contains("tokens/min"));
+        app.stats_scope = StatsScope::Selected;
+        let selected = render(&app, 60);
+        assert!(selected[1].contains("1k"));
+        assert!(!selected[6].contains("tokens/min"));
+    }
+
+    #[test]
+    fn aggregate_empty_states_distinguish_no_live_sessions_from_no_usage() {
+        let mut app = app_with_rates([0; 4], [0; 4]);
+        app.stats_scope = StatsScope::AllLive;
+        assert!(render(&app, 32).join("\n").contains("No usage yet"));
+        app.sessions.clear();
+        assert!(render(&app, 32).join("\n").contains("No live sessions"));
     }
 
     #[test]

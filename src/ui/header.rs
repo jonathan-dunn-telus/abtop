@@ -6,23 +6,46 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
+
+fn app_title() -> String {
+    format!(" abtop v{} ", env!("CARGO_PKG_VERSION"))
+}
+
+fn stats_control(app: &App) -> String {
+    match app.stats_scope {
+        crate::app::StatsScope::Selected => " a Stats: Selected ".to_string(),
+        crate::app::StatsScope::AllLive => {
+            format!(" a Stats: All live ({}) ", app.live_sessions().count())
+        }
+    }
+}
+
+pub(crate) fn stats_control_area(app: &App, area: Rect) -> Rect {
+    let offset = (app_title().width() as u16).min(area.width);
+    Rect::new(
+        area.x + offset,
+        area.y,
+        (stats_control(app).width() as u16).min(area.width - offset),
+        area.height.min(1),
+    )
+}
 
 pub(crate) fn draw_header(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let session_count = app.sessions.len();
     let active = app.agent_aggregate.active_count;
 
     let now = chrono::Local::now().format("%H:%M").to_string();
-    let version = env!("CARGO_PKG_VERSION");
-
-    let title = format!(" abtop v{version} ");
-    let right = format!(" {now}  {active}↑ {session_count}● ");
+    let title = app_title();
+    let scope = stats_control(app);
+    let right = format!(" {now}  {active}↑ {session_count}●  ");
 
     let host_str = app.host_metrics.as_ref().map(fmt_host);
     let agent_str = fmt_agent(&app.agent_aggregate);
 
     // Width budget: prefer host + agents; fall back to agents-only; then to nothing.
     let width = area.width as usize;
-    let base = title.len() + right.len() + 4; // 4 = separators / padding
+    let base = title.width() + scope.width() + right.width();
     let (host_render, agent_render) = if width <= 80 {
         (None, None)
     } else {
@@ -34,6 +57,12 @@ pub(crate) fn draw_header(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         title.clone(),
         Style::default()
             .fg(theme.title)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(
+        scope,
+        Style::default()
+            .fg(theme.hi_fg)
             .add_modifier(Modifier::BOLD),
     ));
 
@@ -56,8 +85,8 @@ pub(crate) fn draw_header(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     }
 
     // Right-align the timestamp+counters block.
-    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let pad = width.saturating_sub(used + right.chars().count());
+    let used: usize = spans.iter().map(|s| s.content.width()).sum();
+    let pad = width.saturating_sub(used + right.width());
     if pad > 0 {
         spans.push(Span::raw(" ".repeat(pad)));
     }

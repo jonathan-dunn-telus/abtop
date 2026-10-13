@@ -1,7 +1,7 @@
 use crate::app::App;
 use crate::model::{
-    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface, ModelUsage,
-    OrphanPort, RateLimitInfo, SessionStatus, SubAgent, ToolCall,
+    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface,
+    ModelUsage, OrphanPort, RateLimitInfo, SessionStatus, SubAgent, ToolCall,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -589,6 +589,12 @@ pub fn populate_demo(app: &mut App) {
     for &r in &rates {
         app.token_rates.push_back(r);
     }
+    // Synthetic rolling totals for the aggregate Tokens sparkline.
+    app.live_token_history = rates
+        .iter()
+        .enumerate()
+        .map(|(index, _)| rates[index.saturating_sub(29)..=index].iter().sum::<f64>() as u64)
+        .collect();
 
     // --- Orphan ports ---
     app.orphan_ports = vec![OrphanPort {

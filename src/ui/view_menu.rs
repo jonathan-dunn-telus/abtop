@@ -20,12 +20,18 @@ pub(crate) enum ViewState {
     On,
     Off,
     Action,
+    Value(&'static str),
 }
 
 pub(crate) fn items(app: &App) -> Vec<ViewItem> {
     use ViewState::*;
     let bool_state = |b: bool| if b { On } else { Off };
     vec![
+        ViewItem {
+            key: 'a',
+            label: "stats scope",
+            state: Value(app.stats_scope.label()),
+        },
         ViewItem {
             key: 'T',
             label: t("view.tree_view").leak(),
@@ -139,6 +145,7 @@ pub(crate) fn draw_view_overlay(f: &mut Frame, app: &App, theme: &Theme) {
             ViewState::On => (on_str.clone(), Style::default().fg(theme.proc_misc)),
             ViewState::Off => (off_str.clone(), Style::default().fg(theme.inactive_fg)),
             ViewState::Action => (action_str.clone(), Style::default().fg(theme.session_id)),
+            ViewState::Value(value) => (value.to_string(), Style::default().fg(theme.hi_fg)),
         };
         lines.push(Line::from(vec![
             Span::styled(

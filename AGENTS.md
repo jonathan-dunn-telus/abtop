@@ -80,6 +80,7 @@ Panel descriptions:
 - **¹context**: Left = token rate braille sparkline (200-point history). Right = per-session context % bars with yellow/red warning.
 - **²quota**: Claude + Codex rate limit gauges side-by-side (5h and 7d windows with reset countdown). Quota is intentionally limited to Claude and Codex; do not add an OpenCode row unless OpenCode exposes a reliable account-level provider rate-limit source.
 - **³tokens**: Total token breakdown (in/out/cache) + per-turn sparkline for selected session.
+- **Stats scope (`a`)**: Tokens and Models share `Selected` / `All live`, initially Selected and persisted as `stats_scope`. All live sums lifetime usage of unique, confirmed live sessions, including waiting and rate-limited sessions, independently of session search/selection. Done and Unknown sessions are excluded; totals drop when sessions close. Existing collector subagent rollups are counted once. The aggregate Tokens sparkline uses rolling tokens/min across all four categories, sampled each refresh (200 points); Selected keeps per-turn history. The header control is clickable with `--mouse`, and the View menu exposes the same toggle. Quota, Context, JSON snapshots, and `--once` retain their existing scope.
 - **⁸models**: Lifetime token totals and percentage share per model for the selected session. Enabled by default beside Tokens and in the narrow-terminal Usage tab; `8` toggles persisted `show_models`. Includes Claude's tracked subagents and nested workflow agents; Codex and OpenCode retain selected-session-only scope. Model totals match the Tokens pane, including cache tokens. Missing attribution uses `Unknown`; overflow uses `Other (N)`. JSON snapshots expose the complete `model_usage` list.
 - **projects** (always visible): Per-project git branch + added/modified file counts.
 - **⁴ports**: Agent-spawned open ports + orphan ports (from dead sessions). Conflict detection.
@@ -283,6 +284,7 @@ Tracks child processes that have open ports. When a parent session dies but the 
 | `q` | Quit |
 | `r` | Force refresh |
 | `8` | Toggle Models pane |
+| `a` | Toggle Tokens/Models scope: selected / all live |
 
 ## Tech Stack
 
