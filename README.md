@@ -21,8 +21,13 @@ Category bars show each category's share of **all four raw categories**, includi
 not shares of the headline Total. Cached context still occupies the context
 window, and account quotas retain their provider-defined meanings.
 
-Token totals are not cost estimates: all token categories have different prices,
-and excluded cache reads are not necessarily free. For library consumers,
+Excluding cache reads focuses headline totals on token categories that generally
+cost more per token, making spending drivers easier to gauge. These totals are
+not cost estimates: prices vary by model and category, and large cache-read
+volumes can still contribute materially to the bill. Cache reads remain visible
+separately.
+
+For library consumers,
 `AgentSession::total_tokens()` is the single total API; `active_tokens()` has been
 removed. Snapshot field names and raw category counters are unchanged.
 
