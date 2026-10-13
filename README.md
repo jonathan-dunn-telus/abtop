@@ -7,6 +7,23 @@ Claude Code, Codex CLI, and OpenCode sessions are discovered from local process/
 
 ![demo](https://raw.githubusercontent.com/graykode/abtop/main/assets/demo.gif)
 
+## Token accounting
+
+Token totals use **input + output + cache writes**, excluding cache reads. This
+basis applies to session and subagent totals, Tokens averages and per-turn
+history, activity rates, and plain/JSON snapshots. Cache writes remain included.
+
+The CacheR row is labeled `excluded` (or `excl` in compact layouts) because it is
+excluded from Total. It remains a separate raw counter. Category bars show each
+category's share of **all four raw categories**, including cache reads; they are
+not shares of the headline Total. Cached context still occupies the context
+window, and account quotas retain their provider-defined meanings.
+
+Token totals are not cost estimates: all token categories have different prices,
+and excluded cache reads are not necessarily free. For library consumers,
+`AgentSession::total_tokens()` is the single total API; `active_tokens()` has been
+removed. Snapshot field names and raw category counters are unchanged.
+
 ## Why
 
 - Running 3+ agents across projects? See them all in one screen.

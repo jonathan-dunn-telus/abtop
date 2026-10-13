@@ -1,7 +1,7 @@
 use super::process::{self, ProcInfo};
 use crate::model::{
-    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface,
-    RateLimitInfo, SessionStatus, ToolCall, MAX_CHAT_MESSAGES, MAX_FILE_ACCESSES,
+    token_total, AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp,
+    LaunchSurface, RateLimitInfo, SessionStatus, ToolCall, MAX_CHAT_MESSAGES, MAX_FILE_ACCESSES,
 };
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -1369,8 +1369,8 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
                     Some("token_count") => {
                         let info = &payload["info"];
                         // Codex input_tokens already includes cached_input_tokens.
-                        // Store only the non-cached input portion so
-                        // AgentSession::total_tokens() does not double-count cache.
+                        // Store non-cached input separately so totals exclude reused
+                        // input while the raw cache-read counter remains available.
                         let total = &info["total_token_usage"];
                         if total.is_object() {
                             let inp = total["input_tokens"].as_u64().unwrap_or(0);
@@ -1392,7 +1392,15 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
                             let out = last["output_tokens"].as_u64().unwrap_or(0);
                             result.last_context_tokens = inp;
                             if result.token_history.len() < 10_000 {
-                                result.token_history.push(inp + out);
+                                let cache = last["cached_input_tokens"]
+                                    .as_u64()
+                                    .or_else(|| last["cache_read_input_tokens"].as_u64())
+                                    .unwrap_or(0);
+                                result.token_history.push(token_total(
+                                    inp.saturating_sub(cache),
+                                    out,
+                                    0,
+                                ));
                             }
                         }
                         // Context window may also appear inside info
@@ -2029,7 +2037,26 @@ mod tests {
         assert_eq!(result.last_context_tokens, 50);
         assert_eq!(result.context_window, 128000);
         assert_eq!(result.token_history.len(), 1);
-        assert_eq!(result.token_history[0], 70);
+        assert_eq!(result.token_history[0], 60);
+    }
+
+    #[test]
+    fn codex_cache_only_and_excess_cached_input_do_not_inflate_history() {
+        for cache in [50, 100] {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            let event = serde_json::json!({"type":"event_msg","payload":{
+                "type":"token_count","info":{
+                    "total_token_usage":{"input_tokens":50,"cached_input_tokens":cache,"output_tokens":0},
+                    "last_token_usage":{"input_tokens":50,"cached_input_tokens":cache,"output_tokens":0}
+                }
+            }}).to_string();
+            write_lines(&mut file, &[SESSION_META, &event]);
+            let result = parse_codex_jsonl(file.path()).unwrap();
+            assert_eq!(result.token_history, vec![0]);
+            assert_eq!(result.total_input, 0);
+            assert_eq!(result.total_cache_read, cache);
+            assert_eq!(result.last_context_tokens, 50);
+        }
     }
 
     #[test]
@@ -2116,6 +2143,7 @@ mod tests {
         let result = parse_codex_jsonl(file.path()).unwrap();
         assert_eq!(result.total_cache_read, 30);
         assert_eq!(result.last_context_tokens, 20);
+        assert_eq!(result.token_history, vec![25]);
     }
 
     #[test]

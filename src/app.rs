@@ -524,7 +524,7 @@ impl App {
         let mut rate: f64 = 0.0;
         for s in &self.sessions {
             let key = (s.agent_cli.to_string(), s.session_id.clone());
-            let total = s.active_tokens();
+            let total = s.total_tokens();
             let prev = self.prev_tokens.get(&key).copied().unwrap_or(total);
             rate += total.saturating_sub(prev) as f64;
             self.prev_tokens.insert(key, total);

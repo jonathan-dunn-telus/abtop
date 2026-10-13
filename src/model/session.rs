@@ -100,6 +100,7 @@ pub struct OrphanPort {
 pub struct SubAgent {
     pub name: String,
     pub status: String,
+    /// Input + output + cache writes; excludes cache reads.
     pub tokens: u64,
 }
 
@@ -188,6 +189,7 @@ pub struct AgentSession {
     pub git_branch: String,
     pub git_added: u32,
     pub git_modified: u32,
+    /// Per-turn input + output + cache writes, excluding cache reads.
     pub token_history: Vec<u64>,
     /// Per-turn context size (input tokens) for context evolution visualization.
     pub context_history: Vec<u64>,
@@ -225,18 +227,20 @@ pub struct AgentSession {
     pub config_root: String,
 }
 
-impl AgentSession {
-    pub fn total_tokens(&self) -> u64 {
-        self.total_input_tokens
-            + self.total_output_tokens
-            + self.total_cache_read
-            + self.total_cache_create
-    }
+/// Shared accounting basis for cumulative totals, attribution, and activity.
+/// Cache reads remain separate because they represent reused input.
+pub(crate) fn token_total(input: u64, output: u64, cache_write: u64) -> u64 {
+    input + output + cache_write
+}
 
-    /// Tokens that represent new work (input + output), excluding cache hits.
-    /// Used for rate calculation to avoid inflated numbers from cache_read.
-    pub fn active_tokens(&self) -> u64 {
-        self.total_input_tokens + self.total_output_tokens + self.total_cache_create
+impl AgentSession {
+    /// Input + output + cache writes; excludes cache reads.
+    pub fn total_tokens(&self) -> u64 {
+        token_total(
+            self.total_input_tokens,
+            self.total_output_tokens,
+            self.total_cache_create,
+        )
     }
 
     pub fn elapsed(&self) -> Duration {
@@ -339,12 +343,22 @@ mod tests {
     #[test]
     fn test_total_tokens() {
         let session = make_session(100, 50, 200, 30);
-        assert_eq!(session.total_tokens(), 380); // 100 + 50 + 200 + 30
+        assert_eq!(session.total_tokens(), 180);
+        assert_eq!(session.total_cache_read, 200);
     }
 
     #[test]
-    fn test_active_tokens() {
-        let session = make_session(100, 50, 200, 30);
-        assert_eq!(session.active_tokens(), 180); // 100 + 50 + 30, excludes cache_read
+    fn cache_reads_do_not_contribute_but_cache_writes_do() {
+        for (input, output, reads, writes, expected) in [
+            (0, 0, 0, 0, 0),
+            (0, 0, 200, 0, 0),
+            (0, 0, 0, 30, 30),
+            (100, 50, 20_000, 30, 180),
+        ] {
+            assert_eq!(
+                make_session(input, output, reads, writes).total_tokens(),
+                expected
+            );
+        }
     }
 }

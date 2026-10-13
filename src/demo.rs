@@ -516,6 +516,21 @@ pub fn populate_demo(app: &mut App) {
         },
     ];
 
+    // The synthetic history values are shape weights. Scale them to each
+    // session's qualifying total so the demo uses the same accounting as data.
+    for session in &mut app.sessions {
+        let weight: u64 = session.token_history.iter().sum();
+        let total = session.total_tokens();
+        let mut cumulative = 0;
+        let mut previous = 0;
+        for value in &mut session.token_history {
+            cumulative += *value;
+            let allocated = (total * cumulative).checked_div(weight).unwrap_or(0);
+            *value = allocated - previous;
+            previous = allocated;
+        }
+    }
+
     // --- Summaries (pre-populated, no LLM calls) ---
     app.summaries.insert(
         "a1b2c3d4-5678-9abc-def0-111111111111".into(),

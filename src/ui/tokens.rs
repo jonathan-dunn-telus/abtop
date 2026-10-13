@@ -6,11 +6,25 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 use super::{
     braille_sparkline, btop_block_active, fmt_tokens, grad_at, make_gradient, meter_bar,
     styled_label, truncate_str,
 };
+
+/// Keep the cache-read exclusion visible even when bars must disappear.
+fn cache_read_label(inner_width: usize, value_width: usize) -> String {
+    let label = t("tokens.cache_r");
+    [
+        format!(" {label} excluded:"),
+        format!(" {label} excl:"),
+        "CR excl".to_string(),
+    ]
+    .into_iter()
+    .find(|label| label.width() + 1 + value_width <= inner_width)
+    .unwrap_or_else(|| "CR excl".to_string())
+}
 
 pub(crate) fn draw_tokens_panel(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     draw_tokens_panel_active(f, app, area, theme, false);
@@ -28,17 +42,18 @@ pub(crate) fn draw_tokens_panel_active(
     let total_out: u64 = selected.map(|s| s.total_output_tokens).unwrap_or(0);
     let cache_read: u64 = selected.map(|s| s.total_cache_read).unwrap_or(0);
     let cache_write: u64 = selected.map(|s| s.total_cache_create).unwrap_or(0);
-    let total: u64 = total_in + total_out + cache_read + cache_write;
+    let total = selected.map(|s| s.total_tokens()).unwrap_or(0);
+    let raw_total = total + cache_read;
     let turns: u32 = selected.map(|s| s.turn_count).unwrap_or(0);
     let avg = if turns > 0 { total / turns as u64 } else { 0 };
 
-    // Compute percentages for mini meter bars
-    let (in_pct, out_pct, cache_r_pct, cache_w_pct) = if total > 0 {
+    // Category bars show shares of all raw usage, including excluded cache reads.
+    let (in_pct, out_pct, cache_r_pct, cache_w_pct) = if raw_total > 0 {
         (
-            total_in as f64 / total as f64 * 100.0,
-            total_out as f64 / total as f64 * 100.0,
-            cache_read as f64 / total as f64 * 100.0,
-            cache_write as f64 / total as f64 * 100.0,
+            total_in as f64 / raw_total as f64 * 100.0,
+            total_out as f64 / raw_total as f64 * 100.0,
+            cache_read as f64 / raw_total as f64 * 100.0,
+            cache_write as f64 / raw_total as f64 * 100.0,
         )
     } else {
         (0.0, 0.0, 0.0, 0.0)
@@ -60,8 +75,6 @@ pub(crate) fn draw_tokens_panel_active(
         theme.cached_grad.end,
     );
 
-    let bar_w = (area.width as usize).saturating_sub(20).clamp(5, 15);
-
     let total_label = t("tokens.total");
     let total_line = vec![
         styled_label(format!(" {}: ", total_label).as_str(), theme.graph_text),
@@ -73,49 +86,49 @@ pub(crate) fn draw_tokens_panel_active(
         ),
     ];
 
-    let input_label = t("tokens.input");
-    let mut input_line = vec![styled_label(
-        format!(" {} :", input_label).as_str(),
-        theme.graph_text,
-    )];
-    input_line.extend(meter_bar(in_pct, bar_w, &free_grad, theme.meter_bg));
-    input_line.push(Span::styled(
-        format!(" {}", fmt_tokens(total_in)),
-        Style::default().fg(grad_at(&free_grad, 80.0)),
-    ));
-
-    let output_label = t("tokens.output");
-    let mut output_line = vec![styled_label(
-        format!(" {}:", output_label).as_str(),
-        theme.graph_text,
-    )];
-    output_line.extend(meter_bar(out_pct, bar_w, &used_grad, theme.meter_bg));
-    output_line.push(Span::styled(
-        format!(" {}", fmt_tokens(total_out)),
-        Style::default().fg(grad_at(&used_grad, 80.0)),
-    ));
-
-    let cache_r_label = t("tokens.cache_r");
-    let mut cache_r_line = vec![styled_label(
-        format!(" {}:", cache_r_label).as_str(),
-        theme.graph_text,
-    )];
-    cache_r_line.extend(meter_bar(cache_r_pct, bar_w, &cached_grad, theme.meter_bg));
-    cache_r_line.push(Span::styled(
-        format!(" {}", fmt_tokens(cache_read)),
-        Style::default().fg(grad_at(&cached_grad, 80.0)),
-    ));
-
-    let cache_w_label = t("tokens.cache_w");
-    let mut cache_w_line = vec![styled_label(
-        format!(" {}:", cache_w_label).as_str(),
-        theme.graph_text,
-    )];
-    cache_w_line.extend(meter_bar(cache_w_pct, bar_w, &cached_grad, theme.meter_bg));
-    cache_w_line.push(Span::styled(
-        format!(" {}", fmt_tokens(cache_write)),
-        Style::default().fg(grad_at(&cached_grad, 80.0)),
-    ));
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let rows = [
+        (
+            format!(" {} :", t("tokens.input")),
+            total_in,
+            in_pct,
+            &free_grad,
+        ),
+        (
+            format!(" {}:", t("tokens.output")),
+            total_out,
+            out_pct,
+            &used_grad,
+        ),
+        (
+            cache_read_label(inner_width, fmt_tokens(cache_read).width()),
+            cache_read,
+            cache_r_pct,
+            &cached_grad,
+        ),
+        (
+            format!(" {}:", t("tokens.cache_w")),
+            cache_write,
+            cache_w_pct,
+            &cached_grad,
+        ),
+    ];
+    let text_width = rows
+        .iter()
+        .map(|(label, value, _, _)| label.width() + 1 + fmt_tokens(*value).width())
+        .max()
+        .unwrap_or(0);
+    let bar_width = inner_width.saturating_sub(text_width).min(15);
+    let [input_line, output_line, cache_r_line, cache_w_line] =
+        rows.map(|(label, value, percentage, gradient)| {
+            let mut line = vec![styled_label(&label, theme.graph_text)];
+            line.extend(meter_bar(percentage, bar_width, gradient, theme.meter_bg));
+            line.push(Span::styled(
+                format!(" {}", fmt_tokens(value)),
+                Style::default().fg(grad_at(gradient, 80.0)),
+            ));
+            line
+        });
 
     // Per-turn sparkline from selected session's token_history
     let cpu_grad = make_gradient(theme.cpu_grad.start, theme.cpu_grad.mid, theme.cpu_grad.end);
@@ -174,4 +187,57 @@ pub(crate) fn draw_tokens_panel_active(
     };
     let block = btop_block_active(&panel_title, "³", theme.mem_box, theme, active);
     f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn render(totals: [u64; 4], turns: u32, width: u16) -> Vec<String> {
+        let mut app = App::new_with_config(Theme::default(), &[], Default::default());
+        crate::demo::populate_demo(&mut app);
+        app.selected = 0;
+        let session = &mut app.sessions[0];
+        [
+            session.total_input_tokens,
+            session.total_output_tokens,
+            session.total_cache_read,
+            session.total_cache_create,
+        ] = totals;
+        session.turn_count = turns;
+        let mut terminal = Terminal::new(TestBackend::new(width, 9)).unwrap();
+        terminal
+            .draw(|f| draw_tokens_panel(f, &app, f.area(), &app.theme))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..9)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn tokens_exclude_reads_and_keep_the_exclusion_and_values_visible() {
+        for width in [15, 20, 32, 60] {
+            let lines = render([100, 50, 200, 30], 2, width);
+            assert!(lines[1].contains("180"), "{width}: {}", lines[1]);
+            assert!(lines[4].contains("200"), "{width}: {}", lines[4]);
+            assert!(lines[4].contains("excl"), "{width}: {}", lines[4]);
+            assert!(lines[5].contains("30"), "{width}: {}", lines[5]);
+            if width >= 32 {
+                assert!(lines[7].contains("90/t"));
+            }
+        }
+    }
+
+    #[test]
+    fn cache_only_and_zero_turn_usage_stay_visible_without_invalid_averages() {
+        for totals in [[0, 0, 200, 0], [0; 4]] {
+            let lines = render(totals, 0, 32);
+            assert!(lines[1].contains("Total: 0"));
+            assert!(lines[4].contains("excl"));
+            assert!(lines[7].contains("0/t"));
+            assert!(!lines.join("\n").contains("NaN"));
+        }
+    }
 }
