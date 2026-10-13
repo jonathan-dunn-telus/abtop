@@ -1,9 +1,9 @@
-use crate::app::App;
+use crate::app::{App, TokenRates};
 use crate::model::{
     AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface,
     ModelUsage, OrphanPort, RateLimitInfo, SessionStatus, SubAgent, ToolCall,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -585,9 +585,12 @@ pub fn populate_demo(app: &mut App) {
         0.0, 0.0, 1400.0, 1180.0, 850.0, 620.0, 410.0, 0.0, 560.0, 820.0, 1060.0, 1280.0, 940.0,
         700.0, 480.0, 0.0, 0.0, 380.0, 720.0, 1150.0, 1320.0, 980.0, 650.0,
     ];
-    app.token_rates.clear();
-    for &r in &rates {
-        app.token_rates.push_back(r);
+    app.clear_global_token_history();
+    let now = Instant::now();
+    for (index, &rate) in rates.iter().enumerate() {
+        let cache = rate as u64 * (index as u64 % 5 + 2);
+        let at = now - Duration::from_secs((rates.len() - 1 - index) as u64 * 2);
+        app.record_global_token_delta(at, demo_token_delta(rate as u64, cache));
     }
     // Synthetic rolling totals for the aggregate Tokens sparkline.
     app.live_token_history = rates
@@ -611,4 +614,22 @@ pub fn populate_demo(app: &mut App) {
         load1: 1.8,
     });
     app.agent_aggregate = crate::host_info::AgentAggregate::from_sessions(&app.sessions);
+}
+
+fn demo_token_delta(rate: u64, cache_read: u64) -> TokenRates {
+    TokenRates {
+        input: rate / 2,
+        output: rate / 4,
+        cache_write: rate - rate / 2 - rate / 4,
+        cache_read,
+    }
+}
+
+pub(crate) fn advance_token_rates(app: &mut App) {
+    if let (Some(rate), Some(cache)) = (
+        app.token_rates.pop_front(),
+        app.cache_read_rates.pop_front(),
+    ) {
+        app.record_global_token_delta(Instant::now(), demo_token_delta(rate as u64, cache as u64));
+    }
 }

@@ -9,6 +9,7 @@ mod ports;
 mod projects;
 mod quota;
 mod sessions;
+mod token_rate;
 mod tokens;
 mod view_menu;
 
@@ -332,6 +333,7 @@ pub(crate) enum ClickTarget {
 struct DesktopLayout {
     header: Rect,
     context: Option<Rect>,
+    token_rate: Option<Rect>,
     mid: Vec<(NarrowSection, Rect)>,
     sessions: Option<Rect>,
     footer: Rect,
@@ -424,6 +426,10 @@ pub fn draw(f: &mut Frame, app: &App) {
     let layout = desktop_layout(app, area);
     header::draw_header(f, app, layout.header, theme);
 
+    if let Some(area) = layout.token_rate {
+        token_rate::draw_token_rate_panel_active(f, app, area, theme, false);
+    }
+
     if let Some(area) = layout.context {
         context::draw_context_panel(f, app, area, theme);
     }
@@ -436,7 +442,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             NarrowSection::Projects => projects::draw_projects_panel(f, app, area, theme),
             NarrowSection::Ports => ports::draw_ports_panel(f, app, area, theme),
             NarrowSection::Mcp => mcp::draw_mcp_panel(f, app, area, theme),
-            NarrowSection::Sessions | NarrowSection::Context => {}
+            NarrowSection::Sessions | NarrowSection::Context | NarrowSection::TokenRate => {}
         }
     }
 
@@ -476,7 +482,7 @@ fn desktop_min_width(section: NarrowSection) -> u16 {
         NarrowSection::Quota | NarrowSection::Ports | NarrowSection::Mcp => 24,
         NarrowSection::Tokens => 22,
         NarrowSection::Models | NarrowSection::Projects => 20,
-        NarrowSection::Sessions | NarrowSection::Context => 0,
+        NarrowSection::Sessions | NarrowSection::Context | NarrowSection::TokenRate => 0,
     }
 }
 
@@ -490,7 +496,7 @@ fn uses_desktop_layout(app: &App, width: u16) -> bool {
 }
 
 fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
-    const CONTEXT_MIN: u16 = 5;
+    const TOP_MIN: u16 = 5;
     const FIXED: u16 = 2; // header + footer
 
     let mid_sections = desktop_sections(app);
@@ -502,7 +508,12 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
     } else {
         0
     };
-    let context_ideal: u16 = (app.sessions.len() as u16 + 4).clamp(5, 10);
+    let top_min_ideal = if app.show_token_rate && app.show_cache_read_rate {
+        6
+    } else {
+        5
+    };
+    let top_ideal: u16 = (app.sessions.len() as u16 + 4).clamp(top_min_ideal, 10);
 
     let available = area.height.saturating_sub(FIXED);
     // Tokens need five content rows for the total and all four categories.
@@ -525,10 +536,9 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
         0
     };
     let surplus = available.saturating_sub(sessions_h + mid_h);
-    let context_h = if app.show_context && sessions_h >= sessions_ideal && surplus >= CONTEXT_MIN {
-        context_ideal.min(surplus)
-    } else if app.show_context && !app.show_sessions && surplus >= CONTEXT_MIN {
-        context_ideal.min(available.saturating_sub(mid_h))
+    let top_enabled = app.show_context || app.show_token_rate;
+    let top_h = if top_enabled && sessions_h >= sessions_ideal && surplus >= TOP_MIN {
+        top_ideal.min(surplus)
     } else {
         0
     };
@@ -537,8 +547,8 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
     let mut n = 0;
     constraints[n] = Constraint::Length(1);
     n += 1;
-    if context_h > 0 {
-        constraints[n] = Constraint::Length(context_h);
+    if top_h > 0 {
+        constraints[n] = Constraint::Length(top_h);
         n += 1;
     }
     if mid_h > 0 {
@@ -561,12 +571,22 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
     let header = chunks[idx];
     idx += 1;
 
-    let context = if context_h > 0 {
+    let (token_rate, context) = if top_h > 0 {
         let area = chunks[idx];
         idx += 1;
-        Some(area)
+        match (app.show_token_rate, app.show_context) {
+            (true, true) => {
+                let panes =
+                    Layout::horizontal([Constraint::Percentage(65), Constraint::Percentage(35)])
+                        .split(area);
+                (Some(panes[0]), Some(panes[1]))
+            }
+            (true, false) => (Some(area), None),
+            (false, true) => (None, Some(area)),
+            (false, false) => (None, None),
+        }
     } else {
-        None
+        (None, None)
     };
 
     let mid = if mid_h > 0 {
@@ -599,6 +619,7 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
     DesktopLayout {
         header,
         context,
+        token_rate,
         mid,
         sessions,
         footer: chunks[idx],
@@ -718,15 +739,18 @@ fn narrow_section_areas(app: &App, tab: NarrowTab, area: Rect) -> Vec<(NarrowSec
 
     let constraints = if tab == NarrowTab::Usage {
         let min_height = |section| match section {
-            NarrowSection::Context => 5,
+            NarrowSection::Context | NarrowSection::TokenRate => 5,
             NarrowSection::Quota => 6,
             NarrowSection::Tokens => 7,
             NarrowSection::Models => 4,
             _ => 0,
         };
-        if sections.iter().copied().map(min_height).sum::<u16>() > area.height {
-            // Context yields first without changing the persisted visibility setting.
-            sections.retain(|section| *section != NarrowSection::Context);
+        // Optional graphs yield before the core usage rows, without changing
+        // saved visibility. Keep context usage available longer than token rate.
+        for optional in [NarrowSection::TokenRate, NarrowSection::Context] {
+            if sections.iter().copied().map(min_height).sum::<u16>() > area.height {
+                sections.retain(|section| *section != optional);
+            }
         }
         let mut minima: Vec<_> = sections.iter().copied().map(min_height).collect();
         if minima.iter().sum::<u16>() > area.height {
@@ -772,7 +796,7 @@ fn visible_active_section(app: &App, sections: &[(NarrowSection, Rect)]) -> Opti
         .or_else(|| sections.first().map(|(section, _)| *section))
 }
 
-/// Keep keyboard zoom on a visible pane when resizing hides Context.
+/// Keep keyboard zoom on a visible pane when resizing hides optional panes.
 pub(crate) fn sync_narrow_section(app: &mut App, area: Rect) {
     if uses_desktop_layout(app, area.width) || area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         return;
@@ -801,6 +825,9 @@ fn draw_narrow_section(
             projects::draw_projects_panel_active(f, app, area, theme, active)
         }
         NarrowSection::Context => context::draw_context_panel_active(f, app, area, theme, active),
+        NarrowSection::TokenRate => {
+            token_rate::draw_token_rate_panel_active(f, app, area, theme, active)
+        }
         NarrowSection::Quota => quota::draw_quota_panel_active(f, app, area, theme, active),
         NarrowSection::Tokens => tokens::draw_tokens_panel_active(f, app, area, theme, active),
         NarrowSection::Models => models::draw_models_panel_active(f, app, area, theme, active),
@@ -1364,7 +1391,7 @@ mod tests {
         assert_eq!(usage_sections.len(), 4);
         for (section, area) in usage_sections {
             let minimum = match section {
-                NarrowSection::Context => 5,
+                NarrowSection::Context | NarrowSection::TokenRate => 5,
                 NarrowSection::Quota => 6,
                 NarrowSection::Tokens => 7,
                 NarrowSection::Models => 4,
@@ -1686,6 +1713,216 @@ mod tests {
         app.show_mcp = false;
         assert!(uses_desktop_layout(&app, 100));
         assert!(!uses_desktop_layout(&app, 99));
+    }
+
+    #[test]
+    fn desktop_top_panes_split_expand_and_yield_without_changing_preferences() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        let area = Rect::new(0, 0, 160, 40);
+        let layout = desktop_layout(&app, area);
+        let rate = layout.token_rate.unwrap();
+        let context = layout.context.unwrap();
+        assert_eq!(rate.width, 104);
+        assert_eq!(context.width, 56);
+        assert_eq!(rate.right(), context.x);
+        assert_eq!((rate.y, rate.height), (context.y, context.height));
+
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let rate_text = area_text(terminal.backend().buffer(), rate);
+        assert!(rate_text.contains("token rate") && rate_text.contains("Global"));
+        assert!(rate_text.contains("/min"));
+        assert!(!rate_text.contains("Total") && !rate_text.contains("webshop"));
+        let context_text = area_text(terminal.backend().buffer(), context);
+        for value in ["webshop", "72%", "200k C2", "Window"] {
+            assert!(
+                context_text.contains(value),
+                "missing {value}: {context_text}"
+            );
+        }
+        assert!(!context_text.contains("/min") && !context_text.contains("Total"));
+
+        for (show_rate, show_context) in [(true, false), (false, true), (false, false)] {
+            app.show_token_rate = show_rate;
+            app.show_context = show_context;
+            let layout = desktop_layout(&app, area);
+            assert_eq!(layout.token_rate.is_some(), show_rate);
+            assert_eq!(layout.context.is_some(), show_context);
+            for pane in [layout.token_rate, layout.context].into_iter().flatten() {
+                assert_eq!(pane.width, area.width);
+                assert_eq!(pane.height, rate.height);
+            }
+        }
+        app.show_token_rate = true;
+        app.show_context = true;
+        let short = desktop_layout(&app, Rect::new(0, 0, 160, 24));
+        assert!(short.token_rate.is_none() && short.context.is_none());
+        assert!(app.show_token_rate && app.show_context);
+    }
+
+    #[test]
+    fn cache_chart_fits_desktop_and_narrow_layouts_without_changing_pane_controls() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        app.sessions.truncate(1);
+        let area = Rect::new(0, 0, 160, 40);
+        assert_eq!(desktop_layout(&app, area).token_rate.unwrap().height, 5);
+        app.show_cache_read_rate = true;
+        assert_eq!(desktop_layout(&app, area).token_rate.unwrap().height, 6);
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = area_text(
+            terminal.backend().buffer(),
+            desktop_layout(&app, area).token_rate.unwrap(),
+        );
+        assert!(text.contains("Cache reads") && text.contains("independent scales"));
+        // Only five rows are available after reserving Sessions and the middle row.
+        let short = desktop_layout(&app, Rect::new(0, 0, 160, 24));
+        assert_eq!(short.token_rate.unwrap().height, 5);
+
+        app.set_narrow_tab(NarrowTab::Usage);
+        for height in [24, 27, 30, 40] {
+            let area = Rect::new(0, 0, 80, height);
+            let body = narrow_chunks(area)[1];
+            app.show_cache_read_rate = false;
+            let without_cache = narrow_section_areas(&app, NarrowTab::Usage, body);
+            app.show_cache_read_rate = true;
+            assert_eq!(
+                narrow_section_areas(&app, NarrowTab::Usage, body),
+                without_cache
+            );
+            sync_narrow_section(&mut app, area);
+            app.toggle_narrow_section_zoom(NarrowSection::TokenRate);
+            let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
+            terminal.draw(|f| draw(f, &app)).unwrap();
+            let text = area_text(terminal.backend().buffer(), body);
+            assert!(text.contains("Cache reads") && text.contains("Reuse"));
+            assert_eq!(
+                click_target(&app, area, body.x + 1, body.y + 1),
+                Some(ClickTarget::NarrowSection(NarrowSection::TokenRate))
+            );
+            assert_eq!(
+                click_target(&app, area, body.right() - 3, body.y),
+                Some(ClickTarget::NarrowZoom(NarrowSection::TokenRate))
+            );
+            app.restore_narrow_sections();
+        }
+        app.view_open = true;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        assert!(
+            area_text(terminal.backend().buffer(), Rect::new(0, 0, 80, 24))
+                .contains("cache-read chart")
+        );
+        app.view_open = false;
+        app.config_open = true;
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        assert!(
+            area_text(terminal.backend().buffer(), Rect::new(0, 0, 80, 24))
+                .contains("Cache-read chart (C)")
+        );
+    }
+
+    #[test]
+    fn token_rate_yields_before_context_with_visible_focus_and_independent_zoom() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        app.set_narrow_tab(NarrowTab::Usage);
+        for (height, show_rate, show_context) in
+            [(40, true, true), (27, false, true), (24, false, false)]
+        {
+            let area = Rect::new(0, 0, 80, height);
+            let sections = narrow_section_areas(&app, NarrowTab::Usage, narrow_chunks(area)[1]);
+            assert_eq!(
+                sections.iter().any(|(s, _)| *s == NarrowSection::TokenRate),
+                show_rate
+            );
+            assert_eq!(
+                sections.iter().any(|(s, _)| *s == NarrowSection::Context),
+                show_context
+            );
+            assert!(app.show_token_rate && app.show_context);
+            sync_narrow_section(&mut app, area);
+            let active = app.active_narrow_section().unwrap();
+            assert_eq!(active, sections[0].0);
+            for (section, pane) in &sections {
+                assert_eq!(
+                    click_target(&app, area, pane.x + 1, pane.y + 1),
+                    Some(ClickTarget::NarrowSection(*section))
+                );
+                assert_eq!(
+                    click_target(&app, area, pane.right() - 3, pane.y),
+                    Some(ClickTarget::NarrowZoom(*section))
+                );
+            }
+            app.maximize_active_narrow_section();
+            assert_eq!(
+                narrow_section_areas(&app, NarrowTab::Usage, narrow_chunks(area)[1]),
+                vec![(active, narrow_chunks(area)[1])]
+            );
+            app.restore_narrow_sections();
+        }
+        let area = Rect::new(0, 0, 80, 24);
+        for section in [NarrowSection::TokenRate, NarrowSection::Context] {
+            app.toggle_narrow_section_zoom(section);
+            assert_eq!(
+                narrow_section_areas(&app, NarrowTab::Usage, narrow_chunks(area)[1]),
+                vec![(section, narrow_chunks(area)[1])]
+            );
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|f| draw(f, &app)).unwrap();
+            let body = area_text(terminal.backend().buffer(), narrow_chunks(area)[1]);
+            assert_eq!(body.contains("/min"), section == NarrowSection::TokenRate);
+            assert_eq!(body.contains("webshop"), section == NarrowSection::Context);
+            app.restore_narrow_sections();
+        }
+    }
+
+    #[test]
+    fn top_panes_keep_their_content_in_compact_and_empty_states() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        for height in [3, 8] {
+            let area = Rect::new(0, 0, 80, height);
+            let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
+            terminal
+                .draw(|f| context::draw_context_panel(f, &app, area, &app.theme))
+                .unwrap();
+            let text = area_text(terminal.backend().buffer(), area);
+            assert!(
+                text.contains("webshop") && text.contains("72%") && text.contains("200k C2"),
+                "{text}"
+            );
+            assert!(!text.contains("/min") && !text.contains("Total"));
+            terminal
+                .draw(|f| {
+                    token_rate::draw_token_rate_panel_active(f, &app, area, &app.theme, false)
+                })
+                .unwrap();
+            let before = area_text(terminal.backend().buffer(), area);
+            app.selected = 1;
+            app.stats_scope = StatsScope::AllLive;
+            app.filter_text = "no matching session".into();
+            terminal
+                .draw(|f| {
+                    token_rate::draw_token_rate_panel_active(f, &app, area, &app.theme, false)
+                })
+                .unwrap();
+            assert_eq!(before, area_text(terminal.backend().buffer(), area));
+        }
+        app.sessions.clear();
+        app.clear_global_token_history();
+        let area = Rect::new(0, 0, 80, 5);
+        let mut terminal = Terminal::new(TestBackend::new(80, 5)).unwrap();
+        terminal
+            .draw(|f| context::draw_context_panel(f, &app, area, &app.theme))
+            .unwrap();
+        assert!(area_text(terminal.backend().buffer(), area).contains("no active sessions"));
+        terminal
+            .draw(|f| token_rate::draw_token_rate_panel_active(f, &app, area, &app.theme, false))
+            .unwrap();
+        assert!(area_text(terminal.backend().buffer(), area).contains("0/min"));
     }
 
     #[test]

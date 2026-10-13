@@ -127,7 +127,7 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("help.toggle_file_audit", "toggle file audit");
     m.insert(
         "help.toggle_panels",
-        "toggle panels (context/quota/tokens/projects/ports/sessions/mcp/models)",
+        "toggle panes (9: token rate; v: list)",
     );
     m.insert(
         "help.mcp_suppress",
@@ -196,6 +196,20 @@ static LOCALE_EN: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("tokens.turns", "Turns");
     m.insert("tokens.avg", "Avg");
     m.insert("tokens.tokens_turn", "tokens/turn");
+
+    // Token rate panel
+    m.insert("token_rate.cache_reads", "Cache reads");
+    m.insert("token_rate.reuse", "Reuse");
+    m.insert("token_rate.independent_scales", "independent scales");
+    m.insert("view.cache_read_rate", "cache-read chart");
+    m.insert("config.cache_read_rate", "Cache-read chart (C)");
+    m.insert(
+        "help.cache_read_rate",
+        "toggle cache chart and reuse in Token rate",
+    );
+    m.insert("token_rate.global", "Global");
+    m.insert("view.token_rate_panel", "token rate panel");
+    m.insert("config.token_rate_panel", "Token rate panel (9)");
 
     // Context panel
     m.insert("context.rate", "Rate");
@@ -386,7 +400,7 @@ static LOCALE_ZH: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("help.toggle_file_audit", "切换文件审计");
     m.insert(
         "help.toggle_panels",
-        "切换面板 (上下文/配额/词元/项目/端口/会话/MCP)",
+        "toggle panes (9: token rate; v: list)",
     );
     m.insert("help.mcp_suppress", "切换会话面板中的 MCP 服务器隐藏");
     m.insert("help.this_help", "显示帮助");
@@ -452,6 +466,20 @@ static LOCALE_ZH: LazyLock<std::collections::HashMap<&str, &str>> = LazyLock::ne
     m.insert("tokens.turns", "轮数");
     m.insert("tokens.avg", "平均");
     m.insert("tokens.tokens_turn", "词元/轮");
+
+    // Token rate panel
+    m.insert("token_rate.cache_reads", "Cache reads");
+    m.insert("token_rate.reuse", "Reuse");
+    m.insert("token_rate.independent_scales", "independent scales");
+    m.insert("view.cache_read_rate", "cache-read chart");
+    m.insert("config.cache_read_rate", "Cache-read chart (C)");
+    m.insert(
+        "help.cache_read_rate",
+        "toggle cache chart and reuse in Token rate",
+    );
+    m.insert("token_rate.global", "Global");
+    m.insert("view.token_rate_panel", "token rate panel");
+    m.insert("config.token_rate_panel", "Token rate panel (9)");
 
     // Context panel
     m.insert("context.rate", "速率");

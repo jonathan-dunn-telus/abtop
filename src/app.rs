@@ -12,7 +12,7 @@ pub use stats::StatsScope;
 
 /// Maximum data points kept for the live token-rate graph.
 const GRAPH_HISTORY_LEN: usize = 200;
-/// Window for the per-session token rates shown in the tokens pane.
+/// Window for the per-session and global token-rate summaries.
 const TOKEN_RATE_WINDOW: Duration = Duration::from_secs(60);
 /// Max concurrent summary jobs.
 const MAX_SUMMARY_JOBS: usize = 3;
@@ -31,6 +31,15 @@ pub(crate) struct TokenRates {
 impl TokenRates {
     pub(crate) fn total(&self) -> u64 {
         self.input + self.output + self.cache_read + self.cache_write
+    }
+
+    pub(crate) fn uncached_total(&self) -> u64 {
+        self.input + self.output + self.cache_write
+    }
+
+    pub(crate) fn cache_reuse_percent(&self) -> Option<f64> {
+        let input_side = self.input as f64 + self.cache_read as f64 + self.cache_write as f64;
+        (input_side > 0.0).then(|| self.cache_read as f64 / input_side * 100.0)
     }
 
     fn add(&mut self, other: &Self) {
@@ -54,7 +63,7 @@ impl TokenRateCounter {
         }
     }
 
-    fn update(&mut self, total: u64, now: Instant) {
+    fn update(&mut self, total: u64, now: Instant) -> u64 {
         if total < self.previous {
             // Transcript rotation or correction invalidates this category's history.
             self.samples.clear();
@@ -71,6 +80,7 @@ impl TokenRateCounter {
             self.samples.push_back((now, delta));
         }
         self.previous = total;
+        delta
     }
 
     fn rate(&self, now: Instant) -> u64 {
@@ -101,12 +111,14 @@ impl SessionTokenRates {
         }
     }
 
-    fn update(&mut self, session: &AgentSession, now: Instant) {
-        self.input.update(session.total_input_tokens, now);
-        self.output.update(session.total_output_tokens, now);
-        self.cache_read.update(session.total_cache_read, now);
-        self.cache_write.update(session.total_cache_create, now);
+    fn update(&mut self, session: &AgentSession, now: Instant) -> TokenRates {
         self.last_seen = now;
+        TokenRates {
+            input: self.input.update(session.total_input_tokens, now),
+            output: self.output.update(session.total_output_tokens, now),
+            cache_read: self.cache_read.update(session.total_cache_read, now),
+            cache_write: self.cache_write.update(session.total_cache_create, now),
+        }
     }
 
     fn rates(&self, now: Instant) -> TokenRates {
@@ -173,6 +185,7 @@ pub enum NarrowSection {
     Sessions,
     Projects,
     Context,
+    TokenRate,
     Quota,
     Tokens,
     Models,
@@ -184,7 +197,9 @@ impl NarrowSection {
     pub fn tab(self) -> NarrowTab {
         match self {
             Self::Sessions | Self::Projects => NarrowTab::Work,
-            Self::Context | Self::Quota | Self::Tokens | Self::Models => NarrowTab::Usage,
+            Self::TokenRate | Self::Context | Self::Quota | Self::Tokens | Self::Models => {
+                NarrowTab::Usage
+            }
             Self::Ports | Self::Mcp => NarrowTab::System,
         }
     }
@@ -202,10 +217,12 @@ pub struct App {
     pub should_quit: bool,
     /// Token rate per tick (delta). Ring buffer for the braille graph.
     pub token_rates: VecDeque<f64>,
+    /// Cache-read deltas sampled alongside token_rates, including idle refreshes.
+    pub(crate) cache_read_rates: VecDeque<f64>,
+    /// Observed global activity, retained after sessions close until it expires.
+    global_token_samples: VecDeque<(Instant, TokenRates)>,
     /// Account-level rate limits (Claude, Codex, etc.)
     pub rate_limits: Vec<RateLimitInfo>,
-    /// Per-session previous token totals, keyed by (agent_cli, session_id).
-    prev_tokens: HashMap<(String, String), u64>,
     /// Recent category deltas, keyed by (agent_cli, session_id).
     session_token_rates: HashMap<(String, String), SessionTokenRates>,
     /// Rate limit poll counter (read every 5 ticks = 10s)
@@ -229,6 +246,11 @@ pub struct App {
     kill_confirm: Option<(usize, Instant)>,
     pub theme: Theme,
     pub show_context: bool,
+    pub show_token_rate: bool,
+    pub show_cache_read_rate: bool,
+    pub(crate) save_cache_read_rate: fn(bool) -> Result<(), String>,
+    /// Injectable persistence boundary; tests never write the user's config.
+    pub(crate) save_panel_visibility: fn(&crate::config::PanelVisibility) -> Result<(), String>,
     pub show_quota: bool,
     pub show_tokens: bool,
     pub show_models: bool,
@@ -296,7 +318,8 @@ impl App {
             should_quit: false,
             token_rates: VecDeque::with_capacity(GRAPH_HISTORY_LEN),
             rate_limits: Vec::new(),
-            prev_tokens: HashMap::new(),
+            cache_read_rates: VecDeque::with_capacity(GRAPH_HISTORY_LEN),
+            global_token_samples: VecDeque::new(),
             session_token_rates: HashMap::new(),
             rate_limit_counter: 5,
             collector,
@@ -310,6 +333,10 @@ impl App {
             kill_confirm: None,
             theme,
             show_context: panels.context,
+            show_token_rate: panels.token_rate,
+            show_cache_read_rate: false,
+            save_cache_read_rate: crate::config::save_cache_read_rate,
+            save_panel_visibility: crate::config::save_panel_visibility,
             show_quota: panels.quota,
             show_tokens: panels.tokens,
             show_models: panels.models,
@@ -352,6 +379,13 @@ impl App {
         }
     }
 
+    pub fn toggle_cache_read_rate(&mut self) {
+        self.show_cache_read_rate = !self.show_cache_read_rate;
+        if let Err(error) = (self.save_cache_read_rate)(self.show_cache_read_rate) {
+            self.set_status(format!("cache chart save failed: {error}"));
+        }
+    }
+
     pub fn toggle_panel(&mut self, panel: u8) {
         match panel {
             1 => self.show_context = !self.show_context,
@@ -362,6 +396,7 @@ impl App {
             6 => self.show_sessions = !self.show_sessions,
             7 => self.show_mcp = !self.show_mcp,
             8 => self.show_models = !self.show_models,
+            9 => self.show_token_rate = !self.show_token_rate,
             _ => return,
         }
         self.persist_panel_visibility();
@@ -385,6 +420,7 @@ impl App {
     fn persist_panel_visibility(&mut self) {
         let panels = crate::config::PanelVisibility {
             context: self.show_context,
+            token_rate: self.show_token_rate,
             quota: self.show_quota,
             tokens: self.show_tokens,
             models: self.show_models,
@@ -393,7 +429,7 @@ impl App {
             sessions: self.show_sessions,
             mcp: self.show_mcp,
         };
-        if let Err(e) = crate::config::save_panel_visibility(&panels) {
+        if let Err(e) = (self.save_panel_visibility)(&panels) {
             self.set_status(format!("panels save failed: {}", e));
         }
     }
@@ -410,7 +446,7 @@ impl App {
     }
 
     pub fn config_item_count(&self) -> usize {
-        9 // theme + 8 panel toggles
+        11 // theme + 9 panel toggles + cache chart
     }
 
     pub fn config_select_next(&mut self) {
@@ -437,6 +473,11 @@ impl App {
             6 => self.show_sessions = !self.show_sessions,
             7 => self.show_mcp = !self.show_mcp,
             8 => self.show_models = !self.show_models,
+            9 => self.show_token_rate = !self.show_token_rate,
+            10 => {
+                self.toggle_cache_read_rate();
+                return;
+            }
             _ => return,
         }
         self.persist_panel_visibility();
@@ -447,7 +488,11 @@ impl App {
         match tab {
             NarrowTab::Work => self.show_sessions || self.show_projects,
             NarrowTab::Usage => {
-                self.show_context || self.show_quota || self.show_tokens || self.show_models
+                self.show_token_rate
+                    || self.show_context
+                    || self.show_quota
+                    || self.show_tokens
+                    || self.show_models
             }
             NarrowTab::System => self.show_ports || self.show_mcp,
         }
@@ -511,6 +556,7 @@ impl App {
             NarrowSection::Sessions => self.show_sessions,
             NarrowSection::Projects => self.show_projects,
             NarrowSection::Context => self.show_context,
+            NarrowSection::TokenRate => self.show_token_rate,
             NarrowSection::Quota => self.show_quota,
             NarrowSection::Tokens => self.show_tokens,
             NarrowSection::Models => self.show_models,
@@ -523,6 +569,7 @@ impl App {
         let sections: &[NarrowSection] = match tab {
             NarrowTab::Work => &[NarrowSection::Sessions, NarrowSection::Projects],
             NarrowTab::Usage => &[
+                NarrowSection::TokenRate,
                 NarrowSection::Context,
                 NarrowSection::Quota,
                 NarrowSection::Tokens,
@@ -646,24 +693,6 @@ impl App {
 
         self.update_session_token_rates(Instant::now());
 
-        // Compute rate as sum of per-session deltas (stable across session churn).
-        // Update prev_tokens in place; stale entries are harmless (bounded by
-        // total unique sessions ever seen) and keeping them avoids false spikes
-        // when a session transiently disappears from one poll.
-        let mut rate: f64 = 0.0;
-        for s in &self.sessions {
-            let key = (s.agent_cli.to_string(), s.session_id.clone());
-            let total = s.active_tokens();
-            let prev = self.prev_tokens.get(&key).copied().unwrap_or(total);
-            rate += total.saturating_sub(prev) as f64;
-            self.prev_tokens.insert(key, total);
-        }
-
-        self.token_rates.push_back(rate);
-        if self.token_rates.len() > GRAPH_HISTORY_LEN {
-            self.token_rates.pop_front();
-        }
-
         // Poll rate limits: first tick immediately, then every 5 ticks ≈ 10s
         if self.rate_limits.is_empty() || self.rate_limit_counter >= 5 {
             self.rate_limit_counter = 0;
@@ -684,21 +713,65 @@ impl App {
         self.session_token_rates
             .retain(|_, rates| now.duration_since(rates.last_seen) < TOKEN_RATE_WINDOW);
         let mut seen = HashSet::new();
+        let mut delta = TokenRates::default();
         for session in &self.sessions {
             let key = (session.agent_cli.to_string(), session.session_id.clone());
             if !seen.insert(key.clone()) {
                 continue;
             }
-            self.session_token_rates
-                .entry(key)
-                .or_insert_with(|| SessionTokenRates::new(session, now))
-                .update(session, now);
+            delta.add(
+                &self
+                    .session_token_rates
+                    .entry(key)
+                    .or_insert_with(|| SessionTokenRates::new(session, now))
+                    .update(session, now),
+            );
         }
+        self.record_global_token_delta(now, delta);
         self.live_token_history
             .push_back(self.live_token_rates(now).total());
         if self.live_token_history.len() > GRAPH_HISTORY_LEN {
             self.live_token_history.pop_front();
         }
+    }
+
+    pub(crate) fn record_global_token_delta(&mut self, now: Instant, delta: TokenRates) {
+        self.token_rates.push_back(delta.uncached_total() as f64);
+        self.cache_read_rates.push_back(delta.cache_read as f64);
+        if self.token_rates.len() > GRAPH_HISTORY_LEN {
+            self.token_rates.pop_front();
+        }
+        if self.cache_read_rates.len() > GRAPH_HISTORY_LEN {
+            self.cache_read_rates.pop_front();
+        }
+        while self
+            .global_token_samples
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) >= TOKEN_RATE_WINDOW)
+        {
+            self.global_token_samples.pop_front();
+        }
+        if delta.total() > 0 {
+            self.global_token_samples.push_back((now, delta));
+        }
+    }
+
+    pub(crate) fn global_token_rates(&self, now: Instant) -> TokenRates {
+        let mut rates = TokenRates::default();
+        for (_, delta) in self
+            .global_token_samples
+            .iter()
+            .filter(|(at, _)| now.duration_since(*at) < TOKEN_RATE_WINDOW)
+        {
+            rates.add(delta);
+        }
+        rates
+    }
+
+    pub(crate) fn clear_global_token_history(&mut self) {
+        self.token_rates.clear();
+        self.cache_read_rates.clear();
+        self.global_token_samples.clear();
     }
 
     pub(crate) fn session_token_rates(&self, session: &AgentSession, now: Instant) -> TokenRates {
@@ -1228,6 +1301,147 @@ mod tests {
             seven_day_window_minutes: None,
             updated_at: None,
         }
+    }
+
+    #[test]
+    fn global_rates_share_category_deltas_and_expire_after_sessions_close() {
+        let mut app = App::new_with_config(Theme::default(), &[], Default::default());
+        let mut session = waiting_session("claude");
+        session.total_input_tokens = 100_000;
+        session.total_cache_read = 1_000_000;
+        app.sessions.push(session);
+        let start = Instant::now();
+        app.update_session_token_rates(start);
+        assert_eq!(app.global_token_rates(start), TokenRates::default());
+        assert_eq!(app.token_rates.back(), Some(&0.0));
+        assert_eq!(app.cache_read_rates.back(), Some(&0.0));
+
+        app.sessions[0].total_input_tokens += 200;
+        app.sessions[0].total_output_tokens += 100;
+        app.sessions[0].total_cache_read += 600;
+        app.sessions[0].total_cache_create += 200;
+        app.sessions.push(app.sessions[0].clone());
+        app.filter_text = "no matching sessions".into();
+        app.stats_scope = StatsScope::AllLive;
+        app.show_token_rate = false;
+        app.update_session_token_rates(start + Duration::from_secs(2));
+        let rates = app.global_token_rates(start + Duration::from_secs(2));
+        assert_eq!(rates.uncached_total(), 500);
+        assert_eq!(rates.cache_read, 600);
+        assert_eq!(rates.cache_reuse_percent(), Some(60.0));
+        assert_eq!(app.token_rates.back(), Some(&500.0));
+        assert_eq!(app.cache_read_rates.back(), Some(&600.0));
+
+        app.sessions.truncate(1);
+        app.sessions[0].total_output_tokens += 50;
+        app.update_session_token_rates(start + Duration::from_secs(19));
+        app.sessions[0].total_cache_read += 200;
+        app.update_session_token_rates(start + Duration::from_secs(61));
+        assert_eq!(
+            app.global_token_rates(start + Duration::from_secs(61))
+                .total(),
+            1_350
+        );
+        app.sessions.clear();
+        app.update_session_token_rates(start + Duration::from_secs(62));
+        let rates = app.global_token_rates(start + Duration::from_secs(62));
+        assert_eq!(rates.uncached_total(), 50);
+        assert_eq!(rates.cache_read, 200);
+        assert_eq!(rates.cache_reuse_percent(), Some(100.0));
+        assert_eq!(app.token_rates.back(), Some(&0.0));
+        assert_eq!(app.cache_read_rates.back(), Some(&0.0));
+        // Expire during rendering, without another collection tick.
+        assert_eq!(
+            app.global_token_rates(start + Duration::from_secs(121)),
+            TokenRates::default()
+        );
+    }
+
+    #[test]
+    fn global_histories_handle_resets_discovery_gaps_and_manual_refreshes() {
+        let mut app = App::new_with_config(Theme::default(), &[], Default::default());
+        let start = Instant::now();
+        app.sessions.push(waiting_session("codex"));
+        app.sessions[0].total_cache_read = 1_000;
+        app.update_session_token_rates(start);
+        app.sessions[0].total_input_tokens = 100;
+        app.sessions[0].total_cache_read = 10;
+        app.update_session_token_rates(start + Duration::from_secs(2));
+        assert_eq!(app.token_rates.back(), Some(&100.0));
+        assert_eq!(app.cache_read_rates.back(), Some(&0.0));
+        app.sessions[0].total_cache_read = 40;
+        app.update_session_token_rates(start + Duration::from_secs(2));
+        assert_eq!(app.cache_read_rates.back(), Some(&30.0));
+        app.update_session_token_rates(start + Duration::from_secs(2));
+        assert_eq!(app.cache_read_rates.back(), Some(&0.0));
+
+        let mut session = app.sessions.pop().unwrap();
+        app.update_session_token_rates(start + Duration::from_secs(3));
+        session.total_cache_read += 20;
+        app.sessions.push(session);
+        app.update_session_token_rates(start + Duration::from_secs(20));
+        assert_eq!(app.cache_read_rates.back(), Some(&20.0));
+        assert_eq!(
+            app.global_token_rates(start + Duration::from_secs(20))
+                .cache_read,
+            50
+        );
+        // A long collection gap establishes fresh baselines instead of a spike.
+        app.sessions[0].total_input_tokens += 50_000;
+        app.sessions[0].total_cache_read += 500_000;
+        app.update_session_token_rates(start + Duration::from_secs(80));
+        assert_eq!(
+            app.global_token_rates(start + Duration::from_secs(80)),
+            TokenRates::default()
+        );
+        for second in 81..=300 {
+            app.update_session_token_rates(start + Duration::from_secs(second));
+        }
+        assert_eq!(app.token_rates.len(), GRAPH_HISTORY_LEN);
+        assert_eq!(app.cache_read_rates.len(), GRAPH_HISTORY_LEN);
+        assert!(app.token_rates.iter().all(|&rate| rate == 0.0));
+        assert!(app.cache_read_rates.iter().all(|&rate| rate == 0.0));
+        assert!(app.global_token_samples.is_empty());
+    }
+
+    #[test]
+    fn reuse_is_weighted_by_input_tokens_and_excludes_output() {
+        for (input, cache_read, cache_write, expected) in [
+            (0, 0, 0, None),
+            (200, 600, 200, Some(60.0)),
+            (100, 0, 100, Some(0.0)),
+            (0, 100, 0, Some(100.0)),
+        ] {
+            for output in [0, 10_000] {
+                let rates = TokenRates {
+                    input,
+                    output,
+                    cache_read,
+                    cache_write,
+                };
+                assert_eq!(rates.cache_reuse_percent(), expected);
+            }
+        }
+        let mut app = App::new_with_config(Theme::default(), &[], Default::default());
+        let now = Instant::now();
+        app.record_global_token_delta(
+            now,
+            TokenRates {
+                input: 100,
+                ..Default::default()
+            },
+        );
+        app.record_global_token_delta(
+            now,
+            TokenRates {
+                cache_read: 900,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            app.global_token_rates(now).cache_reuse_percent(),
+            Some(90.0)
+        );
     }
 
     #[test]

@@ -87,6 +87,7 @@ fn build_app(theme: theme::Theme, cfg: &config::AppConfig) -> App {
         &cfg.claude_config_dirs,
     );
     app.stats_scope = cfg.stats_scope;
+    app.show_cache_read_rate = cfg.show_cache_read_rate;
     app
 }
 
@@ -266,12 +267,12 @@ fn run_app(
         };
 
         if demo_mode {
-            // Rotate token rates to animate the sparkline
-            if let Some(front) = app.token_rates.pop_front() {
-                app.token_rates.push_back(front);
-            }
-            if let Some(front) = app.live_token_history.pop_front() {
-                app.live_token_history.push_back(front);
+            if last_tick.elapsed() >= tick_interval {
+                demo::advance_token_rates(&mut app);
+                if let Some(front) = app.live_token_history.pop_front() {
+                    app.live_token_history.push_back(front);
+                }
+                last_tick = std::time::Instant::now();
             }
         } else if !had_input && last_tick.elapsed() >= tick_interval {
             // Data tick every 2s — skip when handling input to avoid lag
@@ -301,10 +302,11 @@ fn handle_key_press(
         match key.code {
             KeyCode::Esc | KeyCode::Char('v') => app.view_open = false,
             KeyCode::Char('a') => app.toggle_stats_scope(),
+            KeyCode::Char('C') => app.toggle_cache_read_rate(),
             KeyCode::Char('T') => app.tree_view = !app.tree_view,
             KeyCode::Char('l') => app.toggle_timeline(),
             KeyCode::Char('f') => app.toggle_file_audit(),
-            KeyCode::Char(c @ '1'..='8') => app.toggle_panel(c as u8 - b'0'),
+            KeyCode::Char(c @ '1'..='9') => app.toggle_panel(c as u8 - b'0'),
             KeyCode::Char('M') => app.toggle_mcp_session_suppression(),
             KeyCode::Char('t') => app.cycle_theme(),
             _ => {}
@@ -331,6 +333,7 @@ fn handle_key_press(
         match key.code {
             KeyCode::Char('q') => app.quit(),
             KeyCode::Char('a') => app.toggle_stats_scope(),
+            KeyCode::Char('C') => app.toggle_cache_read_rate(),
             KeyCode::Char('r') if !demo_mode => app.tick(),
             KeyCode::Down | KeyCode::Char('j') => app.select_next(),
             KeyCode::Up | KeyCode::Char('k') => app.select_prev(),
@@ -346,7 +349,7 @@ fn handle_key_press(
             KeyCode::Char('t') => app.cycle_theme(),
             KeyCode::Char('T') => app.tree_view = !app.tree_view,
             KeyCode::Char('l') | KeyCode::Char('L') => app.toggle_timeline(),
-            KeyCode::Char(c @ '1'..='8') => app.toggle_panel(c as u8 - b'0'),
+            KeyCode::Char(c @ '1'..='9') => app.toggle_panel(c as u8 - b'0'),
             KeyCode::Char('M') => app.toggle_mcp_session_suppression(),
             KeyCode::Char('c') => app.toggle_config(),
             KeyCode::Char('v') => app.toggle_view_menu(),
@@ -575,6 +578,112 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn token_rate_keyboard_menu_and_config_persist_independently() {
+        thread_local! {
+            static SAVED: std::cell::RefCell<Vec<(bool, bool)>> = const {
+                std::cell::RefCell::new(Vec::new())
+            };
+        }
+        let mut app = App::new_with_config(theme::Theme::default(), &[], Default::default());
+        app.save_panel_visibility = |panels| {
+            SAVED.with_borrow_mut(|saved| saved.push((panels.context, panels.token_rate)));
+            Ok(())
+        };
+        let key = KeyEvent::new(KeyCode::Char('9'), KeyModifiers::NONE);
+        handle_key_press(&mut app, key, true, false, |_| panic!("must not jump"));
+        assert!(!app.show_token_rate);
+        assert!(app.show_context);
+        app.view_open = true;
+        handle_key_press(&mut app, key, true, false, |_| panic!("must not jump"));
+        assert!(app.show_token_rate);
+        app.view_open = false;
+        app.toggle_config();
+        for _ in 0..9 {
+            app.config_select_next();
+        }
+        handle_key_press(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            true,
+            false,
+            |_| panic!("must not jump"),
+        );
+        assert!(!app.show_token_rate);
+        app.toggle_config();
+        handle_key_press(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+            true,
+            false,
+            |_| panic!("must not jump"),
+        );
+        assert!(!app.show_context);
+        assert!(!app.show_token_rate);
+        app.filter_active = true;
+        handle_key_press(&mut app, key, true, false, |_| panic!("must not jump"));
+        assert_eq!(app.filter_text, "9");
+        SAVED.with_borrow(|saved| {
+            assert_eq!(
+                *saved,
+                [(true, false), (true, true), (true, false), (false, false)]
+            );
+        });
+    }
+
+    #[test]
+    fn cache_chart_controls_persist_without_revealing_the_parent_pane() {
+        thread_local! {
+            static SAVED: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let cfg = config::AppConfig {
+            show_cache_read_rate: true,
+            ..Default::default()
+        };
+        let mut app = build_app(theme::Theme::default(), &cfg);
+        assert!(app.show_cache_read_rate);
+        app.show_token_rate = false;
+        app.save_cache_read_rate = |enabled| {
+            SAVED.with_borrow_mut(|saved| saved.push(enabled));
+            Ok(())
+        };
+        let key = KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT);
+        handle_key_press(&mut app, key, true, false, |_| panic!("must not jump"));
+        assert!(!app.show_cache_read_rate);
+        app.view_open = true;
+        handle_key_press(&mut app, key, true, false, |_| panic!("must not jump"));
+        assert!(app.show_cache_read_rate);
+        app.view_open = false;
+        app.toggle_config();
+        for _ in 0..app.config_item_count() {
+            app.config_select_next();
+        }
+        handle_key_press(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            true,
+            false,
+            |_| panic!("must not jump"),
+        );
+        assert!(!app.show_cache_read_rate);
+        app.toggle_config();
+        app.filter_active = true;
+        handle_key_press(&mut app, key, true, false, |_| panic!("must not jump"));
+        assert_eq!(app.filter_text, "C");
+        assert!(!app.show_token_rate);
+        SAVED.with_borrow(|saved| assert_eq!(*saved, [false, true, false]));
+        app.clear_filter();
+        app.save_cache_read_rate = |_| Err("test storage failure".into());
+        handle_key_press(&mut app, key, true, false, |_| panic!("must not jump"));
+        assert!(app.show_cache_read_rate);
+        assert!(app
+            .status_msg
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("test storage failure"));
+    }
 
     #[test]
     fn saved_scope_initializes_app_without_changing_snapshot_interface() {
