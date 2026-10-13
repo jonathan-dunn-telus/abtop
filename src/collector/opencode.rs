@@ -1,5 +1,5 @@
-use super::{process, context_window_for_model};
-use crate::model::{AgentSession, ChildProcess, LaunchSurface, SessionStatus};
+use super::{context_window_for_model, process};
+use crate::model::{AgentSession, ChildProcess, LaunchSurface, ModelUsage, SessionStatus};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -209,6 +209,7 @@ impl OpenCodeCollector {
                 total_output_tokens: ds.total_output,
                 total_cache_read: ds.total_cache_read,
                 total_cache_create: ds.total_cache_write,
+                model_usage: ds.model_usage.clone(),
                 turn_count: ds.turn_count,
                 current_tasks,
                 mem_mb,
@@ -320,21 +321,38 @@ impl OpenCodeCollector {
     fn query_sessions(&self) -> Option<Vec<DbSession>> {
         let session_sql = format!(
             r#"
+WITH recent_sessions AS (
+  SELECT * FROM session ORDER BY time_updated DESC LIMIT {}
+), usage_by_model AS (
+  SELECT m.session_id,
+    COALESCE(json_extract(m.data, '$.modelID'), '') AS model,
+    COALESCE(json_extract(m.data, '$.providerID'), '') AS provider,
+    COUNT(m.id) AS turn_count,
+    COALESCE(SUM(json_extract(m.data, '$.tokens.input')), 0) AS total_input,
+    COALESCE(SUM(json_extract(m.data, '$.tokens.output')), 0) AS total_output,
+    COALESCE(SUM(json_extract(m.data, '$.tokens.cache.read')), 0) AS total_cache_read,
+    COALESCE(SUM(json_extract(m.data, '$.tokens.cache.write')), 0) AS total_cache_write
+  FROM message m JOIN recent_sessions s ON m.session_id = s.id
+  WHERE json_extract(m.data, '$.role') = 'assistant'
+  GROUP BY m.session_id, model, provider
+)
 SELECT
   s.id, s.title, s.directory, s.version, s.time_created, s.time_updated,
-  COALESCE(p.name, '') as project_name,
-  COUNT(m.id) as turn_count,
-  COALESCE(SUM(json_extract(m.data, '$.tokens.input')), 0) as total_input,
-  COALESCE(SUM(json_extract(m.data, '$.tokens.output')), 0) as total_output,
-  COALESCE(SUM(json_extract(m.data, '$.tokens.cache.read')), 0) as total_cache_read,
-  COALESCE(SUM(json_extract(m.data, '$.tokens.cache.write')), 0) as total_cache_write
-FROM session s
+  COALESCE(p.name, '') AS project_name,
+  COALESCE(SUM(u.turn_count), 0) AS turn_count,
+  COALESCE(SUM(u.total_input), 0) AS total_input,
+  COALESCE(SUM(u.total_output), 0) AS total_output,
+  COALESCE(SUM(u.total_cache_read), 0) AS total_cache_read,
+  COALESCE(SUM(u.total_cache_write), 0) AS total_cache_write,
+  json_group_array(json_object(
+    'model', u.model, 'provider', u.provider,
+    'total_tokens', u.total_input + u.total_output + u.total_cache_read + u.total_cache_write
+  )) AS model_usage
+FROM recent_sessions s
 LEFT JOIN project p ON s.project_id = p.id
-LEFT JOIN message m ON m.session_id = s.id
-  AND json_extract(m.data, '$.role') = 'assistant'
+LEFT JOIN usage_by_model u ON u.session_id = s.id
 GROUP BY s.id
-ORDER BY s.time_updated DESC
-LIMIT {};"#,
+ORDER BY s.time_updated DESC;"#,
             MAX_SESSIONS
         );
 
@@ -385,6 +403,28 @@ LIMIT {};"#,
             let version = sanitize_db_field(row["version"].as_str().unwrap_or(""), 64);
             let project_name = sanitize_db_field(row["project_name"].as_str().unwrap_or(""), 256);
 
+            let mut model_usage = Vec::new();
+            let usage_rows: Vec<Value> = row["model_usage"]
+                .as_str()
+                .and_then(|json| serde_json::from_str(json).ok())
+                .unwrap_or_default();
+            for usage in usage_rows {
+                let model = sanitize_db_field(usage["model"].as_str().unwrap_or(""), 256);
+                let provider = sanitize_db_field(usage["provider"].as_str().unwrap_or(""), 256);
+                let identity = if model.trim().is_empty() || model == "-" {
+                    "Unknown".to_string()
+                } else if provider.is_empty() {
+                    model
+                } else {
+                    format!("{provider}/{model}")
+                };
+                ModelUsage::add(
+                    &mut model_usage,
+                    &identity,
+                    usage["total_tokens"].as_u64().unwrap_or(0),
+                );
+            }
+
             sessions.push(DbSession {
                 id,
                 title,
@@ -399,6 +439,7 @@ LIMIT {};"#,
                 total_output: row["total_output"].as_u64().unwrap_or(0),
                 total_cache_read: row["total_cache_read"].as_u64().unwrap_or(0),
                 total_cache_write: row["total_cache_write"].as_u64().unwrap_or(0),
+                model_usage: ModelUsage::sorted(&model_usage),
                 model,
                 provider,
             });
@@ -433,6 +474,7 @@ struct DbSession {
     total_output: u64,
     total_cache_read: u64,
     total_cache_write: u64,
+    model_usage: Vec<ModelUsage>,
     model: String,
     provider: String,
 }
@@ -601,6 +643,87 @@ mod tests {
         assert!(!pids.contains(&200)); // grep excluded
         assert!(pids.contains(&300));
         assert_eq!(pids.len(), 2);
+    }
+
+    #[test]
+    fn query_model_usage_groups_providers_and_models_with_matching_totals() {
+        let mut collector = OpenCodeCollector::new();
+        if !collector.check_sqlite3() {
+            eprintln!("Skipping SQLite integration test: sqlite3 is not installed");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        collector.db_path = temp.path().join("opencode.db");
+        let setup = Command::new("sqlite3").arg(&collector.db_path).arg(r#"
+CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT);
+CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT, directory TEXT, version TEXT,
+    time_created INTEGER, time_updated INTEGER, project_id TEXT);
+CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+INSERT INTO project VALUES ('project', 'Example');
+INSERT INTO session VALUES ('main', 'Model changes', '/example/project', '1', 0, 100, 'project');
+INSERT INTO session VALUES ('empty', 'Empty session', '/example/empty', '1', 0, 90, 'project');
+INSERT INTO message VALUES ('1', 'main', 1,
+    '{"role":"assistant","providerID":"alpha","modelID":"shared","tokens":{"input":10,"output":20,"cache":{"read":30,"write":40}}}');
+INSERT INTO message VALUES ('2', 'main', 2,
+    '{"role":"assistant","providerID":"beta","modelID":"shared","tokens":{"input":1,"output":2,"cache":{"read":3,"write":4}}}');
+INSERT INTO message VALUES ('3', 'main', 3,
+    '{"role":"assistant","providerID":"alpha","modelID":"shared","tokens":{"input":1}}');
+INSERT INTO message VALUES ('4', 'main', 4,
+    '{"role":"assistant","providerID":"beta","modelID":"new","tokens":{"input":5}}');
+INSERT INTO message VALUES ('5', 'main', 5,
+    '{"role":"assistant","providerID":"alpha","tokens":{"input":7}}');
+INSERT INTO message VALUES ('6', 'main', 6,
+    '{"role":"user","tokens":{"input":9999}}');
+"#).output().unwrap();
+        assert!(
+            setup.status.success(),
+            "{}",
+            String::from_utf8_lossy(&setup.stderr)
+        );
+        let rows = collector.query_sessions().unwrap();
+        let session = rows.iter().find(|session| session.id == "main").unwrap();
+        assert_eq!(
+            session.model_usage,
+            vec![
+                ModelUsage {
+                    model: "alpha/shared".into(),
+                    total_tokens: 101
+                },
+                ModelUsage {
+                    model: "beta/shared".into(),
+                    total_tokens: 10
+                },
+                ModelUsage {
+                    model: "Unknown".into(),
+                    total_tokens: 7
+                },
+                ModelUsage {
+                    model: "beta/new".into(),
+                    total_tokens: 5
+                },
+            ]
+        );
+        assert_eq!(session.turn_count, 5);
+        assert_eq!(
+            session
+                .model_usage
+                .iter()
+                .map(|entry| entry.total_tokens)
+                .sum::<u64>(),
+            session.total_input
+                + session.total_output
+                + session.total_cache_read
+                + session.total_cache_write
+        );
+        assert_eq!(session.total_input, 24);
+        assert_eq!(
+            collector.query_sessions().unwrap()[0].model_usage,
+            session.model_usage
+        );
+        let empty = rows.iter().find(|session| session.id == "empty").unwrap();
+        assert!(empty.model_usage.is_empty());
+        assert_eq!(empty.turn_count, 0);
+        assert_eq!(empty.total_input, 0);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use super::process::{self, ProcInfo};
 use crate::model::{
-    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface,
+    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface, ModelUsage,
     SessionFile, SessionStatus, SubAgent, MAX_CHAT_MESSAGES, MAX_FILE_ACCESSES,
 };
 use serde_json::Value;
@@ -52,6 +52,7 @@ struct SubagentUsage {
     file_identity: (u64, u64),
     /// Input, output, cache read, and cache write tokens, in that order.
     totals: [u64; 4],
+    model_usage: Vec<ModelUsage>,
 }
 
 pub struct ClaudeCollector {
@@ -460,6 +461,7 @@ impl ClaudeCollector {
                     if delta.model != "-" {
                         prev.model = delta.model;
                     }
+                    ModelUsage::merge(&mut prev.model_usage, &delta.model_usage);
                     prev.total_input += delta.total_input;
                     prev.total_output += delta.total_output;
                     prev.total_cache_read += delta.total_cache_read;
@@ -536,6 +538,7 @@ impl ClaudeCollector {
             total_output: 0,
             total_cache_read: 0,
             total_cache_create: 0,
+            model_usage: Vec::new(),
             last_context_tokens: 0,
             max_context_tokens: 0,
             prev_cache_read: 0,
@@ -604,6 +607,12 @@ impl ClaudeCollector {
                 .or_default(),
         );
         let [sub_input, sub_output, sub_cache_read, sub_cache_write] = subagent_totals;
+        let mut model_usage = cached.model_usage.clone();
+        if let Some(cache) = self.subagent_cache.get(&subagents_dir) {
+            for usage in cache.values() {
+                ModelUsage::merge(&mut model_usage, &usage.model_usage);
+            }
+        }
         let has_working_subagent = subagents.iter().any(|agent| agent.status == "working");
 
         // Status is best-effort. Signals we trust:
@@ -713,6 +722,7 @@ impl ClaudeCollector {
             total_output_tokens: total_output + sub_output,
             total_cache_read: total_cache_read + sub_cache_read,
             total_cache_create: total_cache_create + sub_cache_write,
+            model_usage: ModelUsage::sorted(&model_usage),
             turn_count,
             current_tasks,
             mem_mb,
@@ -782,6 +792,7 @@ impl ClaudeCollector {
                 }
                 if metadata.len() > usage.offset {
                     let delta = parse_transcript(&path, usage.offset);
+                    ModelUsage::merge(&mut usage.model_usage, &delta.model_usage);
                     let totals = [
                         delta.total_input,
                         delta.total_output,
@@ -1282,6 +1293,7 @@ struct TranscriptResult {
     total_output: u64,
     total_cache_read: u64,
     total_cache_create: u64,
+    model_usage: Vec<ModelUsage>,
     /// Last assistant turn's input context size (for context % calculation)
     last_context_tokens: u64,
     /// High-water mark: largest context seen in any turn (for 1M detection)
@@ -1375,6 +1387,7 @@ fn parse_transcript_with_previous(
         total_output: 0,
         total_cache_read: 0,
         total_cache_create: 0,
+        model_usage: Vec::new(),
         last_context_tokens: 0,
         max_context_tokens: 0,
         prev_cache_read: 0,
@@ -1522,6 +1535,14 @@ fn parse_transcript_with_previous(
                                         .get("cache_creation_input_tokens")
                                         .and_then(|v| v.as_u64())
                                         .unwrap_or(0);
+                                    let usage_model = super::sanitize_terminal_text(
+                                        msg.get("model").and_then(Value::as_str).unwrap_or(""),
+                                    );
+                                    ModelUsage::add(
+                                        &mut result.model_usage,
+                                        &usage_model,
+                                        inp + out + cr + cc,
+                                    );
                                     result.total_input += inp;
                                     result.total_output += out;
                                     result.total_cache_read += cr;
@@ -2205,6 +2226,10 @@ mod tests {
     }
 
     fn append_usage(path: &Path, totals: [u64; 4]) {
+        append_model_usage(path, "", totals);
+    }
+
+    fn append_model_usage(path: &Path, model: &str, totals: [u64; 4]) {
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -2216,6 +2241,7 @@ mod tests {
             serde_json::json!({
                 "type": "assistant",
                 "message": {
+                    "model": model,
                     "usage": {
                         "input_tokens": totals[0],
                         "output_tokens": totals[1],
@@ -2242,9 +2268,13 @@ mod tests {
         let root = parent.with_extension("").join("subagents");
         let workflow = root.join("workflows/wf-example");
         fs::create_dir_all(&workflow).unwrap();
-        append_usage(&root.join("agent-direct.jsonl"), [1, 2, 3, 4]);
+        append_model_usage(
+            &root.join("agent-direct.jsonl"),
+            "claude-sonnet-4-6",
+            [1, 2, 3, 4],
+        );
         let nested = workflow.join("agent-nested.jsonl");
-        append_usage(&nested, [10, 20, 30, 40]);
+        append_model_usage(&nested, "claude-haiku-4-5", [10, 20, 30, 40]);
         // A journal is not an agent transcript, even if it contains usage.
         append_usage(&workflow.join("journal.jsonl"), [1_000; 4]);
 
@@ -2275,11 +2305,24 @@ mod tests {
         assert_eq!(session.total_cache_create, 44);
         assert_eq!(session.subagents.len(), 2);
         assert_eq!(session.status, SessionStatus::Executing);
+        assert_eq!(
+            session.model_usage,
+            vec![
+                ModelUsage {
+                    model: "claude-haiku-4-5".into(),
+                    total_tokens: 100
+                },
+                ModelUsage {
+                    model: "claude-sonnet-4-6".into(),
+                    total_tokens: 31
+                },
+            ]
+        );
         let context = session.context_percent;
         let turns = session.turn_count;
         app.update_session_token_rates(start);
 
-        append_usage(&nested, [5, 6, 7, 8]);
+        append_model_usage(&nested, "claude-haiku-4-5", [5, 6, 7, 8]);
         app.sessions = collect();
         let now = start + std::time::Duration::from_secs(2);
         app.update_session_token_rates(now);
@@ -2309,6 +2352,19 @@ mod tests {
             app.session_token_rates(&app.sessions[0], start + std::time::Duration::from_secs(62)),
             crate::app::TokenRates::default(),
         );
+        assert_eq!(app.sessions[0].model_usage[0].total_tokens, 126);
+        // Parent model changes must merge with the cached model totals.
+        append_model_usage(&parent, "claude-opus-4-6", [1, 2, 3, 4]);
+        app.sessions = collect();
+        let expected = app.sessions[0].model_usage.clone();
+        assert_eq!(
+            expected.iter().map(|entry| entry.total_tokens).sum::<u64>(),
+            app.sessions[0].total_tokens()
+        );
+        assert_eq!(expected.len(), 3);
+        fs::remove_file(&nested).unwrap();
+        app.sessions = collect();
+        assert_eq!(app.sessions[0].model_usage, expected);
         collector.evict_stale_cache(&[]);
         assert!(collector.subagent_cache.is_empty());
     }
@@ -2321,25 +2377,65 @@ mod tests {
         append_usage(&path, [10, 20, 30, 40]);
         let (_, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
         assert_eq!(totals, [10, 20, 30, 40]);
+        assert_eq!(
+            cache
+                .values()
+                .flat_map(|usage| &usage.model_usage)
+                .map(|entry| entry.total_tokens)
+                .sum::<u64>(),
+            totals.iter().sum::<u64>()
+        );
         let offset = cache[&path].offset;
         let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
         write!(file, "{{\"type\":\"assistant\",\"message\":").unwrap();
         let (_, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
         assert_eq!(totals, [10, 20, 30, 40]);
+        assert_eq!(
+            cache
+                .values()
+                .flat_map(|usage| &usage.model_usage)
+                .map(|entry| entry.total_tokens)
+                .sum::<u64>(),
+            totals.iter().sum::<u64>()
+        );
         assert_eq!(cache[&path].offset, offset);
         writeln!(file, "{{\"usage\":{{\"input_tokens\":7}}}}}}").unwrap();
         let (_, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
         assert_eq!(totals, [17, 20, 30, 40]);
+        assert_eq!(
+            cache
+                .values()
+                .flat_map(|usage| &usage.model_usage)
+                .map(|entry| entry.total_tokens)
+                .sum::<u64>(),
+            totals.iter().sum::<u64>()
+        );
         drop(file);
 
         fs::write(&path, "").unwrap();
         append_usage(&path, [1, 2, 3, 4]);
         let (_, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
         assert_eq!(totals, [1, 2, 3, 4]);
+        assert_eq!(
+            cache
+                .values()
+                .flat_map(|usage| &usage.model_usage)
+                .map(|entry| entry.total_tokens)
+                .sum::<u64>(),
+            totals.iter().sum::<u64>()
+        );
         fs::remove_file(&path).unwrap();
         let (agents, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
         assert!(agents.is_empty());
         assert_eq!(totals, [1, 2, 3, 4]);
+        assert_eq!(
+            cache
+                .values()
+                .flat_map(|usage| &usage.model_usage)
+                .map(|entry| entry.total_tokens)
+                .sum::<u64>(),
+            totals.iter().sum::<u64>()
+        );
     }
 
     #[test]
@@ -2353,6 +2449,14 @@ mod tests {
             set_mtime(&path, -60);
             let (_, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
             assert_eq!(totals, [10, 20, 30, 40]);
+            assert_eq!(
+                cache
+                    .values()
+                    .flat_map(|usage| &usage.model_usage)
+                    .map(|entry| entry.total_tokens)
+                    .sum::<u64>(),
+                totals.iter().sum::<u64>()
+            );
             let old_identity = cache[&path].file_identity;
             let old_len = fs::metadata(&path).unwrap().len();
 
@@ -2371,11 +2475,27 @@ mod tests {
 
             let (agents, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
             assert_eq!(totals, replacement_totals);
+            assert_eq!(
+                cache
+                    .values()
+                    .flat_map(|usage| &usage.model_usage)
+                    .map(|entry| entry.total_tokens)
+                    .sum::<u64>(),
+                totals.iter().sum::<u64>()
+            );
             assert_eq!(agents.len(), 1);
             assert_eq!(agents[0].tokens, replacement_totals.iter().sum::<u64>());
             assert_eq!(cache[&path].offset, new_len);
             let (_, totals) = ClaudeCollector::collect_subagents(temp.path(), &mut cache);
             assert_eq!(totals, replacement_totals);
+            assert_eq!(
+                cache
+                    .values()
+                    .flat_map(|usage| &usage.model_usage)
+                    .map(|entry| entry.total_tokens)
+                    .sum::<u64>(),
+                totals.iter().sum::<u64>()
+            );
         }
     }
 
@@ -3385,6 +3505,55 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
             .unwrap();
 
         assert_eq!(second.compaction_count, 1);
+    }
+
+    #[test]
+    fn model_usage_tracks_records_without_inheriting_missing_models() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        append_model_usage(file.path(), "claude-opus-4-6", [10, 20, 30, 40]);
+        append_model_usage(file.path(), "claude-sonnet-4-6", [1, 2, 3, 4]);
+        append_usage(file.path(), [2, 0, 0, 0]);
+        append_model_usage(file.path(), "unused", [0; 4]);
+        let first = parse_transcript(file.path(), 0);
+        assert_eq!(
+            ModelUsage::sorted(&first.model_usage),
+            vec![
+                ModelUsage {
+                    model: "claude-opus-4-6".into(),
+                    total_tokens: 100
+                },
+                ModelUsage {
+                    model: "claude-sonnet-4-6".into(),
+                    total_tokens: 10
+                },
+                ModelUsage {
+                    model: "Unknown".into(),
+                    total_tokens: 2
+                },
+            ]
+        );
+        assert!(parse_transcript(file.path(), first.new_offset)
+            .model_usage
+            .is_empty());
+        append_model_usage(file.path(), "claude-opus-4-6", [1; 4]);
+        let delta = parse_transcript(file.path(), first.new_offset);
+        assert_eq!(
+            delta.model_usage,
+            vec![ModelUsage {
+                model: "claude-opus-4-6".into(),
+                total_tokens: 4
+            }]
+        );
+        fs::write(file.path(), "").unwrap();
+        append_model_usage(file.path(), "replacement", [1, 0, 0, 0]);
+        let reset = parse_transcript(file.path(), delta.new_offset);
+        assert_eq!(
+            reset.model_usage,
+            vec![ModelUsage {
+                model: "replacement".into(),
+                total_tokens: 1
+            }]
+        );
     }
 
     #[test]

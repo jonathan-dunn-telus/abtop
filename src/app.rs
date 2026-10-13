@@ -159,6 +159,7 @@ pub enum NarrowSection {
     Context,
     Quota,
     Tokens,
+    Models,
     Ports,
     Mcp,
 }
@@ -167,7 +168,7 @@ impl NarrowSection {
     pub fn tab(self) -> NarrowTab {
         match self {
             Self::Sessions | Self::Projects => NarrowTab::Work,
-            Self::Context | Self::Quota | Self::Tokens => NarrowTab::Usage,
+            Self::Context | Self::Quota | Self::Tokens | Self::Models => NarrowTab::Usage,
             Self::Ports | Self::Mcp => NarrowTab::System,
         }
     }
@@ -208,6 +209,7 @@ pub struct App {
     pub show_context: bool,
     pub show_quota: bool,
     pub show_tokens: bool,
+    pub show_models: bool,
     pub show_projects: bool,
     pub show_ports: bool,
     pub show_sessions: bool,
@@ -285,6 +287,7 @@ impl App {
             show_context: panels.context,
             show_quota: panels.quota,
             show_tokens: panels.tokens,
+            show_models: panels.models,
             show_projects: panels.projects,
             show_ports: panels.ports,
             show_sessions: panels.sessions,
@@ -333,6 +336,7 @@ impl App {
             5 => self.show_ports = !self.show_ports,
             6 => self.show_sessions = !self.show_sessions,
             7 => self.show_mcp = !self.show_mcp,
+            8 => self.show_models = !self.show_models,
             _ => return,
         }
         self.persist_panel_visibility();
@@ -358,6 +362,7 @@ impl App {
             context: self.show_context,
             quota: self.show_quota,
             tokens: self.show_tokens,
+            models: self.show_models,
             projects: self.show_projects,
             ports: self.show_ports,
             sessions: self.show_sessions,
@@ -380,7 +385,7 @@ impl App {
     }
 
     pub fn config_item_count(&self) -> usize {
-        8 // theme + 7 panel toggles
+        9 // theme + 8 panel toggles
     }
 
     pub fn config_select_next(&mut self) {
@@ -406,6 +411,7 @@ impl App {
             5 => self.show_ports = !self.show_ports,
             6 => self.show_sessions = !self.show_sessions,
             7 => self.show_mcp = !self.show_mcp,
+            8 => self.show_models = !self.show_models,
             _ => return,
         }
         self.persist_panel_visibility();
@@ -415,7 +421,9 @@ impl App {
     pub fn narrow_tab_visible(&self, tab: NarrowTab) -> bool {
         match tab {
             NarrowTab::Work => self.show_sessions || self.show_projects,
-            NarrowTab::Usage => self.show_context || self.show_quota || self.show_tokens,
+            NarrowTab::Usage => {
+                self.show_context || self.show_quota || self.show_tokens || self.show_models
+            }
             NarrowTab::System => self.show_ports || self.show_mcp,
         }
     }
@@ -480,6 +488,7 @@ impl App {
             NarrowSection::Context => self.show_context,
             NarrowSection::Quota => self.show_quota,
             NarrowSection::Tokens => self.show_tokens,
+            NarrowSection::Models => self.show_models,
             NarrowSection::Ports => self.show_ports,
             NarrowSection::Mcp => self.show_mcp,
         }
@@ -492,6 +501,7 @@ impl App {
                 NarrowSection::Context,
                 NarrowSection::Quota,
                 NarrowSection::Tokens,
+                NarrowSection::Models,
             ],
             NarrowTab::System => &[NarrowSection::Ports, NarrowSection::Mcp],
         };
@@ -1146,6 +1156,7 @@ mod tests {
             total_output_tokens: 0,
             total_cache_read: 0,
             total_cache_create: 0,
+            model_usage: Vec::new(),
             turn_count: 0,
             compaction_count: 0,
             current_tasks: vec![],

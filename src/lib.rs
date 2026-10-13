@@ -253,7 +253,10 @@ fn run_app(
     let render_interval = Duration::from_millis(500);
 
     loop {
-        terminal.draw(|f| ui::draw(f, &app))?;
+        terminal.draw(|f| {
+            ui::sync_narrow_section(&mut app, f.area());
+            ui::draw(f, &app);
+        })?;
 
         // Poll at 500ms for smooth animations; data tick every 2s
         let had_input = if event::poll(render_interval)? {
@@ -310,7 +313,7 @@ fn handle_key_press(
             KeyCode::Char('T') => app.tree_view = !app.tree_view,
             KeyCode::Char('l') => app.toggle_timeline(),
             KeyCode::Char('f') => app.toggle_file_audit(),
-            KeyCode::Char(c @ '1'..='7') => app.toggle_panel(c as u8 - b'0'),
+            KeyCode::Char(c @ '1'..='8') => app.toggle_panel(c as u8 - b'0'),
             KeyCode::Char('M') => app.toggle_mcp_session_suppression(),
             KeyCode::Char('t') => app.cycle_theme(),
             _ => {}
@@ -351,7 +354,7 @@ fn handle_key_press(
             KeyCode::Char('t') => app.cycle_theme(),
             KeyCode::Char('T') => app.tree_view = !app.tree_view,
             KeyCode::Char('l') | KeyCode::Char('L') => app.toggle_timeline(),
-            KeyCode::Char(c @ '1'..='7') => app.toggle_panel(c as u8 - b'0'),
+            KeyCode::Char(c @ '1'..='8') => app.toggle_panel(c as u8 - b'0'),
             KeyCode::Char('M') => app.toggle_mcp_session_suppression(),
             KeyCode::Char('c') => app.toggle_config(),
             KeyCode::Char('v') => app.toggle_view_menu(),

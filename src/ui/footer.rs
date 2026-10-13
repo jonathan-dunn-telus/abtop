@@ -66,7 +66,7 @@ pub(crate) fn draw_footer(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
             Style::default().fg(theme.main_fg),
         ));
     }
-    if compact {
+    if !super::uses_desktop_layout(app, area.width) {
         spans.push(Span::styled("←→", Style::default().fg(theme.hi_fg)));
         spans.push(Span::styled(" tabs ", Style::default().fg(theme.main_fg)));
     }

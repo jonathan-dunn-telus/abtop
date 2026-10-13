@@ -63,6 +63,12 @@ Mouse capture is off by default so terminal drag selection and copy keep working
 
 The tokens pane shows the selected session's Input, Output, CacheR, and CacheW totals, followed by tokens per minute over a rolling 60-second window. Claude totals and rates include subagents, including nested workflow agents. Rates count increases observed while abtop runs, start at zero, and return to zero after a minute without new tokens. On narrow panes, meter bars shrink first; rates are hidden if the text still cannot fit.
 
+The models pane shows lifetime token totals and percentage share for each model used by the selected session, sorted by usage. It appears beside Tokens on wide terminals and in the Usage tab on narrow terminals. Press `8` to toggle it, or use the View/config menus; visibility is saved. Narrow panes use two-line entries, with overflow combined into `Other (N)`.
+
+The desktop layout reserves minimum widths for enabled panes and switches to tabs when they cannot fit (134 columns with all panes enabled). In the Usage tab, Context hides first when height is limited, preserving both quota windows and all four token categories. Quota bars shrink before values are clipped, reset countdowns move inline in shorter panes, and Models combines overflow when needed. These automatic layout changes do not alter saved visibility settings.
+
+Model totals include input, output, cache reads, and cache writes, matching the Tokens pane. Claude includes tracked subagents and nested workflow agents; Codex and OpenCode cover the selected session only. Distinct model versions stay separate, and OpenCode entries include the provider. Missing model metadata is counted as `Unknown`. Codex attributes increases in cumulative usage to the current turn's model; if counters decrease, the replacement baseline becomes `Unknown` and subsequent increases resume model attribution.
+
 ### Terminal Jump
 
 Press `Enter` to focus the terminal running the selected agent. abtop supports cmux, tmux, and iTerm2 on macOS.
@@ -126,6 +132,8 @@ Light themes (`light` — Solarized cream, `white` — GitHub-style pure white) 
 
 ```toml
 theme = "btop"
+# Show per-model usage for the selected session (enabled by default).
+show_models = true
 # Hide specific agent CLIs from the TUI (case-insensitive).
 # Useful if you only use one agent and want a cleaner view.
 hidden_agents = ["codex"]
@@ -155,7 +163,7 @@ When `language` is unset, abtop auto-detects from `LANG` — any value starting 
 | `x`                | Kill selected session                |
 | `X`                | Kill all orphan ports                |
 | `t`                | Cycle theme                          |
-| `1`–`5`            | Toggle panel visibility              |
+| `1`–`8`            | Toggle panels (`8`: models)           |
 | `Esc`              | Open/close config page               |
 | `q`                | Quit                                 |
 | `r`                | Force refresh                        |
@@ -190,6 +198,8 @@ let json = serde_json::to_string(&app.to_snapshot(2_000)).unwrap();
 `App` is not `Send` (it owns the collectors), so keep it on one thread and pass
 the serialized JSON elsewhere. [abtop-web-ui](https://github.com/XKHoshizora/abtop-web-ui)
 is a reference consumer: a local-first web dashboard built on exactly this API.
+
+Each JSON session includes `model_usage`, an array of `{ "model": "...", "total_tokens": 123 }` entries sorted by usage. These entries use the same accounting and subagent scope as that session's `total_tokens`; percentage share is `100 * total_tokens / session.total_tokens` when the session total is nonzero. Library users constructing `AgentSession`, `SessionView`, or `PanelVisibility` literals must supply the new `model_usage` or `models` field as appropriate.
 
 ## Privacy
 

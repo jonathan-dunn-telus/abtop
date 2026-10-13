@@ -57,6 +57,11 @@ pub(crate) fn items(app: &App) -> Vec<ViewItem> {
             state: bool_state(app.show_tokens),
         },
         ViewItem {
+            key: '8',
+            label: t("view.models_panel").leak(),
+            state: bool_state(app.show_models),
+        },
+        ViewItem {
             key: '4',
             label: t("view.projects_panel").leak(),
             state: bool_state(app.show_projects),

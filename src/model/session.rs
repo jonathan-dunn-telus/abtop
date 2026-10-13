@@ -158,6 +158,50 @@ impl LaunchSurface {
     }
 }
 
+/// Lifetime tokens attributed to one model, using the session's additive
+/// input/output/cache accounting. Missing model metadata uses `Unknown`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ModelUsage {
+    pub model: String,
+    pub total_tokens: u64,
+}
+
+impl ModelUsage {
+    pub(crate) fn add(entries: &mut Vec<Self>, model: &str, total_tokens: u64) {
+        if total_tokens == 0 {
+            return;
+        }
+        let model = match model.trim() {
+            "" | "-" => "Unknown",
+            model => model,
+        };
+        if let Some(entry) = entries.iter_mut().find(|entry| entry.model == model) {
+            entry.total_tokens += total_tokens;
+        } else {
+            entries.push(Self {
+                model: model.to_string(),
+                total_tokens,
+            });
+        }
+    }
+
+    pub(crate) fn merge(entries: &mut Vec<Self>, additions: &[Self]) {
+        for entry in additions {
+            Self::add(entries, &entry.model, entry.total_tokens);
+        }
+    }
+
+    pub(crate) fn sorted(entries: &[Self]) -> Vec<Self> {
+        let mut entries = entries.to_vec();
+        entries.sort_unstable_by(|a, b| {
+            b.total_tokens
+                .cmp(&a.total_tokens)
+                .then_with(|| a.model.cmp(&b.model))
+        });
+        entries
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentSession {
     /// Which CLI tool this session belongs to: "claude", "codex", etc.
@@ -181,6 +225,8 @@ pub struct AgentSession {
     pub total_output_tokens: u64,
     pub total_cache_read: u64,
     pub total_cache_create: u64,
+    /// Per-model usage for the same lifetime and subagent scope as the totals.
+    pub model_usage: Vec<ModelUsage>,
     pub turn_count: u32,
     pub current_tasks: Vec<String>,
     pub mem_mb: u64,
@@ -310,6 +356,7 @@ mod tests {
             total_output_tokens: output,
             total_cache_read: cache_read,
             total_cache_create: cache_create,
+            model_usage: Vec::new(),
             turn_count: 0,
             current_tasks: Vec::new(),
             mem_mb: 0,

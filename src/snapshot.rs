@@ -14,7 +14,7 @@ use crate::app::App;
 use crate::collector::mcp::ACTIVE_MTIME_SECS;
 use crate::host_info::{AgentAggregate, HostMetrics};
 use crate::model::{
-    ChatRole, ChildProcess, LaunchSurface, OrphanPort, RateLimitInfo, SessionStatus,
+    ChatRole, ChildProcess, LaunchSurface, ModelUsage, OrphanPort, RateLimitInfo, SessionStatus,
     MAX_CHAT_MESSAGES,
 };
 use serde::Serialize;
@@ -114,6 +114,8 @@ pub struct SessionView {
     pub context_window: u64,
     /// All token classes summed: input + output + cache read + cache write.
     pub total_tokens: u64,
+    /// Lifetime usage per model, including the same subagents as the session totals.
+    pub model_usage: Vec<ModelUsage>,
     /// Cumulative input (prompt) tokens for the session.
     pub input_tokens: u64,
     /// Cumulative output (completion) tokens for the session.
@@ -219,6 +221,7 @@ impl App {
                 context_percent: s.context_percent,
                 context_window: s.context_window,
                 total_tokens: s.total_tokens(),
+                model_usage: ModelUsage::sorted(&s.model_usage),
                 input_tokens: s.total_input_tokens,
                 output_tokens: s.total_output_tokens,
                 cache_read_tokens: s.total_cache_read,
@@ -373,6 +376,32 @@ mod tests {
                 assert!(m.role == "user" || m.role == "assistant");
             }
         }
+    }
+
+    #[test]
+    fn snapshot_model_usage_is_complete_sorted_and_serializable() {
+        let app = demo_app();
+        let snapshot = app.to_snapshot(2_000);
+        let json = serde_json::to_value(&snapshot).unwrap();
+        for (index, session) in snapshot.sessions.iter().enumerate() {
+            assert_eq!(
+                session
+                    .model_usage
+                    .iter()
+                    .map(|entry| entry.total_tokens)
+                    .sum::<u64>(),
+                session.total_tokens
+            );
+            assert_eq!(
+                session.model_usage,
+                ModelUsage::sorted(&session.model_usage)
+            );
+            assert_eq!(
+                json["sessions"][index]["model_usage"],
+                serde_json::to_value(&session.model_usage).unwrap()
+            );
+        }
+        assert_eq!(snapshot.sessions[0].model_usage.len(), 2);
     }
 
     #[test]
