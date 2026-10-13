@@ -1,7 +1,7 @@
 use crate::app::App;
 use crate::model::{
-    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface, ModelUsage,
-    OrphanPort, RateLimitInfo, SessionStatus, SubAgent, ToolCall,
+    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface,
+    ModelUsage, OrphanPort, RateLimitInfo, SessionStatus, SubAgent, ToolCall,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -524,12 +524,26 @@ pub fn populate_demo(app: &mut App) {
     for session in &mut app.sessions {
         let total = session.total_tokens();
         let child_tokens: u64 = session.subagents.iter().map(|child| child.tokens).sum();
+        // The synthetic child totals have no category breakdown; distribute
+        // active tokens proportionally and keep the session totals exact.
+        let active = session.active_tokens();
+        let child_active = if total == 0 {
+            0
+        } else {
+            (active as u128 * child_tokens as u128 / total as u128) as u64
+        };
         ModelUsage::add(
             &mut session.model_usage,
             &session.model,
             total - child_tokens,
+            active - child_active,
         );
-        ModelUsage::add(&mut session.model_usage, "claude-haiku-4-5", child_tokens);
+        ModelUsage::add(
+            &mut session.model_usage,
+            "claude-haiku-4-5",
+            child_tokens,
+            child_active,
+        );
     }
 
     // --- Summaries (pre-populated, no LLM calls) ---

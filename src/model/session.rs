@@ -164,11 +164,14 @@ impl LaunchSurface {
 pub struct ModelUsage {
     pub model: String,
     pub total_tokens: u64,
+    /// Input + output + cache writes, used internally for live rates.
+    #[serde(skip)]
+    pub active_tokens: u64,
 }
 
 impl ModelUsage {
-    pub(crate) fn add(entries: &mut Vec<Self>, model: &str, total_tokens: u64) {
-        if total_tokens == 0 {
+    pub(crate) fn add(entries: &mut Vec<Self>, model: &str, total_tokens: u64, active_tokens: u64) {
+        if total_tokens == 0 && active_tokens == 0 {
             return;
         }
         let model = match model.trim() {
@@ -177,17 +180,24 @@ impl ModelUsage {
         };
         if let Some(entry) = entries.iter_mut().find(|entry| entry.model == model) {
             entry.total_tokens += total_tokens;
+            entry.active_tokens += active_tokens;
         } else {
             entries.push(Self {
                 model: model.to_string(),
                 total_tokens,
+                active_tokens,
             });
         }
     }
 
     pub(crate) fn merge(entries: &mut Vec<Self>, additions: &[Self]) {
         for entry in additions {
-            Self::add(entries, &entry.model, entry.total_tokens);
+            Self::add(
+                entries,
+                &entry.model,
+                entry.total_tokens,
+                entry.active_tokens,
+            );
         }
     }
 

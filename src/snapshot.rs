@@ -388,6 +388,18 @@ mod tests {
                 session
                     .model_usage
                     .iter()
+                    .map(|usage| usage.active_tokens)
+                    .sum::<u64>(),
+                app.sessions[index].active_tokens()
+            );
+            for usage in json["sessions"][index]["model_usage"].as_array().unwrap() {
+                assert_eq!(usage.as_object().unwrap().len(), 2);
+                assert!(usage.get("active_tokens").is_none());
+            }
+            assert_eq!(
+                session
+                    .model_usage
+                    .iter()
                     .map(|entry| entry.total_tokens)
                     .sum::<u64>(),
                 session.total_tokens

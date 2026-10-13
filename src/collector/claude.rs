@@ -1,7 +1,7 @@
 use super::process::{self, ProcInfo};
 use crate::model::{
-    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface, ModelUsage,
-    SessionFile, SessionStatus, SubAgent, MAX_CHAT_MESSAGES, MAX_FILE_ACCESSES,
+    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface,
+    ModelUsage, SessionFile, SessionStatus, SubAgent, MAX_CHAT_MESSAGES, MAX_FILE_ACCESSES,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -653,7 +653,11 @@ impl ClaudeCollector {
         };
 
         let configured_model = read_configured_model(&sf.cwd);
-        let context_window = crate::collector::context_window_for_model(&model, &configured_model, max_context_tokens);
+        let context_window = crate::collector::context_window_for_model(
+            &model,
+            &configured_model,
+            max_context_tokens,
+        );
         let context_percent = if context_window > 0 {
             (last_context_tokens as f64 / context_window as f64) * 100.0
         } else {
@@ -1542,6 +1546,7 @@ fn parse_transcript_with_previous(
                                         &mut result.model_usage,
                                         &usage_model,
                                         inp + out + cr + cc,
+                                        inp + out + cc,
                                     );
                                     result.total_input += inp;
                                     result.total_output += out;
@@ -1788,16 +1793,22 @@ fn parse_transcript_with_previous(
 ///    invoke the model, so treating them as a prompt would leave
 ///    `last_user_ts_ms` stuck and pin the session in Thinking forever.
 fn is_synthetic_user_msg(entry: &Value) -> bool {
-    if entry.get("isMeta").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if entry
+        .get("isMeta")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         return true;
     }
-    let Some(message) = entry.get("message") else { return false };
+    let Some(message) = entry.get("message") else {
+        return false;
+    };
     match message.get("content") {
         Some(Value::Array(arr)) => {
             !arr.is_empty()
-                && arr.iter().all(|block| {
-                    block.get("type").and_then(|t| t.as_str()) == Some("tool_result")
-                })
+                && arr
+                    .iter()
+                    .all(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
         }
         Some(Value::String(s)) => {
             let t = s.trim_start();
@@ -2310,11 +2321,13 @@ mod tests {
             vec![
                 ModelUsage {
                     model: "claude-haiku-4-5".into(),
-                    total_tokens: 100
+                    total_tokens: 100,
+                    active_tokens: 70
                 },
                 ModelUsage {
                     model: "claude-sonnet-4-6".into(),
-                    total_tokens: 31
+                    total_tokens: 31,
+                    active_tokens: 25
                 },
             ]
         );
@@ -2326,6 +2339,14 @@ mod tests {
         app.sessions = collect();
         let now = start + std::time::Duration::from_secs(2);
         app.update_session_token_rates(now);
+        assert_eq!(
+            app.model_token_rate(&app.sessions[0], "claude-haiku-4-5", now),
+            19
+        );
+        assert_eq!(
+            app.model_token_rate(&app.sessions[0], "claude-sonnet-4-6", now),
+            0
+        );
         assert_eq!(
             app.session_token_rates(&app.sessions[0], now),
             crate::app::TokenRates {
@@ -2349,10 +2370,27 @@ mod tests {
         assert_eq!(app.sessions[0].total_cache_create, 52);
         app.update_session_token_rates(start + std::time::Duration::from_secs(4));
         assert_eq!(
+            app.model_token_rate(
+                &app.sessions[0],
+                "claude-haiku-4-5",
+                start + std::time::Duration::from_secs(4)
+            ),
+            19
+        );
+        assert_eq!(
+            app.model_token_rate(
+                &app.sessions[0],
+                "claude-haiku-4-5",
+                start + std::time::Duration::from_secs(62)
+            ),
+            0
+        );
+        assert_eq!(
             app.session_token_rates(&app.sessions[0], start + std::time::Duration::from_secs(62)),
             crate::app::TokenRates::default(),
         );
         assert_eq!(app.sessions[0].model_usage[0].total_tokens, 126);
+        assert_eq!(app.sessions[0].model_usage[0].active_tokens, 89);
         // Parent model changes must merge with the cached model totals.
         append_model_usage(&parent, "claude-opus-4-6", [1, 2, 3, 4]);
         app.sessions = collect();
@@ -2362,6 +2400,13 @@ mod tests {
             app.sessions[0].total_tokens()
         );
         assert_eq!(expected.len(), 3);
+        assert_eq!(
+            expected
+                .iter()
+                .map(|entry| entry.active_tokens)
+                .sum::<u64>(),
+            app.sessions[0].active_tokens()
+        );
         fs::remove_file(&nested).unwrap();
         app.sessions = collect();
         assert_eq!(app.sessions[0].model_usage, expected);
@@ -2869,15 +2914,18 @@ mod tests {
         // forever (Think generating reply). All three line shapes must be
         // treated as synthetic.
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        write_lines(&mut file, &[
-            // Real prompt + assistant reply to seed a clean Wait state.
-            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"hi"}}"#,
-            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:01Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"hello"}]}}"#,
-            // The three user-role lines `/plugin update` writes:
-            r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat: ...</local-command-caveat>"}}"#,
-            r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<command-name>/plugin</command-name>\n<command-args>update foo</command-args>"}}"#,
-            r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<local-command-stdout>Updated foo</local-command-stdout>"}}"#,
-        ]);
+        write_lines(
+            &mut file,
+            &[
+                // Real prompt + assistant reply to seed a clean Wait state.
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"hi"}}"#,
+                r#"{"type":"assistant","timestamp":"2026-03-28T15:00:01Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"hello"}]}}"#,
+                // The three user-role lines `/plugin update` writes:
+                r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat: ...</local-command-caveat>"}}"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<command-name>/plugin</command-name>\n<command-args>update foo</command-args>"}}"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<local-command-stdout>Updated foo</local-command-stdout>"}}"#,
+            ],
+        );
 
         let result = parse_transcript(file.path(), 0);
 
@@ -2895,11 +2943,14 @@ mod tests {
         // `!ls` and friends serialize as <bash-input>/<bash-stdout> user-role
         // lines with no assistant reply. Same failure mode as /plugin.
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        write_lines(&mut file, &[
-            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:00Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"ok"}]}}"#,
-            r#"{"type":"user","timestamp":"2026-03-28T15:00:05Z","message":{"role":"user","content":"<bash-input>ls</bash-input>"}}"#,
-            r#"{"type":"user","timestamp":"2026-03-28T15:00:05Z","message":{"role":"user","content":"<bash-stdout>a\nb</bash-stdout><bash-stderr></bash-stderr>"}}"#,
-        ]);
+        write_lines(
+            &mut file,
+            &[
+                r#"{"type":"assistant","timestamp":"2026-03-28T15:00:00Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"ok"}]}}"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:05Z","message":{"role":"user","content":"<bash-input>ls</bash-input>"}}"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:05Z","message":{"role":"user","content":"<bash-stdout>a\nb</bash-stdout><bash-stderr></bash-stderr>"}}"#,
+            ],
+        );
 
         let result = parse_transcript(file.path(), 0);
 
@@ -3520,15 +3571,18 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
             vec![
                 ModelUsage {
                     model: "claude-opus-4-6".into(),
-                    total_tokens: 100
+                    total_tokens: 100,
+                    active_tokens: 70
                 },
                 ModelUsage {
                     model: "claude-sonnet-4-6".into(),
-                    total_tokens: 10
+                    total_tokens: 10,
+                    active_tokens: 7
                 },
                 ModelUsage {
                     model: "Unknown".into(),
-                    total_tokens: 2
+                    total_tokens: 2,
+                    active_tokens: 2
                 },
             ]
         );
@@ -3541,7 +3595,8 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
             delta.model_usage,
             vec![ModelUsage {
                 model: "claude-opus-4-6".into(),
-                total_tokens: 4
+                total_tokens: 4,
+                active_tokens: 3
             }]
         );
         fs::write(file.path(), "").unwrap();
@@ -3551,7 +3606,8 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
             reset.model_usage,
             vec![ModelUsage {
                 model: "replacement".into(),
-                total_tokens: 1
+                total_tokens: 1,
+                active_tokens: 1
             }]
         );
     }
@@ -3730,7 +3786,10 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
     #[test]
     fn test_context_window_for_model() {
         // Base model with low token usage → 200K
-        assert_eq!(crate::collector::context_window_for_model("claude-opus-4-6", "", 50_000), 200_000);
+        assert_eq!(
+            crate::collector::context_window_for_model("claude-opus-4-6", "", 50_000),
+            200_000
+        );
         // Explicit [1m] suffix in transcript model → 1M regardless of token count
         assert_eq!(
             crate::collector::context_window_for_model("claude-opus-4-6[1m]", "", 0),
@@ -3745,7 +3804,10 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
             crate::collector::context_window_for_model("claude-sonnet-4-6", "", 100_000),
             200_000
         );
-        assert_eq!(crate::collector::context_window_for_model("unknown-model", "", 0), 200_000);
+        assert_eq!(
+            crate::collector::context_window_for_model("unknown-model", "", 0),
+            200_000
+        );
         // Token usage exceeds 200K → must be 1M window
         assert_eq!(
             crate::collector::context_window_for_model("claude-opus-4-6", "", 250_000),

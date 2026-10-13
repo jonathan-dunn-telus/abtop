@@ -346,7 +346,8 @@ SELECT
   COALESCE(SUM(u.total_cache_write), 0) AS total_cache_write,
   json_group_array(json_object(
     'model', u.model, 'provider', u.provider,
-    'total_tokens', u.total_input + u.total_output + u.total_cache_read + u.total_cache_write
+    'total_tokens', u.total_input + u.total_output + u.total_cache_read + u.total_cache_write,
+    'active_tokens', u.total_input + u.total_output + u.total_cache_write
   )) AS model_usage
 FROM recent_sessions s
 LEFT JOIN project p ON s.project_id = p.id
@@ -422,6 +423,7 @@ LIMIT {};"#,
                     &mut model_usage,
                     &identity,
                     usage["total_tokens"].as_u64().unwrap_or(0),
+                    usage["active_tokens"].as_u64().unwrap_or(0),
                 );
             }
 
@@ -687,19 +689,23 @@ INSERT INTO message VALUES ('6', 'main', 6,
             vec![
                 ModelUsage {
                     model: "alpha/shared".into(),
-                    total_tokens: 101
+                    total_tokens: 101,
+                    active_tokens: 71
                 },
                 ModelUsage {
                     model: "beta/shared".into(),
-                    total_tokens: 10
+                    total_tokens: 10,
+                    active_tokens: 7
                 },
                 ModelUsage {
                     model: "Unknown".into(),
-                    total_tokens: 7
+                    total_tokens: 7,
+                    active_tokens: 7
                 },
                 ModelUsage {
                     model: "beta/new".into(),
-                    total_tokens: 5
+                    total_tokens: 5,
+                    active_tokens: 5
                 },
             ]
         );
@@ -716,6 +722,14 @@ INSERT INTO message VALUES ('6', 'main', 6,
                 + session.total_cache_write
         );
         assert_eq!(session.total_input, 24);
+        assert_eq!(
+            session
+                .model_usage
+                .iter()
+                .map(|usage| usage.active_tokens)
+                .sum::<u64>(),
+            session.total_input + session.total_output + session.total_cache_write
+        );
         assert_eq!(
             collector.query_sessions().unwrap()[0].model_usage,
             session.model_usage

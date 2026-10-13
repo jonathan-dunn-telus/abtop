@@ -1,7 +1,7 @@
 use super::process::{self, ProcInfo};
 use crate::model::{
-    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface, ModelUsage,
-    RateLimitInfo, SessionStatus, ToolCall, MAX_CHAT_MESSAGES, MAX_FILE_ACCESSES,
+    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface,
+    ModelUsage, RateLimitInfo, SessionStatus, ToolCall, MAX_CHAT_MESSAGES, MAX_FILE_ACCESSES,
 };
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -1385,15 +1385,26 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
                             let previous =
                                 result.total_input + result.total_output + result.total_cache_read;
                             let current = inp.saturating_sub(cache) + out + cache;
-                            if current < previous {
+                            let previous_active = result.total_input + result.total_output;
+                            let active = inp.saturating_sub(cache) + out;
+                            if current < previous
+                                || active < previous_active
+                                || cache < result.total_cache_read
+                            {
                                 // A replacement baseline cannot be attributed to the latest model.
                                 result.model_usage.clear();
-                                ModelUsage::add(&mut result.model_usage, "Unknown", current);
+                                ModelUsage::add(
+                                    &mut result.model_usage,
+                                    "Unknown",
+                                    current,
+                                    active,
+                                );
                             } else {
                                 ModelUsage::add(
                                     &mut result.model_usage,
                                     &result.model,
                                     current - previous,
+                                    active - previous_active,
                                 );
                             }
                             result.total_input = inp.saturating_sub(cache);
@@ -2062,15 +2073,18 @@ mod tests {
             vec![
                 ModelUsage {
                     model: "gpt-5-codex".into(),
-                    total_tokens: 340
+                    total_tokens: 340,
+                    active_tokens: 120
                 },
                 ModelUsage {
                     model: "Unknown".into(),
-                    total_tokens: 120
+                    total_tokens: 120,
+                    active_tokens: 40
                 },
                 ModelUsage {
                     model: "gpt-5.3-codex".into(),
-                    total_tokens: 60
+                    total_tokens: 60,
+                    active_tokens: 50
                 },
             ]
         );
@@ -2108,11 +2122,13 @@ mod tests {
             vec![
                 ModelUsage {
                     model: "Unknown".into(),
-                    total_tokens: 110
+                    total_tokens: 110,
+                    active_tokens: 30
                 },
                 ModelUsage {
                     model: "gpt-5-codex".into(),
-                    total_tokens: 55
+                    total_tokens: 55,
+                    active_tokens: 15
                 },
             ]
         );
@@ -2120,6 +2136,39 @@ mod tests {
             result.total_input + result.total_output + result.total_cache_read,
             165
         );
+    }
+
+    #[test]
+    fn model_usage_rebaselines_cache_corrections_without_total_decreases() {
+        for (cached, expected_active) in [(180, 40), (20, 200)] {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            let corrected = serde_json::json!({
+                "type": "event_msg", "payload": {"type": "token_count", "info": {
+                    "total_token_usage": {"input_tokens": 200, "output_tokens": 20,
+                        "cached_input_tokens": cached}
+                }}
+            })
+            .to_string();
+            write_lines(
+                &mut file,
+                &[
+                    SESSION_META,
+                    r#"{"type":"turn_context","payload":{"model":"gpt-5-codex"}}"#,
+                    r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":200,"output_tokens":20,"cached_input_tokens":100}}}}"#,
+                    &corrected,
+                    &corrected,
+                ],
+            );
+            let result = parse_codex_jsonl(file.path()).unwrap();
+            assert_eq!(
+                result.model_usage,
+                vec![ModelUsage {
+                    model: "Unknown".into(),
+                    total_tokens: 220,
+                    active_tokens: expected_active,
+                }]
+            );
+        }
     }
 
     #[test]

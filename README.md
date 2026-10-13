@@ -63,7 +63,7 @@ Mouse capture is off by default so terminal drag selection and copy keep working
 
 The tokens pane shows the selected session's Input, Output, CacheR, and CacheW totals, followed by tokens per minute over a rolling 60-second window. Claude totals and rates include subagents, including nested workflow agents. Rates count increases observed while abtop runs, start at zero, and return to zero after a minute without new tokens. On narrow panes, meter bars shrink first; rates are hidden if the text still cannot fit.
 
-The models pane shows lifetime token totals and percentage share for each model used by the selected session, sorted by usage. It appears beside Tokens on wide terminals and in the Usage tab on narrow terminals. Press `8` to toggle it, or use the View/config menus; visibility is saved. Narrow panes use two-line entries, with overflow combined into `Other (N)`.
+The models pane shows lifetime token totals, percentage share, and tokens per minute for each model used by the selected session, sorted by lifetime usage. The rate follows the percentage and sums Input + Output + CacheW, excluding CacheR, over a rolling 60-second window. Rates start at zero and count increases observed while abtop runs. It appears beside Tokens on wide terminals and in the Usage tab on narrow terminals. Press `8` to toggle it, or use the View/config menus; visibility is saved. Narrow panes use two-line entries, moving the rate to a third line only when the metrics do not fit. Overflow is combined into `Other (N)`, including its summed rate.
 
 The desktop layout reserves minimum widths for enabled panes and switches to tabs when they cannot fit (134 columns with all panes enabled). In the Usage tab, Context hides first when height is limited, preserving both quota windows and all four token categories. Quota bars shrink before values are clipped, reset countdowns move inline in shorter panes, and Models combines overflow when needed. These automatic layout changes do not alter saved visibility settings.
 
@@ -199,7 +199,7 @@ let json = serde_json::to_string(&app.to_snapshot(2_000)).unwrap();
 the serialized JSON elsewhere. [abtop-web-ui](https://github.com/XKHoshizora/abtop-web-ui)
 is a reference consumer: a local-first web dashboard built on exactly this API.
 
-Each JSON session includes `model_usage`, an array of `{ "model": "...", "total_tokens": 123 }` entries sorted by usage. These entries use the same accounting and subagent scope as that session's `total_tokens`; percentage share is `100 * total_tokens / session.total_tokens` when the session total is nonzero. Library users constructing `AgentSession`, `SessionView`, or `PanelVisibility` literals must supply the new `model_usage` or `models` field as appropriate.
+Each JSON session includes `model_usage`, an array of `{ "model": "...", "total_tokens": 123 }` entries sorted by usage. These entries use the same accounting and subagent scope as that session's `total_tokens`; percentage share is `100 * total_tokens / session.total_tokens` when the session total is nonzero. Library users constructing `AgentSession`, `SessionView`, or `PanelVisibility` literals must supply the new `model_usage` or `models` field as appropriate. `ModelUsage` literals also require `active_tokens` (Input + Output + CacheW); this internal rate subtotal is not serialized to JSON.
 
 ## Privacy
 
