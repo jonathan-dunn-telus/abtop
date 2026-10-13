@@ -39,7 +39,7 @@ fn draw_token_rate_charts(f: &mut Frame, app: &App, area: Rect, theme: &Theme, n
     let width = area.width as usize;
     let mut main_label = rate_label(
         t("token_rate.global"),
-        rates.uncached_total(),
+        rates.total(),
         series_color(&app.token_rates, &cpu_grad),
         theme,
     );
@@ -74,7 +74,7 @@ fn draw_token_rate_charts(f: &mut Frame, app: &App, area: Rect, theme: &Theme, n
                 format!(
                     "{} {}/min | CacheR {}/min | {reuse_label} {reuse}",
                     t("token_rate.global"),
-                    fmt_tokens(rates.uncached_total()),
+                    fmt_tokens(rates.total()),
                     fmt_tokens(rates.cache_read),
                 ),
                 Style::default().fg(theme.graph_text),

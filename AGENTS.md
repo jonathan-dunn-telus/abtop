@@ -256,6 +256,14 @@ Each session gets a one-line summary title generated via `claude --print`:
 - Cached to `~/.cache/abtop/summaries.json` (persists across runs)
 - Max 3 concurrent summary jobs, max 2 retries per session
 
+## Token Accounting
+
+Cumulative totals and derived usage use input + output + cache writes, excluding
+cache reads. Use the shared `token_total` helper and `AgentSession::total_tokens()`.
+Preserve raw cache-read counters separately; the CacheR row is explicitly excluded
+from Total. Category bars use the sum of all four raw categories. Context
+occupancy and account-level quota calculations retain their independent meanings.
+
 ## Context Window Calculation
 
 Not provided in data files. Derive:

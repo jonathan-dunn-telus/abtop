@@ -357,7 +357,7 @@ SELECT
   COALESCE(SUM(u.total_cache_write), 0) AS total_cache_write,
   json_group_array(json_object(
     'model', u.model, 'provider', u.provider,
-    'total_tokens', u.total_input + u.total_output + u.total_cache_read + u.total_cache_write
+    'total_tokens', u.total_input + u.total_output + u.total_cache_write
   )) AS model_usage
 FROM recent_sessions s
 LEFT JOIN project p ON s.project_id = p.id
@@ -695,6 +695,8 @@ INSERT INTO message VALUES ('5', 'main', 5,
     '{"role":"assistant","providerID":"alpha","tokens":{"input":7}}');
 INSERT INTO message VALUES ('6', 'main', 6,
     '{"role":"user","tokens":{"input":9999}}');
+INSERT INTO message VALUES ('7', 'main', 7,
+    '{"role":"assistant","providerID":"alpha","modelID":"cache-only","tokens":{"cache":{"read":1000}}}');
 "#).output().unwrap();
         assert!(
             setup.status.success(),
@@ -708,14 +710,14 @@ INSERT INTO message VALUES ('6', 'main', 6,
             vec![
                 ModelUsage {
                     model: "alpha/shared".into(),
-                    total_tokens: 101
-                },
-                ModelUsage {
-                    model: "beta/shared".into(),
-                    total_tokens: 10
+                    total_tokens: 71
                 },
                 ModelUsage {
                     model: "Unknown".into(),
+                    total_tokens: 7
+                },
+                ModelUsage {
+                    model: "beta/shared".into(),
                     total_tokens: 7
                 },
                 ModelUsage {
@@ -724,17 +726,15 @@ INSERT INTO message VALUES ('6', 'main', 6,
                 },
             ]
         );
-        assert_eq!(session.turn_count, 5);
+        assert_eq!(session.turn_count, 6);
+        assert_eq!(session.total_cache_read, 1_033);
         assert_eq!(
             session
                 .model_usage
                 .iter()
                 .map(|entry| entry.total_tokens)
                 .sum::<u64>(),
-            session.total_input
-                + session.total_output
-                + session.total_cache_read
-                + session.total_cache_write
+            session.total_input + session.total_output + session.total_cache_write
         );
         assert_eq!(session.total_input, 24);
         assert_eq!(
@@ -842,7 +842,7 @@ INSERT INTO message VALUES ('6', 'main', 6,
                 total_cache_write: 40,
                 model_usage: vec![ModelUsage {
                     model: "provider/model".into(),
-                    total_tokens: 100,
+                    total_tokens: 70,
                 }],
                 model: "model".into(),
                 provider: "provider".into(),
@@ -875,7 +875,7 @@ INSERT INTO message VALUES ('6', 'main', 6,
             assert_eq!(session.total_output_tokens, 20);
             assert_eq!(session.total_cache_read, 30);
             assert_eq!(session.total_cache_create, 40);
-            assert_eq!(session.model_usage[0].total_tokens, 100);
+            assert_eq!(session.model_usage[0].total_tokens, 70);
             assert_eq!(session.turn_count, 3);
             // Enrichment must change the same object retained for final publication.
             session.git_added = 7;

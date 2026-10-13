@@ -537,6 +537,18 @@ pub fn populate_demo(app: &mut App) {
             total - child_tokens,
         );
         ModelUsage::add(&mut session.model_usage, "claude-haiku-4-5", child_tokens);
+        // Synthetic values are shape weights; allocate only the parent's usage.
+        let weight: u64 = session.token_history.iter().sum();
+        let mut cumulative = 0;
+        let mut previous = 0;
+        for value in &mut session.token_history {
+            cumulative += *value;
+            let allocated = ((total - child_tokens) * cumulative)
+                .checked_div(weight)
+                .unwrap_or(0);
+            *value = allocated - previous;
+            previous = allocated;
+        }
     }
 
     // --- Summaries (pre-populated, no LLM calls) ---

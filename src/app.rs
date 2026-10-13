@@ -1,6 +1,6 @@
 use crate::collector::McpServer;
 use crate::host_info::{AgentAggregate, HostMetrics};
-use crate::model::{AgentSession, OrphanPort, RateLimitInfo, SessionStatus};
+use crate::model::{token_total, AgentSession, OrphanPort, RateLimitInfo, SessionStatus};
 use crate::theme::Theme;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -33,11 +33,11 @@ pub(crate) struct TokenRates {
 
 impl TokenRates {
     pub(crate) fn total(&self) -> u64 {
-        self.input + self.output + self.cache_read + self.cache_write
+        token_total(self.input, self.output, self.cache_write)
     }
 
-    pub(crate) fn uncached_total(&self) -> u64 {
-        self.input + self.output + self.cache_write
+    fn has_activity(&self) -> bool {
+        self.input != 0 || self.output != 0 || self.cache_read != 0 || self.cache_write != 0
     }
 
     pub(crate) fn cache_reuse_percent(&self) -> Option<f64> {
@@ -847,7 +847,7 @@ impl App {
     }
 
     pub(crate) fn record_global_token_delta(&mut self, now: Instant, delta: TokenRates) {
-        self.token_rates.push_back(delta.uncached_total() as f64);
+        self.token_rates.push_back(delta.total() as f64);
         self.cache_read_rates.push_back(delta.cache_read as f64);
         if self.token_rates.len() > GRAPH_HISTORY_LEN {
             self.token_rates.pop_front();
@@ -862,7 +862,7 @@ impl App {
         {
             self.global_token_samples.pop_front();
         }
-        if delta.total() > 0 {
+        if delta.has_activity() {
             self.global_token_samples.push_back((now, delta));
         }
     }
@@ -1839,7 +1839,7 @@ mod tests {
         app.show_token_rate = false;
         app.update_session_token_rates(start + Duration::from_secs(2));
         let rates = app.global_token_rates(start + Duration::from_secs(2));
-        assert_eq!(rates.uncached_total(), 500);
+        assert_eq!(rates.total(), 500);
         assert_eq!(rates.cache_read, 600);
         assert_eq!(rates.cache_reuse_percent(), Some(60.0));
         assert_eq!(app.token_rates.back(), Some(&500.0));
@@ -1853,12 +1853,12 @@ mod tests {
         assert_eq!(
             app.global_token_rates(start + Duration::from_secs(61))
                 .total(),
-            1_350
+            550
         );
         app.sessions.clear();
         app.update_session_token_rates(start + Duration::from_secs(62));
         let rates = app.global_token_rates(start + Duration::from_secs(62));
-        assert_eq!(rates.uncached_total(), 50);
+        assert_eq!(rates.total(), 50);
         assert_eq!(rates.cache_read, 200);
         assert_eq!(rates.cache_reuse_percent(), Some(100.0));
         assert_eq!(app.token_rates.back(), Some(&0.0));

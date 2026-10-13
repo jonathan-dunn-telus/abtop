@@ -7,6 +7,30 @@ Claude Code, Codex CLI, and OpenCode sessions are discovered from local process/
 
 ![demo](https://raw.githubusercontent.com/graykode/abtop/main/assets/demo.gif)
 
+## Token accounting
+
+Token totals use **input + output + cache writes**, excluding cache reads. This
+basis applies to session and subagent totals, Tokens averages and per-turn
+history, activity rates, Models attribution and shares, All live statistics, and
+plain/JSON snapshots. Cache writes remain included.
+
+The CacheR row is labeled `excluded` (or `excl` in compact layouts) because it is
+excluded from Total. It remains a separate raw counter, including when Total is
+zero; Models shows an explicit empty state when no qualifying usage exists.
+Category bars show each category's share of **all four raw categories**, including cache reads; they are
+not shares of the headline Total. Cached context still occupies the context
+window, and account quotas retain their provider-defined meanings.
+
+Excluding cache reads focuses headline totals on token categories that generally
+cost more per token, making spending drivers easier to gauge. These totals are
+not cost estimates: prices vary by model and category, and large cache-read
+volumes can still contribute materially to the bill. Cache reads remain visible
+separately.
+
+For library consumers,
+`AgentSession::total_tokens()` is the single total API; `active_tokens()` has been
+removed. Snapshot field names and raw category counters are unchanged.
+
 ## Why
 
 - Running 3+ agents across projects? See them all in one screen.
@@ -69,7 +93,7 @@ Press `a` to switch Tokens and Models together between **Selected** and **All li
 
 All live adds the lifetime usage of all confirmed live sessions from enabled collectors, including sessions waiting for input or rate limits. Finished sessions and sessions whose process ownership is unknown are excluded. Totals decrease when a session closes. Searching and selecting sessions only affects session navigation and details; it does not change All live totals. Quota remains account-level, and Context keeps its existing cross-session activity and per-session percentages.
 
-Aggregate model shares use the combined token total, and average tokens per turn is the combined total divided by the combined turn count. The aggregate Tokens sparkline shows combined rolling `tokens/min`, including all four token categories, sampled on each refresh for the sessions live at that time (up to 200 samples). History is collected even in Selected mode; discovering a session does not turn its past usage into a rate spike. Existing collector accounting is preserved: Claude session totals already include tracked subagents, while Codex and OpenCode totals cover each session itself.
+Aggregate model shares use the combined token total, and average tokens per turn is the combined total divided by the combined turn count. The aggregate Tokens sparkline shows combined rolling `tokens/min`, excluding cache reads, sampled on each refresh for the sessions live at that time (up to 200 samples). History is collected even in Selected mode; discovering a session does not turn its past usage into a rate spike. Existing collector accounting is preserved: Claude session totals already include tracked subagents, while Codex and OpenCode totals cover each session itself.
 
 The top row has two independent panes: **Token rate** (`9`) shows the global token activity chart and tokens/min; **Context** (`1`) shows each session's project name, context usage, window size, and compaction count. Token rate counts input, output, and cache creation across collected sessions, excluding cache reads. It stays global regardless of selection or the Tokens/Models scope toggle. On desktop, the panes share the row at 65%/35%; hiding either lets the other use the full width. Both toggles are available in the View menu and configuration overlay and persist across restarts.
 
@@ -85,7 +109,7 @@ Agent history starts when abtop observes activity, continues while the pane is h
 
 The desktop layout reserves minimum widths for enabled panes and switches to tabs when they cannot fit (134 columns with all panes enabled). In the Usage tab, Token rate hides first, then Context, when height is limited, preserving both quota windows and all four token categories. Quota bars shrink before values are clipped, reset countdowns move inline in shorter panes, and Models combines overflow when needed. These automatic layout changes do not alter saved visibility settings.
 
-Model totals include input, output, cache reads, and cache writes, matching the Tokens pane in either scope. Distinct model versions stay separate, and OpenCode entries include the provider. Missing model metadata is counted as `Unknown`. Codex attributes increases in cumulative usage to the current turn's model; if counters decrease, the replacement baseline becomes `Unknown` and subsequent increases resume model attribution.
+Model totals include input, output, and cache writes, excluding cache reads and matching the Tokens pane in either scope. Distinct model versions stay separate, and OpenCode entries include the provider. Missing model metadata is counted as `Unknown`. Codex attributes increases in cumulative usage to the current turn's model; if counters decrease, the replacement baseline becomes `Unknown` and subsequent increases resume model attribution.
 
 ### Terminal Jump
 

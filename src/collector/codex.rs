@@ -1,7 +1,8 @@
 use super::process::{self, ProcInfo};
 use crate::model::{
-    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface,
-    ModelUsage, RateLimitInfo, SessionStatus, ToolCall, MAX_CHAT_MESSAGES, MAX_FILE_ACCESSES,
+    token_total, AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp,
+    LaunchSurface, ModelUsage, RateLimitInfo, SessionStatus, ToolCall, MAX_CHAT_MESSAGES,
+    MAX_FILE_ACCESSES,
 };
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -1398,8 +1399,8 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
                     Some("token_count") => {
                         let info = &payload["info"];
                         // Codex input_tokens already includes cached_input_tokens.
-                        // Store only the non-cached input portion so
-                        // AgentSession::total_tokens() does not double-count cache.
+                        // Store non-cached input separately so totals exclude reused
+                        // input while the raw cache-read counter remains available.
                         let total = &info["total_token_usage"];
                         if total.is_object() {
                             let inp = total["input_tokens"].as_u64().unwrap_or(0);
@@ -1408,10 +1409,13 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
                                 .as_u64()
                                 .or_else(|| total["cache_read_input_tokens"].as_u64())
                                 .unwrap_or(0);
-                            let previous =
-                                result.total_input + result.total_output + result.total_cache_read;
-                            let current = inp.saturating_sub(cache) + out + cache;
-                            if current < previous {
+                            let previous = token_total(result.total_input, result.total_output, 0);
+                            let current = token_total(inp.saturating_sub(cache), out, 0);
+                            // A reset can lower raw usage while a smaller cache share
+                            // leaves the attributed total unchanged or even higher.
+                            let previous_with_cache = previous + result.total_cache_read;
+                            let current_with_cache = current + cache;
+                            if current_with_cache < previous_with_cache || current < previous {
                                 // A replacement baseline cannot be attributed to the latest model.
                                 result.model_usage.clear();
                                 ModelUsage::add(&mut result.model_usage, "Unknown", current);
@@ -1435,7 +1439,15 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
                             let out = last["output_tokens"].as_u64().unwrap_or(0);
                             result.last_context_tokens = inp;
                             if result.token_history.len() < 10_000 {
-                                result.token_history.push(inp + out);
+                                let cache = last["cached_input_tokens"]
+                                    .as_u64()
+                                    .or_else(|| last["cache_read_input_tokens"].as_u64())
+                                    .unwrap_or(0);
+                                result.token_history.push(token_total(
+                                    inp.saturating_sub(cache),
+                                    out,
+                                    0,
+                                ));
                             }
                         }
                         // Context window may also appear inside info
@@ -2105,6 +2117,7 @@ mod tests {
         let first = count(100, 20, 80);
         let second = count(400, 60, 300);
         let third = count(450, 70, 310);
+        let cache_only = count(1_450, 70, 1_310);
         write_lines(
             &mut file,
             &[
@@ -2116,6 +2129,8 @@ mod tests {
                 r#"{"type":"turn_context","payload":{"model":"gpt-5.3-codex"}}"#,
                 &second,
                 &third,
+                r#"{"type":"turn_context","payload":{"model":"cache-only"}}"#,
+                &cache_only,
                 r#"{"type":"event_msg","payload":{"type":"token_count","info":null}}"#,
             ],
         );
@@ -2125,15 +2140,15 @@ mod tests {
             vec![
                 ModelUsage {
                     model: "gpt-5-codex".into(),
-                    total_tokens: 340
-                },
-                ModelUsage {
-                    model: "Unknown".into(),
                     total_tokens: 120
                 },
                 ModelUsage {
                     model: "gpt-5.3-codex".into(),
-                    total_tokens: 60
+                    total_tokens: 50
+                },
+                ModelUsage {
+                    model: "Unknown".into(),
+                    total_tokens: 40
                 },
             ]
         );
@@ -2143,7 +2158,7 @@ mod tests {
                 .iter()
                 .map(|entry| entry.total_tokens)
                 .sum::<u64>(),
-            result.total_input + result.total_output + result.total_cache_read
+            result.total_input + result.total_output
         );
         assert_eq!(result.total_input, 140); // Cache is a subset of input.
         assert_eq!(
@@ -2171,18 +2186,74 @@ mod tests {
             vec![
                 ModelUsage {
                     model: "Unknown".into(),
-                    total_tokens: 110
+                    total_tokens: 30
                 },
                 ModelUsage {
                     model: "gpt-5-codex".into(),
-                    total_tokens: 55
+                    total_tokens: 15
                 },
             ]
         );
-        assert_eq!(
-            result.total_input + result.total_output + result.total_cache_read,
-            165
-        );
+        assert_eq!(result.total_input + result.total_output, 45);
+    }
+
+    #[test]
+    fn model_usage_resets_when_raw_usage_drops_regardless_of_cache_share() {
+        for (cache, expected) in [(100, 450), (350, 200), (400, 150)] {
+            let count = |input, output, cached| {
+                serde_json::json!({
+                    "type": "event_msg", "payload": {"type": "token_count", "info": {
+                        "total_token_usage": {
+                            "input_tokens": input, "output_tokens": output,
+                            "cached_input_tokens": cached
+                        }
+                    }}
+                })
+                .to_string()
+            };
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            let initial = count(1000, 100, 900);
+            let replacement = count(500, 50, cache);
+            write_lines(
+                &mut file,
+                &[
+                    SESSION_META,
+                    r#"{"type":"turn_context","payload":{"model":"model-a"}}"#,
+                    &initial,
+                    r#"{"type":"turn_context","payload":{"model":"model-b"}}"#,
+                    &replacement,
+                ],
+            );
+            let result = parse_codex_jsonl(file.path()).unwrap();
+            assert_eq!(
+                result.model_usage,
+                vec![ModelUsage {
+                    model: "Unknown".into(),
+                    total_tokens: expected,
+                }]
+            );
+            assert_eq!(result.total_input, 500 - cache);
+            assert_eq!(result.total_output, 50);
+            assert_eq!(result.total_cache_read, cache);
+
+            // A repeated baseline adds nothing; subsequent growth uses the current model.
+            let next = count(550, 60, cache + 20);
+            write_lines(&mut file, &[&replacement, &next]);
+            let result = parse_codex_jsonl(file.path()).unwrap();
+            assert_eq!(
+                ModelUsage::sorted(&result.model_usage),
+                vec![
+                    ModelUsage {
+                        model: "Unknown".into(),
+                        total_tokens: expected,
+                    },
+                    ModelUsage {
+                        model: "model-b".into(),
+                        total_tokens: 40,
+                    },
+                ]
+            );
+        }
     }
 
     #[test]
@@ -2202,7 +2273,26 @@ mod tests {
         assert_eq!(result.last_context_tokens, 50);
         assert_eq!(result.context_window, 128000);
         assert_eq!(result.token_history.len(), 1);
-        assert_eq!(result.token_history[0], 70);
+        assert_eq!(result.token_history[0], 60);
+    }
+
+    #[test]
+    fn codex_cache_only_and_excess_cached_input_do_not_inflate_history() {
+        for cache in [50, 100] {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            let event = serde_json::json!({"type":"event_msg","payload":{
+                "type":"token_count","info":{
+                    "total_token_usage":{"input_tokens":50,"cached_input_tokens":cache,"output_tokens":0},
+                    "last_token_usage":{"input_tokens":50,"cached_input_tokens":cache,"output_tokens":0}
+                }
+            }}).to_string();
+            write_lines(&mut file, &[SESSION_META, &event]);
+            let result = parse_codex_jsonl(file.path()).unwrap();
+            assert_eq!(result.token_history, vec![0]);
+            assert_eq!(result.total_input, 0);
+            assert_eq!(result.total_cache_read, cache);
+            assert_eq!(result.last_context_tokens, 50);
+        }
     }
 
     #[test]
@@ -2289,6 +2379,7 @@ mod tests {
         let result = parse_codex_jsonl(file.path()).unwrap();
         assert_eq!(result.total_cache_read, 30);
         assert_eq!(result.last_context_tokens, 20);
+        assert_eq!(result.token_history, vec![25]);
     }
 
     #[test]
