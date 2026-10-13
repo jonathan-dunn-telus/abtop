@@ -13,19 +13,6 @@ use super::{
     styled_label, truncate_str,
 };
 
-/// Keep the cache-read exclusion visible even when bars must disappear.
-fn cache_read_label(inner_width: usize, value_width: usize) -> String {
-    let label = t("tokens.cache_r");
-    [
-        format!(" {label} excluded:"),
-        format!(" {label} excl:"),
-        "CR excl".to_string(),
-    ]
-    .into_iter()
-    .find(|label| label.width() + 1 + value_width <= inner_width)
-    .unwrap_or_else(|| "CR excl".to_string())
-}
-
 pub(crate) fn draw_tokens_panel(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     draw_tokens_panel_active(f, app, area, theme, false);
 }
@@ -101,7 +88,7 @@ pub(crate) fn draw_tokens_panel_active(
             &used_grad,
         ),
         (
-            cache_read_label(inner_width, fmt_tokens(cache_read).width()),
+            format!(" {}:", t("tokens.cache_r")),
             cache_read,
             cache_r_pct,
             &cached_grad,
@@ -217,12 +204,12 @@ mod tests {
     }
 
     #[test]
-    fn tokens_exclude_reads_and_keep_the_exclusion_and_values_visible() {
+    fn tokens_exclude_reads_and_keep_labels_and_values_visible() {
         for width in [15, 20, 32, 60] {
             let lines = render([100, 50, 200, 30], 2, width);
             assert!(lines[1].contains("180"), "{width}: {}", lines[1]);
             assert!(lines[4].contains("200"), "{width}: {}", lines[4]);
-            assert!(lines[4].contains("excl"), "{width}: {}", lines[4]);
+            assert!(lines[4].contains("CacheR:"), "{width}: {}", lines[4]);
             assert!(lines[5].contains("30"), "{width}: {}", lines[5]);
             if width >= 32 {
                 assert!(lines[7].contains("90/t"));
@@ -235,7 +222,7 @@ mod tests {
         for totals in [[0, 0, 200, 0], [0; 4]] {
             let lines = render(totals, 0, 32);
             assert!(lines[1].contains("Total: 0"));
-            assert!(lines[4].contains("excl"));
+            assert!(lines[4].contains("CacheR:"));
             assert!(lines[7].contains("0/t"));
             assert!(!lines.join("\n").contains("NaN"));
         }
