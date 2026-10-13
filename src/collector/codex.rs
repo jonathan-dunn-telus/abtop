@@ -1411,7 +1411,11 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
                                 .unwrap_or(0);
                             let previous = token_total(result.total_input, result.total_output, 0);
                             let current = token_total(inp.saturating_sub(cache), out, 0);
-                            if current < previous {
+                            // A reset can lower raw usage while a smaller cache share
+                            // leaves the attributed total unchanged or even higher.
+                            let previous_with_cache = previous + result.total_cache_read;
+                            let current_with_cache = current + cache;
+                            if current_with_cache < previous_with_cache || current < previous {
                                 // A replacement baseline cannot be attributed to the latest model.
                                 result.model_usage.clear();
                                 ModelUsage::add(&mut result.model_usage, "Unknown", current);
@@ -2191,6 +2195,65 @@ mod tests {
             ]
         );
         assert_eq!(result.total_input + result.total_output, 45);
+    }
+
+    #[test]
+    fn model_usage_resets_when_raw_usage_drops_regardless_of_cache_share() {
+        for (cache, expected) in [(100, 450), (350, 200), (400, 150)] {
+            let count = |input, output, cached| {
+                serde_json::json!({
+                    "type": "event_msg", "payload": {"type": "token_count", "info": {
+                        "total_token_usage": {
+                            "input_tokens": input, "output_tokens": output,
+                            "cached_input_tokens": cached
+                        }
+                    }}
+                })
+                .to_string()
+            };
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            let initial = count(1000, 100, 900);
+            let replacement = count(500, 50, cache);
+            write_lines(
+                &mut file,
+                &[
+                    SESSION_META,
+                    r#"{"type":"turn_context","payload":{"model":"model-a"}}"#,
+                    &initial,
+                    r#"{"type":"turn_context","payload":{"model":"model-b"}}"#,
+                    &replacement,
+                ],
+            );
+            let result = parse_codex_jsonl(file.path()).unwrap();
+            assert_eq!(
+                result.model_usage,
+                vec![ModelUsage {
+                    model: "Unknown".into(),
+                    total_tokens: expected,
+                }]
+            );
+            assert_eq!(result.total_input, 500 - cache);
+            assert_eq!(result.total_output, 50);
+            assert_eq!(result.total_cache_read, cache);
+
+            // A repeated baseline adds nothing; subsequent growth uses the current model.
+            let next = count(550, 60, cache + 20);
+            write_lines(&mut file, &[&replacement, &next]);
+            let result = parse_codex_jsonl(file.path()).unwrap();
+            assert_eq!(
+                ModelUsage::sorted(&result.model_usage),
+                vec![
+                    ModelUsage {
+                        model: "Unknown".into(),
+                        total_tokens: expected,
+                    },
+                    ModelUsage {
+                        model: "model-b".into(),
+                        total_tokens: 40,
+                    },
+                ]
+            );
+        }
     }
 
     #[test]
