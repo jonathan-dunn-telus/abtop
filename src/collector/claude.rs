@@ -2229,7 +2229,7 @@ mod tests {
     }
 
     #[test]
-    fn workflow_usage_updates_parent_totals_without_parent_activity() {
+    fn workflow_usage_updates_parent_totals_and_rates_without_parent_activity() {
         let temp = tempfile::tempdir().unwrap();
         let config = ConfigDir::new(temp.path().join("profile"));
         fs::create_dir_all(&config.sessions_dir).unwrap();
@@ -2261,8 +2261,14 @@ mod tests {
                 &ctx,
             )
         };
-        let sessions = collect();
-        let session = &sessions[0];
+        let mut app = crate::app::App::new_with_config(
+            crate::theme::Theme::default(),
+            &[],
+            Default::default(),
+        );
+        let start = std::time::Instant::now();
+        app.sessions = collect();
+        let session = &app.sessions[0];
         assert_eq!(session.total_input_tokens, 23);
         assert_eq!(session.total_output_tokens, 28);
         assert_eq!(session.total_cache_read, 36);
@@ -2271,21 +2277,38 @@ mod tests {
         assert_eq!(session.status, SessionStatus::Executing);
         let context = session.context_percent;
         let turns = session.turn_count;
+        app.update_session_token_rates(start);
+
         append_usage(&nested, [5, 6, 7, 8]);
-        let sessions = collect();
-        let session = &sessions[0];
-        assert_eq!(session.context_percent, context);
-        assert_eq!(session.turn_count, turns);
-        assert_eq!(session.total_input_tokens, 28);
-        assert_eq!(session.total_output_tokens, 34);
-        assert_eq!(session.total_cache_read, 43);
-        assert_eq!(session.total_cache_create, 52);
+        app.sessions = collect();
+        let now = start + std::time::Duration::from_secs(2);
+        app.update_session_token_rates(now);
+        assert_eq!(
+            app.session_token_rates(&app.sessions[0], now),
+            crate::app::TokenRates {
+                input: 5,
+                output: 6,
+                cache_read: 7,
+                cache_write: 8,
+            }
+        );
+        assert_eq!(app.sessions[0].context_percent, context);
+        assert_eq!(app.sessions[0].turn_count, turns);
+        assert_eq!(app.sessions[0].total_input_tokens, 28);
+        assert_eq!(app.sessions[0].total_output_tokens, 34);
+        assert_eq!(app.sessions[0].total_cache_read, 43);
+        assert_eq!(app.sessions[0].total_cache_create, 52);
         // Unchanged files must not add their lifetime usage again.
-        let sessions = collect();
-        assert_eq!(sessions[0].total_input_tokens, 28);
-        assert_eq!(sessions[0].total_output_tokens, 34);
-        assert_eq!(sessions[0].total_cache_read, 43);
-        assert_eq!(sessions[0].total_cache_create, 52);
+        app.sessions = collect();
+        assert_eq!(app.sessions[0].total_input_tokens, 28);
+        assert_eq!(app.sessions[0].total_output_tokens, 34);
+        assert_eq!(app.sessions[0].total_cache_read, 43);
+        assert_eq!(app.sessions[0].total_cache_create, 52);
+        app.update_session_token_rates(start + std::time::Duration::from_secs(4));
+        assert_eq!(
+            app.session_token_rates(&app.sessions[0], start + std::time::Duration::from_secs(62)),
+            crate::app::TokenRates::default(),
+        );
         collector.evict_stale_cache(&[]);
         assert!(collector.subagent_cache.is_empty());
     }

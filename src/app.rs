@@ -5,14 +5,103 @@ use crate::theme::Theme;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Maximum data points kept for the live token-rate graph.
 const GRAPH_HISTORY_LEN: usize = 200;
+/// Window for the per-session token rates shown in the tokens pane.
+const TOKEN_RATE_WINDOW: Duration = Duration::from_secs(60);
 /// Max concurrent summary jobs.
 const MAX_SUMMARY_JOBS: usize = 3;
 /// Max summary attempts per session before giving up.
 const MAX_SUMMARY_RETRIES: u32 = 2;
+
+/// Tokens observed during the last minute, without extrapolating startup data.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct TokenRates {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
+struct TokenRateCounter {
+    previous: u64,
+    samples: VecDeque<(Instant, u64)>,
+}
+
+impl TokenRateCounter {
+    fn new(total: u64) -> Self {
+        Self {
+            previous: total,
+            samples: VecDeque::new(),
+        }
+    }
+
+    fn update(&mut self, total: u64, now: Instant) {
+        if total < self.previous {
+            // Transcript rotation or correction invalidates this category's history.
+            self.samples.clear();
+        }
+        while self
+            .samples
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) >= TOKEN_RATE_WINDOW)
+        {
+            self.samples.pop_front();
+        }
+        let delta = total.saturating_sub(self.previous);
+        if delta > 0 {
+            self.samples.push_back((now, delta));
+        }
+        self.previous = total;
+    }
+
+    fn rate(&self, now: Instant) -> u64 {
+        self.samples
+            .iter()
+            .filter(|(at, _)| now.duration_since(*at) < TOKEN_RATE_WINDOW)
+            .map(|(_, delta)| delta)
+            .sum()
+    }
+}
+
+struct SessionTokenRates {
+    input: TokenRateCounter,
+    output: TokenRateCounter,
+    cache_read: TokenRateCounter,
+    cache_write: TokenRateCounter,
+    last_seen: Instant,
+}
+
+impl SessionTokenRates {
+    fn new(session: &AgentSession, now: Instant) -> Self {
+        Self {
+            input: TokenRateCounter::new(session.total_input_tokens),
+            output: TokenRateCounter::new(session.total_output_tokens),
+            cache_read: TokenRateCounter::new(session.total_cache_read),
+            cache_write: TokenRateCounter::new(session.total_cache_create),
+            last_seen: now,
+        }
+    }
+
+    fn update(&mut self, session: &AgentSession, now: Instant) {
+        self.input.update(session.total_input_tokens, now);
+        self.output.update(session.total_output_tokens, now);
+        self.cache_read.update(session.total_cache_read, now);
+        self.cache_write.update(session.total_cache_create, now);
+        self.last_seen = now;
+    }
+
+    fn rates(&self, now: Instant) -> TokenRates {
+        TokenRates {
+            input: self.input.rate(now),
+            output: self.output.rate(now),
+            cache_read: self.cache_read.rate(now),
+            cache_write: self.cache_write.rate(now),
+        }
+    }
+}
 
 /// Produce a terminal-safe fallback summary from a raw prompt.
 fn sanitize_fallback(prompt: &str, max_len: usize) -> String {
@@ -94,6 +183,8 @@ pub struct App {
     pub rate_limits: Vec<RateLimitInfo>,
     /// Per-session previous token totals, keyed by (agent_cli, session_id).
     prev_tokens: HashMap<(String, String), u64>,
+    /// Recent category deltas, keyed by (agent_cli, session_id).
+    session_token_rates: HashMap<(String, String), SessionTokenRates>,
     /// Rate limit poll counter (read every 5 ticks = 10s)
     rate_limit_counter: u32,
     collector: MultiCollector,
@@ -179,6 +270,7 @@ impl App {
             token_rates: VecDeque::with_capacity(GRAPH_HISTORY_LEN),
             rate_limits: Vec::new(),
             prev_tokens: HashMap::new(),
+            session_token_rates: HashMap::new(),
             rate_limit_counter: 5,
             collector,
             summaries,
@@ -517,6 +609,8 @@ impl App {
         }
         self.clamp_selection_to_visible();
 
+        self.update_session_token_rates(Instant::now());
+
         // Compute rate as sum of per-session deltas (stable across session churn).
         // Update prev_tokens in place; stale entries are harmless (bounded by
         // total unique sessions ever seen) and keeping them avoids false spikes
@@ -547,6 +641,27 @@ impl App {
         }
 
         promote_waiting_to_rate_limited(&mut self.sessions, &self.rate_limits);
+    }
+
+    pub(crate) fn update_session_token_rates(&mut self, now: Instant) {
+        // Keep baselines through brief discovery gaps, but do not accumulate
+        // stale session state or attribute a long absence's tokens to one minute.
+        self.session_token_rates
+            .retain(|_, rates| now.duration_since(rates.last_seen) < TOKEN_RATE_WINDOW);
+        for session in &self.sessions {
+            let key = (session.agent_cli.to_string(), session.session_id.clone());
+            self.session_token_rates
+                .entry(key)
+                .or_insert_with(|| SessionTokenRates::new(session, now))
+                .update(session, now);
+        }
+    }
+
+    pub(crate) fn session_token_rates(&self, session: &AgentSession, now: Instant) -> TokenRates {
+        self.session_token_rates
+            .get(&(session.agent_cli.to_string(), session.session_id.clone()))
+            .map(|rates| rates.rates(now))
+            .unwrap_or_default()
     }
 
     /// Drain completed summary results and spawn retries. Does NOT recollect
@@ -1068,6 +1183,139 @@ mod tests {
             seven_day_window_minutes: None,
             updated_at: None,
         }
+    }
+
+    #[test]
+    fn token_rate_uses_observed_deltas_and_expires_by_elapsed_time() {
+        let start = Instant::now();
+        let mut counter = TokenRateCounter::new(100_000);
+        assert_eq!(counter.rate(start), 0);
+
+        counter.update(100_010, start + Duration::from_secs(2));
+        // No extrapolation to a full minute during startup.
+        assert_eq!(counter.rate(start + Duration::from_secs(2)), 10);
+        counter.update(100_080, start + Duration::from_secs(19));
+        counter.update(100_110, start + Duration::from_secs(61));
+        assert_eq!(counter.rate(start + Duration::from_secs(61)), 110);
+        assert_eq!(counter.rate(start + Duration::from_secs(62)), 100);
+        assert_eq!(counter.rate(start + Duration::from_secs(79)), 30);
+        // Expiration also works between collection ticks.
+        assert_eq!(counter.rate(start + Duration::from_secs(121)), 0);
+        counter.update(100_110, start + Duration::from_secs(125));
+        assert!(counter.samples.is_empty());
+    }
+
+    #[test]
+    fn token_rates_reset_only_the_category_whose_counter_decreases() {
+        let start = Instant::now();
+        let mut session = waiting_session("claude");
+        let mut rates = SessionTokenRates::new(&session, start);
+        session.total_input_tokens = 100;
+        session.total_output_tokens = 200;
+        session.total_cache_read = 300;
+        session.total_cache_create = 400;
+        rates.update(&session, start + Duration::from_secs(2));
+        assert_eq!(
+            rates.rates(start + Duration::from_secs(2)),
+            TokenRates {
+                input: 100,
+                output: 200,
+                cache_read: 300,
+                cache_write: 400,
+            }
+        );
+
+        session.total_cache_read = 10;
+        rates.update(&session, start + Duration::from_secs(4));
+        assert_eq!(
+            rates.rates(start + Duration::from_secs(4)),
+            TokenRates {
+                input: 100,
+                output: 200,
+                cache_read: 0,
+                cache_write: 400,
+            }
+        );
+        session.total_cache_read = 25;
+        rates.update(&session, start + Duration::from_secs(6));
+        assert_eq!(rates.rates(start + Duration::from_secs(6)).cache_read, 15);
+    }
+
+    #[test]
+    fn token_rates_follow_session_identity_across_selection_and_reordering() {
+        let start = Instant::now();
+        let mut app = App::new_with_config(Theme::default(), &[], Default::default());
+        app.sessions = vec![
+            waiting_session("claude"),
+            waiting_session("codex"),
+            waiting_session("opencode"),
+            waiting_session("claude"),
+        ];
+        app.sessions[3].session_id = "another-session".into();
+        app.update_session_token_rates(start);
+        for (index, session) in app.sessions.iter_mut().enumerate() {
+            session.total_input_tokens = (index as u64 + 1) * 100;
+        }
+        let now = start + Duration::from_secs(2);
+        app.update_session_token_rates(now);
+        for selected in [3, 1, 0, 2] {
+            app.selected = selected;
+            assert_eq!(
+                app.session_token_rates(&app.sessions[app.selected], now)
+                    .input,
+                (selected as u64 + 1) * 100
+            );
+        }
+        app.sessions.reverse();
+        app.update_session_token_rates(start + Duration::from_secs(4));
+        for session in &app.sessions {
+            assert_eq!(
+                app.session_token_rates(session, start + Duration::from_secs(4))
+                    .input,
+                session.total_input_tokens
+            );
+        }
+    }
+
+    #[test]
+    fn token_rates_keep_briefly_missing_sessions_and_discard_stale_baselines() {
+        let start = Instant::now();
+        let mut app = App::new_with_config(Theme::default(), &[], Default::default());
+        let mut session = waiting_session("claude");
+        session.total_input_tokens = 1_000;
+        app.sessions = vec![session.clone()];
+        app.update_session_token_rates(start);
+        assert_eq!(
+            app.session_token_rates(&session, start),
+            TokenRates::default()
+        );
+        app.sessions[0].total_input_tokens = 1_200;
+        app.update_session_token_rates(start + Duration::from_secs(2));
+        app.sessions.clear();
+        app.update_session_token_rates(start + Duration::from_secs(4));
+        assert_eq!(app.session_token_rates.len(), 1);
+
+        session.total_input_tokens = 1_250;
+        app.sessions.push(session.clone());
+        app.update_session_token_rates(start + Duration::from_secs(20));
+        assert_eq!(
+            app.session_token_rates(&session, start + Duration::from_secs(20))
+                .input,
+            250
+        );
+        app.sessions.clear();
+        app.update_session_token_rates(start + Duration::from_secs(79));
+        assert_eq!(app.session_token_rates.len(), 1);
+        app.update_session_token_rates(start + Duration::from_secs(80));
+        assert!(app.session_token_rates.is_empty());
+
+        session.total_input_tokens = 50_000;
+        app.sessions.push(session.clone());
+        app.update_session_token_rates(start + Duration::from_secs(81));
+        assert_eq!(
+            app.session_token_rates(&session, start + Duration::from_secs(81)),
+            TokenRates::default()
+        );
     }
 
     #[test]
