@@ -1,5 +1,5 @@
-use crate::collector::{read_rate_limits, McpServer, MultiCollector};
-use crate::host_info::{AgentAggregate, HostMetrics, HostSampler};
+use crate::collector::McpServer;
+use crate::host_info::{AgentAggregate, HostMetrics};
 use crate::model::{AgentSession, OrphanPort, RateLimitInfo, SessionStatus};
 use crate::theme::Theme;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -7,6 +7,9 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+mod agents;
+mod collection;
+use collection::{Collected, CollectionState, StartupMessage};
 mod stats;
 pub use stats::StatsScope;
 
@@ -186,6 +189,7 @@ pub enum NarrowSection {
     Projects,
     Context,
     TokenRate,
+    Agents,
     Quota,
     Tokens,
     Models,
@@ -196,7 +200,7 @@ pub enum NarrowSection {
 impl NarrowSection {
     pub fn tab(self) -> NarrowTab {
         match self {
-            Self::Sessions | Self::Projects => NarrowTab::Work,
+            Self::Sessions | Self::Projects | Self::Agents => NarrowTab::Work,
             Self::TokenRate | Self::Context | Self::Quota | Self::Tokens | Self::Models => {
                 NarrowTab::Usage
             }
@@ -210,6 +214,10 @@ pub struct App {
     pub selected: usize,
     /// Shared scope for the Tokens and Models panes.
     pub stats_scope: StatsScope,
+    pub agent_scope: StatsScope,
+    pub(crate) agent_history: agents::AgentHistory,
+    pub(crate) save_agent_scope: fn(StatsScope) -> Result<(), String>,
+    pub show_agents: bool,
     /// Combined rolling tokens/min, sampled for the sessions live at each tick.
     pub(crate) live_token_history: VecDeque<u64>,
     /// Injectable persistence boundary; tests never write the user's config.
@@ -225,9 +233,8 @@ pub struct App {
     pub rate_limits: Vec<RateLimitInfo>,
     /// Recent category deltas, keyed by (agent_cli, session_id).
     session_token_rates: HashMap<(String, String), SessionTokenRates>,
-    /// Rate limit poll counter (read every 5 ticks = 10s)
-    rate_limit_counter: u32,
-    collector: MultiCollector,
+    collection: Option<CollectionState>,
+    startup: Option<mpsc::Receiver<StartupMessage>>,
     /// Cached LLM-generated summaries, keyed by session_id.
     pub summaries: HashMap<String, String>,
     /// Session IDs currently being summarized.
@@ -276,8 +283,6 @@ pub struct App {
     pub show_timeline: bool,
     pub timeline_scroll: usize,
     pub show_file_audit: bool,
-    /// Host vitals sampler (CPU% delta needs prior snapshot).
-    host_sampler: HostSampler,
     /// Latest host metrics snapshot (None until first valid sample).
     pub host_metrics: Option<HostMetrics>,
     /// Aggregate metrics across all sessions (recomputed each tick).
@@ -306,13 +311,15 @@ impl App {
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         let summaries = load_summary_cache();
-        let mut collector =
-            MultiCollector::with_hidden_and_claude_config_dirs(hidden_agents, claude_config_dirs);
-        collector.set_mcp_suppress(true);
+        let collection = CollectionState::new(hidden_agents, claude_config_dirs);
         Self {
             sessions: Vec::new(),
             selected: 0,
             stats_scope: StatsScope::default(),
+            agent_scope: StatsScope::AllLive,
+            agent_history: Default::default(),
+            save_agent_scope: crate::config::save_agent_scope,
+            show_agents: panels.agents,
             live_token_history: VecDeque::with_capacity(GRAPH_HISTORY_LEN),
             save_stats_scope: crate::config::save_stats_scope,
             should_quit: false,
@@ -321,8 +328,8 @@ impl App {
             cache_read_rates: VecDeque::with_capacity(GRAPH_HISTORY_LEN),
             global_token_samples: VecDeque::new(),
             session_token_rates: HashMap::new(),
-            rate_limit_counter: 5,
-            collector,
+            collection: Some(collection),
+            startup: None,
             summaries,
             pending_summaries: HashSet::new(),
             summary_retries: HashMap::new(),
@@ -357,7 +364,6 @@ impl App {
             show_timeline: false,
             timeline_scroll: 0,
             show_file_audit: false,
-            host_sampler: HostSampler::new(),
             host_metrics: None,
             agent_aggregate: AgentAggregate::default(),
             help_open: false,
@@ -388,6 +394,7 @@ impl App {
 
     pub fn toggle_panel(&mut self, panel: u8) {
         match panel {
+            0 => self.show_agents = !self.show_agents,
             1 => self.show_context = !self.show_context,
             2 => self.show_quota = !self.show_quota,
             3 => self.show_tokens = !self.show_tokens,
@@ -419,6 +426,7 @@ impl App {
 
     fn persist_panel_visibility(&mut self) {
         let panels = crate::config::PanelVisibility {
+            agents: self.show_agents,
             context: self.show_context,
             token_rate: self.show_token_rate,
             quota: self.show_quota,
@@ -446,7 +454,7 @@ impl App {
     }
 
     pub fn config_item_count(&self) -> usize {
-        11 // theme + 9 panel toggles + cache chart
+        12 // theme + 10 panel toggles + cache chart
     }
 
     pub fn config_select_next(&mut self) {
@@ -478,6 +486,7 @@ impl App {
                 self.toggle_cache_read_rate();
                 return;
             }
+            11 => self.show_agents = !self.show_agents,
             _ => return,
         }
         self.persist_panel_visibility();
@@ -486,7 +495,7 @@ impl App {
 
     pub fn narrow_tab_visible(&self, tab: NarrowTab) -> bool {
         match tab {
-            NarrowTab::Work => self.show_sessions || self.show_projects,
+            NarrowTab::Work => self.show_sessions || self.show_projects || self.show_agents,
             NarrowTab::Usage => {
                 self.show_token_rate
                     || self.show_context
@@ -557,6 +566,7 @@ impl App {
             NarrowSection::Projects => self.show_projects,
             NarrowSection::Context => self.show_context,
             NarrowSection::TokenRate => self.show_token_rate,
+            NarrowSection::Agents => self.show_agents,
             NarrowSection::Quota => self.show_quota,
             NarrowSection::Tokens => self.show_tokens,
             NarrowSection::Models => self.show_models,
@@ -567,7 +577,11 @@ impl App {
 
     pub fn visible_narrow_sections(&self, tab: NarrowTab) -> Vec<NarrowSection> {
         let sections: &[NarrowSection] = match tab {
-            NarrowTab::Work => &[NarrowSection::Sessions, NarrowSection::Projects],
+            NarrowTab::Work => &[
+                NarrowSection::Agents,
+                NarrowSection::Sessions,
+                NarrowSection::Projects,
+            ],
             NarrowTab::Usage => &[
                 NarrowSection::TokenRate,
                 NarrowSection::Context,
@@ -670,7 +684,9 @@ impl App {
     /// by [`App::drain_and_retry_summaries`].
     pub fn tick(&mut self) {
         self.tick_no_summaries();
-        self.drain_and_retry_summaries();
+        if !self.initializing() {
+            self.drain_and_retry_summaries();
+        }
     }
 
     /// Refresh all monitored data WITHOUT spawning background summary jobs.
@@ -680,31 +696,126 @@ impl App {
     /// consumers (e.g. the web snapshot API) call this variant so they never
     /// spawn subprocesses or consume the user's Claude quota.
     pub fn tick_no_summaries(&mut self) {
-        self.collector.set_mcp_suppress(self.mcp_suppress_sessions);
-        self.sessions = self.collector.collect();
-        self.orphan_ports = self.collector.orphan_ports.clone();
-        self.mcp_servers = self.collector.mcp_servers.clone();
-        self.host_metrics = self.host_sampler.sample();
-        self.agent_aggregate = AgentAggregate::from_sessions(&self.sessions);
-        if self.selected >= self.sessions.len() && !self.sessions.is_empty() {
-            self.selected = self.sessions.len() - 1;
+        // Startup refresh requests coalesce into the next scheduled synchronous tick.
+        let Some(collection) = self.collection.as_mut() else {
+            return;
+        };
+        collection
+            .collector
+            .set_mcp_suppress(self.mcp_suppress_sessions);
+        let result = collection.collect();
+        self.apply_collected(result);
+    }
+
+    pub(crate) fn initializing(&self) -> bool {
+        self.startup.is_some()
+    }
+
+    pub(crate) fn start_initial_collection(&mut self) -> std::io::Result<()> {
+        if self.initializing() {
+            return Ok(());
         }
+        let mut state = self
+            .collection
+            .take()
+            .expect("collection state owned by App");
+        state.collector.set_mcp_suppress(self.mcp_suppress_sessions);
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("abtop-startup".into())
+            .spawn(move || {
+                let result = state.collect_progressively(|session| {
+                    let _ = tx.send(StartupMessage::Session(Box::new(session.clone())));
+                });
+                let _ = tx.send(StartupMessage::Complete(Box::new((state, result))));
+            })?;
+        self.startup = Some(rx);
+        Ok(())
+    }
+
+    /// Return true once the warmed collectors have returned to the UI thread.
+    pub(crate) fn poll_initial_collection(&mut self) -> std::io::Result<bool> {
+        let Some(rx) = &self.startup else {
+            return Ok(false);
+        };
+        let mut updates = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(StartupMessage::Session(session)) => updates.push(*session),
+                Ok(StartupMessage::Complete(result)) => {
+                    // The final snapshot supersedes all queued provisional updates.
+                    let (mut state, result) = *result;
+                    state.collector.set_mcp_suppress(self.mcp_suppress_sessions);
+                    self.collection = Some(state);
+                    self.startup = None;
+                    self.apply_collected(result);
+                    return Ok(true);
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err(std::io::Error::other("initial collection worker failed"));
+                }
+            }
+        }
+        if !updates.is_empty() {
+            let selected = self
+                .sessions
+                .get(self.selected)
+                .map(|s| (s.agent_cli, s.session_id.clone()));
+            let mut merged = std::mem::take(&mut self.sessions);
+            let mut indices: HashMap<_, _> = merged
+                .iter()
+                .enumerate()
+                .map(|(index, s)| ((s.agent_cli, s.session_id.clone()), index))
+                .collect();
+            for session in updates {
+                let key = (session.agent_cli, session.session_id.clone());
+                if let Some(&index) = indices.get(&key) {
+                    merged[index] = session;
+                } else {
+                    indices.insert(key, merged.len());
+                    merged.push(session);
+                }
+            }
+            self.replace_sessions(merged, selected);
+        }
+        Ok(false)
+    }
+
+    fn replace_sessions(
+        &mut self,
+        mut sessions: Vec<AgentSession>,
+        selected: Option<(&'static str, String)>,
+    ) {
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.started_at));
+        self.selected = selected
+            .and_then(|(provider, id)| {
+                sessions
+                    .iter()
+                    .position(|s| s.agent_cli == provider && s.session_id == id)
+            })
+            .unwrap_or(self.selected)
+            .min(sessions.len().saturating_sub(1));
+        self.sessions = sessions;
+        self.kill_confirm = None;
         self.clamp_selection_to_visible();
+        self.agent_aggregate = AgentAggregate::from_sessions(&self.sessions);
+    }
 
-        self.update_session_token_rates(Instant::now());
-
-        // Poll rate limits: first tick immediately, then every 5 ticks ≈ 10s
-        if self.rate_limits.is_empty() || self.rate_limit_counter >= 5 {
-            self.rate_limit_counter = 0;
-            let extra_dirs = self.collector.all_config_dirs();
-            self.rate_limits = read_rate_limits(&extra_dirs);
-            // Merge live rate limits from agent collectors (e.g. Codex JSONL parsing)
-            self.rate_limits.extend(self.collector.agent_rate_limits());
-        } else {
-            self.rate_limit_counter += 1;
-        }
-
+    fn apply_collected(&mut self, result: Collected) {
+        let selected = self
+            .sessions
+            .get(self.selected)
+            .map(|s| (s.agent_cli, s.session_id.clone()));
+        self.replace_sessions(result.sessions, selected);
+        self.orphan_ports = result.orphan_ports;
+        self.mcp_servers = result.mcp_servers;
+        self.host_metrics = result.host_metrics;
+        self.rate_limits = result.rate_limits;
+        let now = Instant::now();
+        self.update_session_token_rates(now);
         promote_waiting_to_rate_limited(&mut self.sessions, &self.rate_limits);
+        self.record_agents(now);
     }
 
     pub(crate) fn update_session_token_rates(&mut self, now: Instant) {
@@ -940,6 +1051,9 @@ impl App {
     }
 
     pub fn kill_selected(&mut self) {
+        if self.initializing() {
+            return;
+        }
         if self.sessions.is_empty() {
             return;
         }
@@ -988,6 +1102,9 @@ impl App {
     /// Does a fresh port scan and validates PID identity + port ownership
     /// immediately before sending any signals to avoid PID reuse / stale cache issues.
     pub fn kill_orphan_ports(&mut self) {
+        if self.initializing() {
+            return;
+        }
         use crate::collector::process::get_listening_ports;
 
         // Fresh port scan right now — don't rely on cached data
@@ -1273,6 +1390,7 @@ mod tests {
             token_history: vec![],
             context_history: vec![],
             context_window: 0,
+            subagent_counts: Default::default(),
             subagents: vec![],
             mem_file_count: 0,
             mem_line_count: 0,
@@ -1288,6 +1406,401 @@ mod tests {
             git_added: 0,
             git_modified: 0,
         }
+    }
+
+    struct ControlledCollector {
+        session: AgentSession,
+        gate: Option<mpsc::Receiver<()>>,
+        entered: mpsc::Sender<bool>,
+        calls: u64,
+    }
+
+    impl crate::collector::AgentCollector for ControlledCollector {
+        fn collect(&mut self, shared: &crate::collector::SharedProcessData) -> Vec<AgentSession> {
+            self.entered.send(shared.mcp_suppress).unwrap();
+            if let Some(gate) = self.gate.take() {
+                gate.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+            self.calls += 1;
+            self.session.total_input_tokens = 100 + self.calls;
+            vec![self.session.clone()]
+        }
+    }
+
+    impl crate::collector::StartupCollector for ControlledCollector {}
+
+    fn controlled_app() -> (App, Vec<mpsc::Sender<()>>, Vec<mpsc::Receiver<bool>>) {
+        let mut app = App::new_with_config(Theme::default(), &[], Default::default());
+        let mut collectors: Vec<Box<dyn crate::collector::StartupCollector + Send>> = Vec::new();
+        let mut gates = Vec::new();
+        let mut entered = Vec::new();
+        for (index, cli) in ["claude", "codex", "opencode"].into_iter().enumerate() {
+            let (tx, rx) = mpsc::channel();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let mut session = waiting_session(cli);
+            session.session_id = cli.into();
+            session.started_at = index as u64;
+            session.project_name = cli.into();
+            session.cwd = "/nonexistent-abtop-startup-test".into();
+            session.status = SessionStatus::Thinking;
+            collectors.push(Box::new(ControlledCollector {
+                session,
+                gate: Some(rx),
+                entered: entered_tx,
+                calls: 0,
+            }));
+            gates.push(tx);
+            entered.push(entered_rx);
+        }
+        app.collection.as_mut().unwrap().collector =
+            crate::collector::MultiCollector::controlled(collectors);
+        (app, gates, entered)
+    }
+
+    #[test]
+    fn startup_renders_progressively_and_returns_warmed_collection_once() {
+        let (mut app, gates, entered) = controlled_app();
+        app.start_initial_collection().unwrap();
+        assert!(entered[0].recv_timeout(Duration::from_secs(5)).unwrap());
+        // The same renderer used by the TUI can draw while provider one is blocked.
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
+        assert!(app.sessions.is_empty());
+        assert!(app.initializing());
+        assert!(app.token_rates.is_empty());
+        assert!(app.agent_bars(1, Instant::now())[0].is_none());
+        assert!(app.pending_summaries.is_empty());
+        gates[0].send(()).unwrap();
+        assert!(entered[1].recv_timeout(Duration::from_secs(5)).unwrap());
+        assert!(!app.poll_initial_collection().unwrap());
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.sessions[app.selected].agent_cli, "claude");
+        app.kill_selected();
+        app.kill_orphan_ports();
+        assert!(app.kill_confirm.is_none());
+        // Simulate a stale pending confirmation; every new row set clears it.
+        app.kill_confirm = Some((0, Instant::now()));
+        app.tick();
+        app.tick_no_summaries();
+        app.tick();
+        assert!(app.token_rates.is_empty());
+        assert!(app.pending_summaries.is_empty());
+        app.toggle_mcp_session_suppression();
+        gates[1].send(()).unwrap();
+        assert!(entered[2].recv_timeout(Duration::from_secs(5)).unwrap());
+        assert!(!app.poll_initial_collection().unwrap());
+        assert_eq!(app.sessions.len(), 2);
+        assert_eq!(app.sessions[app.selected].agent_cli, "claude");
+        assert_eq!(app.selected, 1);
+        assert!(app.kill_confirm.is_none());
+        app.select_session(0);
+        gates[2].send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.poll_initial_collection().unwrap() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!app.initializing());
+        assert_eq!(app.sessions.len(), 3);
+        assert_eq!(app.sessions[app.selected].agent_cli, "codex");
+        assert!(!app.collection.as_ref().unwrap().collector.mcp_suppress);
+        assert_eq!(app.token_rates.len(), 1);
+        assert_eq!(app.cache_read_rates.len(), 1);
+        assert_eq!(app.live_token_history.len(), 1);
+        assert_eq!(app.global_token_rates(Instant::now()).total(), 0);
+        assert_eq!(app.session_token_rates.len(), 3);
+        assert!(app.agent_bars(1, Instant::now())[0].is_some());
+        assert!(!app.poll_initial_collection().unwrap());
+        assert_eq!(app.token_rates.len(), 1);
+        // Existing collectors, rather than new instances, handle the next sync tick.
+        app.tick_no_summaries();
+        for receiver in entered {
+            assert!(!receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+        assert!(app.sessions.iter().all(|s| s.total_input_tokens == 102));
+        assert_eq!(app.global_token_rates(Instant::now()).input, 3);
+        assert_eq!(app.token_rates.len(), 2);
+    }
+
+    #[test]
+    fn quitting_drops_startup_receiver_without_waiting_for_collectors() {
+        let (mut app, gates, entered) = controlled_app();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            app.start_initial_collection().unwrap();
+            entered[0].recv_timeout(Duration::from_secs(5)).unwrap();
+            app.quit();
+            assert!(app.should_quit);
+            drop(app);
+            dropped_tx.send(()).unwrap();
+            // Keep the test's provider notification receivers alive until released.
+            for receiver in entered.into_iter().skip(1) {
+                receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        });
+        dropped_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // No provider can have finished before the App was dropped.
+        for gate in gates {
+            gate.send(()).unwrap();
+        }
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn startup_worker_failure_is_reported_as_io_error() {
+        struct FailingCollector;
+        impl crate::collector::AgentCollector for FailingCollector {
+            fn collect(&mut self, _: &crate::collector::SharedProcessData) -> Vec<AgentSession> {
+                panic!("controlled startup failure");
+            }
+        }
+        impl crate::collector::StartupCollector for FailingCollector {}
+        let mut app = App::new_with_config(Theme::default(), &[], Default::default());
+        app.collection.as_mut().unwrap().collector =
+            crate::collector::MultiCollector::controlled(vec![Box::new(FailingCollector)]);
+        app.start_initial_collection().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match app.poll_initial_collection() {
+                Err(error) => {
+                    assert_eq!(error.to_string(), "initial collection worker failed");
+                    break;
+                }
+                Ok(_) => {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+    }
+
+    struct SessionBySessionCollector {
+        sessions: Vec<AgentSession>,
+        first_published: mpsc::Sender<()>,
+        continue_scan: Option<mpsc::Receiver<()>>,
+    }
+
+    impl crate::collector::AgentCollector for SessionBySessionCollector {
+        fn collect(&mut self, _: &crate::collector::SharedProcessData) -> Vec<AgentSession> {
+            assert!(
+                self.continue_scan.is_none(),
+                "startup must use its completion observer"
+            );
+            self.sessions.clone()
+        }
+    }
+
+    impl crate::collector::StartupCollector for SessionBySessionCollector {
+        fn collect_startup(
+            &mut self,
+            _: &crate::collector::SharedProcessData,
+            completed: &mut dyn FnMut(&mut AgentSession),
+        ) -> Vec<AgentSession> {
+            for (index, session) in self.sessions.iter_mut().enumerate() {
+                completed(session);
+                if index == 0 {
+                    self.first_published.send(()).unwrap();
+                    self.continue_scan
+                        .take()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap();
+                }
+            }
+            self.sessions.clone()
+        }
+    }
+
+    #[test]
+    fn startup_displays_completed_session_before_same_provider_finishes() {
+        let mut app = App::new_with_config(Theme::default(), &[], Default::default());
+        let mut first = waiting_session("claude");
+        first.session_id = "first".into();
+        first.project_name = "early-project".into();
+        first.cwd = "/nonexistent-abtop-startup-test".into();
+        first.status = SessionStatus::Thinking;
+        first.total_input_tokens = 120;
+        crate::model::ModelUsage::add(&mut first.model_usage, "test-model", 120);
+        let mut second = first.clone();
+        second.session_id = "second".into();
+        second.project_name = "later-project".into();
+        second.started_at = 1;
+        let (published_tx, published_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        app.collection.as_mut().unwrap().collector = crate::collector::MultiCollector::controlled(
+            vec![Box::new(SessionBySessionCollector {
+                sessions: vec![first, second],
+                first_published: published_tx,
+                continue_scan: Some(continue_rx),
+            })],
+        );
+        app.start_initial_collection().unwrap();
+        published_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!app.poll_initial_collection().unwrap());
+        assert!(app.initializing());
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.usage_stats(Instant::now()).total_tokens(), 120);
+        assert_eq!(app.global_agent_counts().claude.working, 1);
+        assert!(app.token_rates.is_empty());
+        assert!(app.agent_bars(1, Instant::now())[0].is_none());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, &app)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("early-project"));
+        assert!(rendered.contains("test-model"));
+        assert!(!rendered.contains("later-project"));
+        continue_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.poll_initial_collection().unwrap() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(app.sessions.len(), 2);
+        assert_eq!(app.sessions[app.selected].session_id, "first");
+        app.stats_scope = StatsScope::AllLive;
+        assert_eq!(app.usage_stats(Instant::now()).total_tokens(), 240);
+        assert_eq!(app.token_rates.len(), 1);
+        assert_eq!(app.global_token_rates(Instant::now()).total(), 0);
+        app.tick_no_summaries();
+        assert_eq!(app.sessions.len(), 2);
+        assert_eq!(app.token_rates.len(), 2);
+        assert_eq!(app.global_token_rates(Instant::now()).total(), 0);
+    }
+
+    #[test]
+    fn startup_upserts_sessions_and_final_snapshot_removes_provisional_rows() {
+        let mut app = App::new_with_config(Theme::default(), &[], Default::default());
+        let state = app.collection.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        app.startup = Some(rx);
+        let mut session = waiting_session("claude");
+        session.session_id = "shared-id".into();
+        session.project_name = "keep".into();
+        session.total_input_tokens = 10;
+        tx.send(StartupMessage::Session(Box::new(session.clone())))
+            .unwrap();
+        session.total_input_tokens = 20;
+        tx.send(StartupMessage::Session(Box::new(session.clone())))
+            .unwrap();
+        assert!(!app.poll_initial_collection().unwrap());
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.usage_stats(Instant::now()).total_tokens(), 20);
+        app.kill_confirm = Some((0, Instant::now()));
+        app.filter_text = "keep".into();
+        let mut other_provider = session.clone();
+        other_provider.agent_cli = "codex";
+        other_provider.project_name = "filtered".into();
+        other_provider.started_at = 2;
+        tx.send(StartupMessage::Session(Box::new(other_provider)))
+            .unwrap();
+        session.total_input_tokens = 30;
+        tx.send(StartupMessage::Session(Box::new(session.clone())))
+            .unwrap();
+        assert!(!app.poll_initial_collection().unwrap());
+        assert_eq!(
+            app.sessions.len(),
+            2,
+            "provider is part of session identity"
+        );
+        assert_eq!(app.visible_indices(), vec![1]);
+        assert_eq!(app.selected, 1);
+        assert!(app.kill_confirm.is_none());
+        assert_eq!(app.usage_stats(Instant::now()).total_tokens(), 30);
+        assert!(app.token_rates.is_empty());
+        // A queued session update and a previously displayed row both yield to final data.
+        let mut removed = session.clone();
+        removed.session_id = "removed".into();
+        tx.send(StartupMessage::Session(Box::new(removed))).unwrap();
+        tx.send(StartupMessage::Complete(Box::new((
+            state,
+            Collected {
+                sessions: vec![session],
+                orphan_ports: vec![],
+                mcp_servers: vec![],
+                host_metrics: None,
+                rate_limits: vec![],
+            },
+        ))))
+        .unwrap();
+        assert!(app.poll_initial_collection().unwrap());
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.sessions[app.selected].session_id, "shared-id");
+        assert_eq!(app.usage_stats(Instant::now()).total_tokens(), 30);
+        assert_eq!(app.token_rates.len(), 1);
+        assert_eq!(app.global_token_rates(Instant::now()).total(), 0);
+    }
+
+    #[test]
+    fn default_startup_waits_for_batch_finalization_and_enriches_before_publication() {
+        struct BatchCollector {
+            started: mpsc::Sender<()>,
+            finish: mpsc::Receiver<()>,
+            sessions: Vec<AgentSession>,
+        }
+        impl crate::collector::AgentCollector for BatchCollector {
+            fn collect(&mut self, _: &crate::collector::SharedProcessData) -> Vec<AgentSession> {
+                self.started.send(()).unwrap();
+                self.finish.recv_timeout(Duration::from_secs(10)).unwrap();
+                for session in &mut self.sessions {
+                    session.subagent_counts.working = 2;
+                }
+                self.sessions.clone()
+            }
+        }
+        impl crate::collector::StartupCollector for BatchCollector {}
+        let project = tempfile::tempdir().unwrap();
+        let mut first = waiting_session("codex");
+        first.session_id = "first".into();
+        first.cwd = project.path().to_string_lossy().into_owned();
+        first.git_added = 999;
+        let mut second = first.clone();
+        second.session_id = "second".into();
+        let mut done = first.clone();
+        done.session_id = "done".into();
+        done.status = SessionStatus::Done;
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let (published_tx, published_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut collector =
+                crate::collector::MultiCollector::controlled(vec![Box::new(BatchCollector {
+                    started: started_tx,
+                    finish: finish_rx,
+                    sessions: vec![first, second, done],
+                })]);
+            collector.collect_progressively(|session| {
+                published_tx.send(session.clone()).unwrap();
+            })
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            published_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        finish_tx.send(()).unwrap();
+        for id in ["first", "second"] {
+            let session = published_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(session.session_id, id);
+            assert_eq!(session.subagent_counts.working, 2);
+            assert_eq!(session.git_added, 0);
+        }
+        let sessions = worker.join().unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions
+            .iter()
+            .all(|s| s.git_added == 0 && s.subagent_counts.working == 2));
+        assert!(
+            published_rx.try_recv().is_err(),
+            "Done sessions are not published"
+        );
     }
 
     fn rate_limit(source: &str, pct: f64) -> RateLimitInfo {

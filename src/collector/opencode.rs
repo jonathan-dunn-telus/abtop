@@ -58,6 +58,14 @@ impl OpenCodeCollector {
     }
 
     fn collect_sessions(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
+        self.collect_sessions_with_observer(shared, &mut |_| {})
+    }
+
+    fn collect_sessions_with_observer(
+        &mut self,
+        shared: &super::SharedProcessData,
+        completed: &mut dyn FnMut(&mut AgentSession),
+    ) -> Vec<AgentSession> {
         // Security: skip if db_path is a symlink (fail-closed)
         if is_symlink(&self.db_path) || !self.db_path.exists() {
             self.cached_db_sessions.clear();
@@ -193,7 +201,7 @@ impl OpenCodeCollector {
                 0.0
             };
 
-            sessions.push(AgentSession {
+            let mut session = AgentSession {
                 agent_cli: "opencode",
                 launch_surface: LaunchSurface::Cli,
                 pid: matched_pid,
@@ -221,6 +229,7 @@ impl OpenCodeCollector {
                 context_history: vec![],
                 compaction_count: 0,
                 context_window,
+                subagent_counts: Default::default(),
                 subagents: vec![],
                 mem_file_count: 0,
                 mem_line_count: 0,
@@ -235,7 +244,9 @@ impl OpenCodeCollector {
                 config_root: super::abbrev_path(
                     self.db_path.parent().unwrap_or(std::path::Path::new(".")),
                 ),
-            });
+            };
+            completed(&mut session);
+            sessions.push(session);
         }
 
         sessions.sort_by_key(|s| std::cmp::Reverse(s.started_at));
@@ -452,6 +463,16 @@ LIMIT {};"#,
 impl Default for OpenCodeCollector {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl super::StartupCollector for OpenCodeCollector {
+    fn collect_startup(
+        &mut self,
+        shared: &super::SharedProcessData,
+        completed: &mut dyn FnMut(&mut AgentSession),
+    ) -> Vec<AgentSession> {
+        self.collect_sessions_with_observer(shared, completed)
     }
 }
 
@@ -792,6 +813,78 @@ INSERT INTO message VALUES ('6', 'main', 6,
             OpenCodeCollector::match_pid_to_session(&pid_commands, "/home/u/proj-a"),
             Some(u32::MAX)
         );
+    }
+
+    #[test]
+    fn startup_publishes_only_complete_pid_matched_sessions() {
+        use super::super::StartupCollector;
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let mut collector = OpenCodeCollector::new();
+        collector.db_path = db.path().to_path_buf();
+        collector.sqlite3_available = Some(true);
+        for (id, directory) in [
+            ("new", "/home/u/proj-a"),
+            ("old", "/home/u/proj-a"),
+            ("unmatched", "/home/u/proj-b"),
+        ] {
+            collector.cached_db_sessions.push(DbSession {
+                id: id.into(),
+                title: "Session".into(),
+                directory: directory.into(),
+                version: "1".into(),
+                time_created: 1,
+                time_updated: 1,
+                project_name: "Project".into(),
+                turn_count: 3,
+                total_input: 10,
+                total_output: 20,
+                total_cache_read: 30,
+                total_cache_write: 40,
+                model_usage: vec![ModelUsage {
+                    model: "provider/model".into(),
+                    total_tokens: 100,
+                }],
+                model: "model".into(),
+                provider: "provider".into(),
+            });
+        }
+        let shared = super::super::SharedProcessData {
+            process_info: HashMap::from([(
+                u32::MAX,
+                process::ProcInfo {
+                    pid: u32::MAX,
+                    ppid: 0,
+                    rss_kb: 1024,
+                    cpu_pct: 0.0,
+                    command: "opencode run --cwd=/home/u/proj-a".into(),
+                },
+            )]),
+            children_map: HashMap::new(),
+            ports: HashMap::new(),
+            slow_tick: false,
+            mcp_server_pids: HashSet::new(),
+            mcp_owned_rollouts: HashSet::new(),
+            mcp_suppress: true,
+            desktop_rollout_fd_map: HashMap::new(),
+        };
+        let mut published = Vec::new();
+        let sessions = collector.collect_startup(&shared, &mut |session| {
+            assert_eq!(session.session_id, "new");
+            assert_eq!(session.pid, u32::MAX);
+            assert_eq!(session.total_input_tokens, 10);
+            assert_eq!(session.total_output_tokens, 20);
+            assert_eq!(session.total_cache_read, 30);
+            assert_eq!(session.total_cache_create, 40);
+            assert_eq!(session.model_usage[0].total_tokens, 100);
+            assert_eq!(session.turn_count, 3);
+            // Enrichment must change the same object retained for final publication.
+            session.git_added = 7;
+            published.push(session.clone());
+        });
+        assert_eq!(published.len(), 1);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].git_added, 7);
+        assert_eq!(sessions[0].model_usage, published[0].model_usage);
     }
 
     #[test]

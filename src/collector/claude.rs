@@ -1,7 +1,7 @@
 use super::process::{self, ProcInfo};
 use crate::model::{
-    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface, ModelUsage,
-    SessionFile, SessionStatus, SubAgent, MAX_CHAT_MESSAGES, MAX_FILE_ACCESSES,
+    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface,
+    ModelUsage, SessionFile, SessionStatus, SubAgent, MAX_CHAT_MESSAGES, MAX_FILE_ACCESSES,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -66,6 +66,7 @@ pub struct ClaudeCollector {
     /// Per-session subagent usage, keyed by subagents directory then transcript path.
     /// Keep only counters and offsets, not each workflow agent's full transcript state.
     subagent_cache: HashMap<PathBuf, HashMap<PathBuf, SubagentUsage>>,
+    activity: HashMap<PathBuf, super::activity::ClaudeActivity>,
 }
 
 impl ClaudeCollector {
@@ -80,6 +81,7 @@ impl ClaudeCollector {
             configured_config_dirs,
             transcript_cache: HashMap::new(),
             subagent_cache: HashMap::new(),
+            activity: HashMap::new(),
         }
     }
 
@@ -129,6 +131,14 @@ impl ClaudeCollector {
     }
 
     fn collect_sessions(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
+        self.collect_sessions_with_observer(shared, &mut |_| {})
+    }
+
+    fn collect_sessions_with_observer(
+        &mut self,
+        shared: &super::SharedProcessData,
+        completed: &mut dyn FnMut(&mut AgentSession),
+    ) -> Vec<AgentSession> {
         // Refresh config dirs on slow ticks only (every ~10s) or on first run.
         // Scanning /proc/<pid>/environ for every Claude process is expensive
         // to do every 2s; config dirs change rarely.
@@ -167,12 +177,13 @@ impl ClaudeCollector {
 
         let discovery_ctx = build_discovery_context(&session_paths, &shared.process_info, self_pid);
 
-        let mut sessions = self.load_session_paths(
+        let mut sessions = self.load_session_paths_with_observer(
             &session_paths,
             &shared.process_info,
             &shared.children_map,
             &shared.ports,
             &discovery_ctx,
+            completed,
         );
 
         self.evict_stale_cache(&sessions);
@@ -190,6 +201,11 @@ impl ClaudeCollector {
             sessions.iter().map(|s| s.session_id.as_str()).collect();
         self.transcript_cache
             .retain(|sid, _| active_ids.contains(sid.as_str()));
+        self.activity.retain(|path, _| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|id| active_ids.contains(id))
+        });
         self.subagent_cache.retain(|dir, _| {
             dir.parent()
                 .and_then(Path::file_name)
@@ -198,6 +214,7 @@ impl ClaudeCollector {
         });
     }
 
+    #[cfg(test)]
     fn load_session_paths(
         &mut self,
         session_paths: &[(PathBuf, ConfigDir)],
@@ -206,13 +223,37 @@ impl ClaudeCollector {
         ports: &HashMap<u32, Vec<u16>>,
         ctx: &DiscoveryContext,
     ) -> Vec<AgentSession> {
+        self.load_session_paths_with_observer(
+            session_paths,
+            process_info,
+            children_map,
+            ports,
+            ctx,
+            &mut |_| {},
+        )
+    }
+
+    fn load_session_paths_with_observer(
+        &mut self,
+        session_paths: &[(PathBuf, ConfigDir)],
+        process_info: &HashMap<u32, ProcInfo>,
+        children_map: &HashMap<u32, Vec<u32>>,
+        ports: &HashMap<u32, Vec<u16>>,
+        ctx: &DiscoveryContext,
+        completed: &mut dyn FnMut(&mut AgentSession),
+    ) -> Vec<AgentSession> {
         let mut sessions = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
+        let mut seen_paths = std::collections::HashSet::new();
         for (path, config) in session_paths {
-            if let Some(session) =
+            if !seen_paths.insert(path) {
+                continue;
+            }
+            if let Some(mut session) =
                 self.load_session(path, config, process_info, children_map, ports, ctx)
             {
                 if seen_ids.insert(session.session_id.clone()) {
+                    completed(&mut session);
                     sessions.push(session);
                 }
             }
@@ -429,7 +470,10 @@ impl ClaudeCollector {
             // Detect file replacement: if the file identity changed, reparse from scratch.
             let identity_changed = cached
                 .as_ref()
-                .map(|c| c.file_identity != file_identity(tp))
+                .map(|c| {
+                    c.file_identity != file_identity(tp)
+                        || fs::metadata(tp).is_ok_and(|m| m.len() < c.new_offset)
+                })
                 .unwrap_or(false);
             let from_offset = if identity_changed {
                 0
@@ -445,11 +489,16 @@ impl ClaudeCollector {
             } else {
                 (0, 0)
             };
+            let activity = self.activity.entry(tp.clone()).or_default();
+            if from_offset == 0 {
+                activity.reset_parent();
+            }
             let delta = parse_transcript_with_previous(
                 tp,
                 from_offset,
                 initial_context_tokens,
                 initial_cache_read,
+                Some(activity),
             );
 
             if let Some(mut prev) = cached {
@@ -477,9 +526,8 @@ impl ClaudeCollector {
                     }
                     prev.compaction_count += delta.compaction_count;
                     prev.turn_count += delta.turn_count;
-                    // Always update current_task from delta — empty means
-                    // latest assistant turn had no tool_use (task cleared)
-                    if delta.turn_count > 0 {
+                    // Assistant turns and completed manual compaction can clear tasks.
+                    if delta.saw_task_state {
                         prev.current_task = delta.current_task;
                     }
                     if !delta.version.is_empty() {
@@ -559,6 +607,7 @@ impl ClaudeCollector {
             last_assistant_ts_ms: 0,
             last_user_ts_ms: 0,
             saw_turn: false,
+            saw_task_state: false,
             file_accesses: Vec::new(),
         };
         let cached = self
@@ -597,14 +646,20 @@ impl ClaudeCollector {
             .and_then(|tp| tp.parent().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| config.projects_dir.join(encode_cwd_path(&sf.cwd)));
 
-        // Collect subagents before deriving the parent status so asynchronous
-        // Agent work keeps the parent active after its tool_result has returned.
+        // Collect child lifecycle state independently of the main agent's work.
         let subagents_dir = project_dir.join(&sf.session_id).join("subagents");
-        let (subagents, subagent_totals) = Self::collect_subagents(
+        let paths = child_inventory(&subagents_dir);
+        // Child evidence must live as long as its usage cursor, even before
+        // the parent transcript exists or while it is temporarily absent.
+        let activity_path = project_dir.join(format!("{}.jsonl", sf.session_id));
+        let activity = self.activity.entry(activity_path).or_default();
+        let (mut subagents, subagent_totals) = Self::collect_subagents_from_inventory(
             &subagents_dir,
             self.subagent_cache
                 .entry(subagents_dir.clone())
                 .or_default(),
+            &paths,
+            activity,
         );
         let [sub_input, sub_output, sub_cache_read, sub_cache_write] = subagent_totals;
         let mut model_usage = cached.model_usage.clone();
@@ -613,7 +668,21 @@ impl ClaudeCollector {
                 ModelUsage::merge(&mut model_usage, &usage.model_usage);
             }
         }
-        let has_working_subagent = subagents.iter().any(|agent| agent.status == "working");
+        let subagent_counts = if transcript_path.is_some() {
+            let counts = activity.reconcile(&subagents_dir, &paths);
+            for agent in &mut subagents {
+                agent.status = activity
+                    .states
+                    .get(&agent.activity_key)
+                    .copied()
+                    .unwrap_or_default()
+                    .label()
+                    .to_owned();
+            }
+            counts
+        } else {
+            Default::default()
+        };
 
         // Status is best-effort. Signals we trust:
         //   1. Active descendant CPU → tool is running.
@@ -621,9 +690,7 @@ impl ClaudeCollector {
         //      tool_use unanswered. Catches I/O-bound tools (Read, Edit)
         //      whose descendants stay under 5% CPU, so the CPU heuristic
         //      alone would flicker to Waiting while the tool runs.
-        //   3. A working subagent → an async Agent call is still running even
-        //      though its tool_result has already returned to the parent.
-        //   4. last_user_ts_ms > 0 → trailing transcript line is a real
+        //   3. last_user_ts_ms > 0 → trailing transcript line is a real
         //      user prompt with no assistant reply yet, so the model is
         //      generating. tool_result wrappers are skipped at the
         //      parser level so this only fires for actual prompts.
@@ -643,7 +710,7 @@ impl ClaudeCollector {
             // between CPU samples, so has_active_descendant alone misses them.
             let pending_tool = !cached.current_task.is_empty();
             let model_generating = cached.last_user_ts_ms > 0;
-            if has_active_descendant || pending_tool || has_working_subagent {
+            if has_active_descendant || pending_tool {
                 SessionStatus::Executing
             } else if model_generating {
                 SessionStatus::Thinking
@@ -653,7 +720,11 @@ impl ClaudeCollector {
         };
 
         let configured_model = read_configured_model(&sf.cwd);
-        let context_window = crate::collector::context_window_for_model(&model, &configured_model, max_context_tokens);
+        let context_window = crate::collector::context_window_for_model(
+            &model,
+            &configured_model,
+            max_context_tokens,
+        );
         let context_percent = if context_window > 0 {
             (last_context_tokens as f64 / context_window as f64) * 100.0
         } else {
@@ -735,6 +806,7 @@ impl ClaudeCollector {
             compaction_count,
             context_window,
             subagents,
+            subagent_counts,
             mem_file_count,
             mem_line_count,
             children,
@@ -749,96 +821,105 @@ impl ClaudeCollector {
         })
     }
 
+    #[cfg(test)]
     fn collect_subagents(
-        subagents_dir: &Path,
+        directory: &Path,
         cache: &mut HashMap<PathBuf, SubagentUsage>,
     ) -> (Vec<SubAgent>, [u64; 4]) {
+        let paths = child_inventory(directory);
+        Self::collect_subagents_from_inventory(directory, cache, &paths, &mut Default::default())
+    }
+
+    fn collect_subagents_from_inventory(
+        subagents_dir: &Path,
+        cache: &mut HashMap<PathBuf, SubagentUsage>,
+        paths: &[PathBuf],
+        activity: &mut super::activity::ClaudeActivity,
+    ) -> (Vec<SubAgent>, [u64; 4]) {
         let mut subagents = Vec::new();
-        let mut directories = vec![subagents_dir.to_path_buf()];
-        while let Some(directory) = directories.pop() {
-            // Workflows write under subagents/workflows/<workflow-id>/. Do not
-            // follow directory links out of this session or into a cycle.
-            if is_symlink(&directory) {
-                continue;
-            }
-            let Ok(entries) = fs::read_dir(&directory) else {
+        for path in paths {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            for entry in entries.flatten() {
-                let Ok(file_type) = entry.file_type() else {
-                    continue;
-                };
-                let path = entry.path();
-                if file_type.is_dir() {
-                    directories.push(path);
-                    continue;
+            if !name.starts_with("agent-") || !name.ends_with(".jsonl") {
+                continue;
+            }
+            let Ok(metadata) = fs::symlink_metadata(path) else {
+                activity.child_read(path, false, false);
+                continue;
+            };
+            if !metadata.is_file() {
+                activity.child_read(path, false, false);
+                continue;
+            }
+            let usage = cache.entry(path.clone()).or_default();
+            let identity = file_identity(path);
+            if identity != usage.file_identity || metadata.len() < usage.offset {
+                *usage = SubagentUsage::default();
+                activity.reset_child(path);
+            }
+            let read = read_records(path, usage.offset, |value| {
+                activity.child_event(path, value);
+                if value["type"] != "assistant" {
+                    return;
                 }
-                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                    continue;
-                };
-                // Skip workflow journals and other JSONL files that are not
-                // agent transcripts. Metadata can arrive after the transcript.
-                if !file_type.is_file() || !name.starts_with("agent-") || !name.ends_with(".jsonl")
-                {
-                    continue;
-                }
-                let Ok(metadata) = entry.metadata() else {
-                    continue;
-                };
-                let usage = cache.entry(path.clone()).or_default();
-                let identity = file_identity(&path);
-                if identity != usage.file_identity || metadata.len() < usage.offset {
-                    *usage = SubagentUsage::default();
-                }
-                if metadata.len() > usage.offset {
-                    let delta = parse_transcript(&path, usage.offset);
-                    ModelUsage::merge(&mut usage.model_usage, &delta.model_usage);
-                    let totals = [
-                        delta.total_input,
-                        delta.total_output,
-                        delta.total_cache_read,
-                        delta.total_cache_create,
-                    ];
-                    for (total, increment) in usage.totals.iter_mut().zip(totals) {
+                let msg = &value["message"];
+                if let Some(tokens) = msg.get("usage") {
+                    let counts = [
+                        "input_tokens",
+                        "output_tokens",
+                        "cache_read_input_tokens",
+                        "cache_creation_input_tokens",
+                    ]
+                    .map(|key| tokens[key].as_u64().unwrap_or(0));
+                    for (total, increment) in usage.totals.iter_mut().zip(counts) {
                         *total += increment;
                     }
-                    usage.offset = delta.new_offset;
-                    usage.file_identity = delta.file_identity;
+                    let model = super::sanitize_terminal_text(msg["model"].as_str().unwrap_or(""));
+                    ModelUsage::add(&mut usage.model_usage, &model, counts.iter().sum());
                 }
+            });
+            usage.offset = read.offset;
+            usage.file_identity = identity;
+            activity.child_read(path, read.readable, read.skipped);
 
-                let meta_path = path.with_extension("meta.json");
-                let meta: Option<Value> = if is_symlink(&meta_path) {
-                    None
-                } else {
-                    fs::read_to_string(&meta_path)
-                        .ok()
-                        .and_then(|text| serde_json::from_str(&text).ok())
-                };
-                let description = meta
-                    .as_ref()
-                    .and_then(|value| value.get("description"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_else(|| name.trim_end_matches(".jsonl"));
-                let age = metadata
-                    .modified()
+            let meta_path = path.with_extension("meta.json");
+            let meta: Option<Value> = if is_symlink(&meta_path) {
+                None
+            } else {
+                fs::read_to_string(&meta_path)
                     .ok()
-                    .and_then(|mtime| mtime.elapsed().ok());
-                let subagent = SubAgent {
-                    name: truncate(description, 30),
-                    status: if age.is_some_and(|age| age.as_secs() < 30) {
-                        "working".to_string()
-                    } else {
-                        "done".to_string()
-                    },
-                    tokens: usage.totals.iter().sum(),
-                };
-                subagents.push((path, subagent));
-            }
+                    .and_then(|text| serde_json::from_str(&text).ok())
+            };
+            let description = meta
+                .as_ref()
+                .and_then(|value| value.get("description"))
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| name.trim_end_matches(".jsonl"));
+            let age = metadata
+                .modified()
+                .ok()
+                .and_then(|mtime| mtime.elapsed().ok());
+            let subagent = SubAgent {
+                activity_key: super::activity::activity_key(
+                    subagents_dir,
+                    path.parent().unwrap(),
+                    name.trim_start_matches("agent-").trim_end_matches(".jsonl"),
+                ),
+                name: truncate(description, 30),
+                status: if age.is_some_and(|age| age.as_secs() < 30) {
+                    "working".to_string()
+                } else {
+                    "done".to_string()
+                },
+                tokens: usage.totals.iter().sum(),
+            };
+            subagents.push((path, subagent));
         }
 
         // Directory iteration order is unspecified. Use transcript paths so
         // rows stay ordered even when metadata arrives or descriptions change.
-        subagents.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        subagents.sort_unstable_by_key(|(path, _)| *path);
         let subagents = subagents.into_iter().map(|(_, agent)| agent).collect();
 
         // Preserve lifetime counts if a completed agent's file is removed.
@@ -877,6 +958,16 @@ impl ClaudeCollector {
 impl Default for ClaudeCollector {
     fn default() -> Self {
         Self::with_configured_dirs(Vec::new())
+    }
+}
+
+impl super::StartupCollector for ClaudeCollector {
+    fn collect_startup(
+        &mut self,
+        shared: &super::SharedProcessData,
+        completed: &mut dyn FnMut(&mut AgentSession),
+    ) -> Vec<AgentSession> {
+        self.collect_sessions_with_observer(shared, completed)
     }
 }
 
@@ -1310,7 +1401,7 @@ struct TranscriptResult {
     git_branch: String,
     last_activity: std::time::SystemTime,
     new_offset: u64,
-    /// File identity: (inode, mtime_ns). Used to detect file replacement
+    /// File identity: (device, inode) on Unix. Used to detect file replacement
     /// even when the new file is the same size or larger.
     file_identity: (u64, u64),
     token_history: Vec<u64>,
@@ -1327,11 +1418,13 @@ struct TranscriptResult {
     /// followed by an assistant turn. Zero when the latest entry was an
     /// assistant turn. Mutually exclusive with `last_assistant_ts_ms`.
     last_user_ts_ms: u64,
-    /// True when this parse observed at least one `user` or `assistant`
-    /// line. When false the timestamp fields above are just defaults and
+    /// True when this parse observed a turn or a manual compaction boundary.
+    /// When false the timestamp fields above are just defaults and
     /// must not overwrite cached state - otherwise a no-new-data tick
     /// would clear the live pending/thinking markers.
     saw_turn: bool,
+    /// A new assistant turn or manual compaction updated the pending tool state.
+    saw_task_state: bool,
     /// File access audit log extracted from tool_use entries.
     file_accesses: Vec<FileAccess>,
 }
@@ -1346,32 +1439,120 @@ fn is_symlink(path: &Path) -> bool {
 
 /// Get file identity as (device, inode) for detecting file replacement.
 #[cfg(unix)]
-fn file_identity(path: &Path) -> (u64, u64) {
+pub(super) fn file_identity(path: &Path) -> (u64, u64) {
     fs::metadata(path)
         .ok()
         .map(|m| (m.dev(), m.ino()))
         .unwrap_or((0, 0))
 }
 
-#[cfg(windows)]
-fn file_identity(path: &Path) -> (u64, u64) {
-    fs::metadata(path)
-        .ok()
-        .map(|m| {
-            let size = m.len();
-            let mtime_ns = m
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0);
-            (size, mtime_ns)
-        })
-        .unwrap_or((0, 0))
+#[cfg(not(unix))]
+pub(super) fn file_identity(path: &Path) -> (u64, u64) {
+    (
+        0,
+        fs::metadata(path)
+            .ok()
+            .and_then(|m| m.created().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0),
+    )
 }
 
+#[cfg(test)]
+thread_local! {
+    static READ_COUNTS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+fn child_inventory(directory: &Path) -> Vec<PathBuf> {
+    #[cfg(test)]
+    READ_COUNTS.with(|counts| {
+        let (records, inventories) = counts.get();
+        counts.set((records, inventories + 1));
+    });
+    let mut paths = Vec::new();
+    super::activity::files_under(directory, &mut paths);
+    paths
+}
+
+pub(super) struct RecordRead {
+    pub offset: u64,
+    pub readable: bool,
+    pub skipped: bool,
+}
+
+/// Claude accepts complete JSON at EOF, even before the writer appends a newline.
+/// One bounded read and decode supplies both accounting and lifecycle consumers.
+pub(super) fn read_records(
+    path: &Path,
+    offset: u64,
+    mut consume: impl FnMut(&Value),
+) -> RecordRead {
+    let mut result = RecordRead {
+        offset,
+        readable: false,
+        skipped: false,
+    };
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return result;
+    };
+    if !metadata.is_file() {
+        return result;
+    }
+    let Ok(mut file) = fs::File::open(path) else {
+        return result;
+    };
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return result;
+    }
+    result.readable = true;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    const MAX_LINE_BYTES: u64 = 10 * 1024 * 1024;
+    loop {
+        line.clear();
+        match reader
+            .by_ref()
+            .take(MAX_LINE_BYTES + 1)
+            .read_until(b'\n', &mut line)
+        {
+            Ok(0) => break,
+            Ok(n) => {
+                if n as u64 > MAX_LINE_BYTES {
+                    // Preserve the existing oversized-line policy: skip the
+                    // remainder, but never treat this lifecycle as complete evidence.
+                    result.offset = metadata.len();
+                    result.skipped = true;
+                    result.readable = false;
+                    break;
+                }
+                let newline = line.last() == Some(&b'\n');
+                match serde_json::from_slice::<Value>(&line) {
+                    Ok(value) => {
+                        #[cfg(test)]
+                        READ_COUNTS.with(|counts| {
+                            let (records, inventories) = counts.get();
+                            counts.set((records + 1, inventories));
+                        });
+                        consume(&value);
+                    }
+                    Err(_) if !newline => break,
+                    Err(_) => {}
+                }
+                result.offset += n as u64;
+            }
+            Err(_) => {
+                result.readable = false;
+                break;
+            }
+        }
+    }
+    result
+}
+
+#[cfg(test)]
 fn parse_transcript(path: &Path, from_offset: u64) -> TranscriptResult {
-    parse_transcript_with_previous(path, from_offset, 0, 0)
+    parse_transcript_with_previous(path, from_offset, 0, 0, None)
 }
 
 fn parse_transcript_with_previous(
@@ -1379,6 +1560,7 @@ fn parse_transcript_with_previous(
     from_offset: u64,
     initial_context_tokens: u64,
     initial_cache_read: u64,
+    mut activity: Option<&mut super::activity::ClaudeActivity>,
 ) -> TranscriptResult {
     let identity = file_identity(path);
     let mut result = TranscriptResult {
@@ -1408,27 +1590,16 @@ fn parse_transcript_with_previous(
         last_assistant_ts_ms: 0,
         last_user_ts_ms: 0,
         saw_turn: false,
+        saw_task_state: false,
         file_accesses: Vec::new(),
     };
 
-    let file = match fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return result,
-    };
-
-    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    if file_len == from_offset {
-        // No new data
-        result.new_offset = file_len;
-        return result;
-    }
-    // File shrank (truncation/rotation) — reset and reparse from start
-    let effective_offset = if file_len < from_offset {
+    let file_len = fs::metadata(path).map(|m| m.len()).unwrap_or(from_offset);
+    let from_offset = if file_len < from_offset {
         0
     } else {
         from_offset
     };
-    let from_offset = effective_offset;
     let mut prev_context_tokens = if from_offset > 0 {
         initial_context_tokens
     } else {
@@ -1439,321 +1610,268 @@ fn parse_transcript_with_previous(
     } else {
         0
     };
-
-    let mut reader = BufReader::new(file);
-    if from_offset > 0 {
-        let _ = reader.seek(SeekFrom::Start(from_offset));
+    if file_len != from_offset {
+        result.last_activity = fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(std::time::UNIX_EPOCH);
     }
+    let read = read_records(path, from_offset, |val| {
+        if let Some(activity) = activity.as_deref_mut() {
+            activity.parent_event(val);
+        }
+        // Parse timestamp from any entry (for tool duration calculation)
+        let entry_ts_ms = val
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+            .map(|dt| dt.timestamp_millis().max(0) as u64)
+            .unwrap_or(0);
 
-    let mtime = fs::metadata(path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .unwrap_or(std::time::UNIX_EPOCH);
-    result.last_activity = mtime;
-
-    const MAX_LINE_BYTES: usize = 10 * 1024 * 1024; // 10 MB
-
-    let mut bytes_read = from_offset;
-    let mut line_buf = String::new();
-    loop {
-        line_buf.clear();
-        // Bounded read: take(MAX+1) physically caps the allocation. Without
-        // this, a malformed or hostile transcript with an unbounded line
-        // would OOM the process before any length check could fire.
-        match reader
-            .by_ref()
-            .take(MAX_LINE_BYTES as u64 + 1)
-            .read_line(&mut line_buf)
-        {
-            Ok(0) => break,
-            Ok(n) => {
-                // Cap hit without a newline — malformed/hostile line. Skip
-                // to end of file; we'll re-evaluate when file_identity changes.
-                if line_buf.len() > MAX_LINE_BYTES && !line_buf.ends_with('\n') {
-                    bytes_read = file_len;
-                    break;
-                }
-                let has_newline = line_buf.ends_with('\n');
-                let line = line_buf.trim();
-                if line.is_empty() {
-                    if has_newline {
-                        bytes_read += n as u64;
+        match val.get("type").and_then(|t| t.as_str()) {
+            Some("assistant") => {
+                result.saw_task_state = true;
+                result.turn_count += 1;
+                // Clear previous task on each new turn so stale tasks
+                // don't persist when latest turn has no tool_use
+                result.current_task = String::new();
+                if let Some(msg) = val.get("message") {
+                    if let Some(m) = msg.get("model").and_then(|m| m.as_str()) {
+                        result.model = m.to_string();
                     }
-                    continue;
-                }
-                // Try to parse as JSON. If incomplete (no newline) and
-                // parse fails, defer to next poll. If parse succeeds,
-                // accept the record even without trailing newline.
-                let val = match serde_json::from_str::<Value>(line) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        if has_newline {
-                            // Complete line but invalid JSON — skip it
-                            bytes_read += n as u64;
+                    if let Some(usage) = msg.get("usage") {
+                        let inp = usage
+                            .get("input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let out = usage
+                            .get("output_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let cr = usage
+                            .get("cache_read_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let cc = usage
+                            .get("cache_creation_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let usage_model = super::sanitize_terminal_text(
+                            msg.get("model").and_then(Value::as_str).unwrap_or(""),
+                        );
+                        ModelUsage::add(&mut result.model_usage, &usage_model, inp + out + cr + cc);
+                        result.total_input += inp;
+                        result.total_output += out;
+                        result.total_cache_read += cr;
+                        result.total_cache_create += cc;
+                        // Context = input_tokens + cache_read (excludes cache_creation, #54)
+                        // Exception: when cache_read = 0 but cache_creation > 0,
+                        // this is a fresh session creating cache for the first time,
+                        // so cache_creation represents the actual context size.
+                        let prev_context = prev_context_tokens;
+                        let current_context = if cr == 0 && cc > 0 {
+                            inp + cc
+                        } else {
+                            inp + cr
+                        };
+                        result.last_context_tokens = current_context;
+                        if result.last_context_tokens > result.max_context_tokens {
+                            result.max_context_tokens = result.last_context_tokens;
                         }
-                        // Incomplete line with parse error — defer
-                        if !has_newline {
-                            break;
+                        // Detect compaction: context drops > 30% between turns
+                        // AND cache_read drops hard (old cache invalidated).
+                        // This avoids false positives from normal cache hit rate
+                        // fluctuations where total context varies but no
+                        // actual conversation truncation occurred.
+                        if prev_context > 0
+                            && result.last_context_tokens < prev_context * 7 / 10
+                            && prev_cache_read > 1000
+                            && cr < prev_cache_read / 5
+                        {
+                            result.compaction_count += 1;
                         }
-                        continue;
+                        prev_context_tokens = current_context;
+                        prev_cache_read = cr;
+                        result.prev_cache_read = cr;
+                        if result.context_history.len() < 10_000 {
+                            result.context_history.push(result.last_context_tokens);
+                        }
+                        if result.token_history.len() < 10_000 {
+                            result.token_history.push(inp + out + cr + cc);
+                        }
                     }
-                };
-                bytes_read += n as u64;
-                {
-                    // Parse timestamp from any entry (for tool duration calculation)
-                    let entry_ts_ms = val
-                        .get("timestamp")
-                        .and_then(|t| t.as_str())
-                        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
-                        .map(|dt| dt.timestamp_millis().max(0) as u64)
-                        .unwrap_or(0);
-
-                    match val.get("type").and_then(|t| t.as_str()) {
-                        Some("assistant") => {
-                            result.turn_count += 1;
-                            // Clear previous task on each new turn so stale tasks
-                            // don't persist when latest turn has no tool_use
-                            result.current_task = String::new();
-                            if let Some(msg) = val.get("message") {
-                                if let Some(m) = msg.get("model").and_then(|m| m.as_str()) {
-                                    result.model = m.to_string();
-                                }
-                                if let Some(usage) = msg.get("usage") {
-                                    let inp = usage
-                                        .get("input_tokens")
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(0);
-                                    let out = usage
-                                        .get("output_tokens")
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(0);
-                                    let cr = usage
-                                        .get("cache_read_input_tokens")
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(0);
-                                    let cc = usage
-                                        .get("cache_creation_input_tokens")
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(0);
-                                    let usage_model = super::sanitize_terminal_text(
-                                        msg.get("model").and_then(Value::as_str).unwrap_or(""),
-                                    );
-                                    ModelUsage::add(
-                                        &mut result.model_usage,
-                                        &usage_model,
-                                        inp + out + cr + cc,
-                                    );
-                                    result.total_input += inp;
-                                    result.total_output += out;
-                                    result.total_cache_read += cr;
-                                    result.total_cache_create += cc;
-                                    // Context = input_tokens + cache_read (excludes cache_creation, #54)
-                                    // Exception: when cache_read = 0 but cache_creation > 0,
-                                    // this is a fresh session creating cache for the first time,
-                                    // so cache_creation represents the actual context size.
-                                    let prev_context = prev_context_tokens;
-                                    let current_context = if cr == 0 && cc > 0 {
-                                        inp + cc
+                    // Extract first assistant text (text blocks only) for summary fallback
+                    if result.first_assistant_text.is_empty() {
+                        if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
+                            let texts: Vec<&str> = content
+                                .iter()
+                                .filter_map(|block| {
+                                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                        block.get("text").and_then(|t| t.as_str())
                                     } else {
-                                        inp + cr
-                                    };
-                                    result.last_context_tokens = current_context;
-                                    if result.last_context_tokens > result.max_context_tokens {
-                                        result.max_context_tokens = result.last_context_tokens;
+                                        None
                                     }
-                                    // Detect compaction: context drops > 30% between turns
-                                    // AND cache_read drops hard (old cache invalidated).
-                                    // This avoids false positives from normal cache hit rate
-                                    // fluctuations where total context varies but no
-                                    // actual conversation truncation occurred.
-                                    if prev_context > 0
-                                        && result.last_context_tokens < prev_context * 7 / 10
-                                        && prev_cache_read > 1000
-                                        && cr < prev_cache_read / 5
-                                    {
-                                        result.compaction_count += 1;
-                                    }
-                                    prev_context_tokens = current_context;
-                                    prev_cache_read = cr;
-                                    result.prev_cache_read = cr;
-                                    if result.context_history.len() < 10_000 {
-                                        result.context_history.push(result.last_context_tokens);
-                                    }
-                                    if result.token_history.len() < 10_000 {
-                                        result.token_history.push(inp + out + cr + cc);
-                                    }
+                                })
+                                .collect();
+                            if !texts.is_empty() {
+                                let joined = texts.join(" ");
+                                let normalized: String = joined
+                                    .lines()
+                                    .map(|l| l.trim())
+                                    .filter(|l| !l.is_empty())
+                                    .collect::<Vec<_>>()
+                                    .join(" ");
+                                result.first_assistant_text = truncate(&normalized, 200);
+                            }
+                        }
+                    }
+                    let assistant_text = extract_chat_text(msg);
+                    if !assistant_text.is_empty() {
+                        push_chat_message(
+                            &mut result.chat_messages,
+                            ChatRole::Assistant,
+                            assistant_text,
+                        );
+                    }
+                    // Extract all tool_use entries: timeline + current_task + file access audit
+                    let mut has_tool_use = false;
+                    if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
+                        for item in content {
+                            if item.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                                has_tool_use = true;
+                                let tool = item.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                                let arg = extract_tool_arg(item);
+                                // Last tool_use in forward order wins current_task
+                                result.current_task = format!("{} {}", tool, arg);
+                                if result.tool_calls.len() < 500 {
+                                    result.tool_calls.push(crate::model::ToolCall {
+                                        name: tool.to_string(),
+                                        arg: truncate(&arg, 40),
+                                        duration_ms: 0, // filled on next user turn
+                                    });
                                 }
-                                // Extract first assistant text (text blocks only) for summary fallback
-                                if result.first_assistant_text.is_empty() {
-                                    if let Some(content) =
-                                        msg.get("content").and_then(|c| c.as_array())
-                                    {
-                                        let texts: Vec<&str> = content
-                                            .iter()
-                                            .filter_map(|block| {
-                                                if block.get("type").and_then(|t| t.as_str())
-                                                    == Some("text")
-                                                {
-                                                    block.get("text").and_then(|t| t.as_str())
-                                                } else {
-                                                    None
-                                                }
-                                            })
-                                            .collect();
-                                        if !texts.is_empty() {
-                                            let joined = texts.join(" ");
-                                            let normalized: String = joined
-                                                .lines()
-                                                .map(|l| l.trim())
-                                                .filter(|l| !l.is_empty())
-                                                .collect::<Vec<_>>()
-                                                .join(" ");
-                                            result.first_assistant_text =
-                                                truncate(&normalized, 200);
-                                        }
-                                    }
-                                }
-                                let assistant_text = extract_chat_text(msg);
-                                if !assistant_text.is_empty() {
-                                    push_chat_message(
-                                        &mut result.chat_messages,
-                                        ChatRole::Assistant,
-                                        assistant_text,
-                                    );
-                                }
-                                // Extract all tool_use entries: timeline + current_task + file access audit
-                                let mut has_tool_use = false;
-                                if let Some(content) = msg.get("content").and_then(|c| c.as_array())
+                                // Extract file access audit entries.
+                                // Cap is applied once at the end of
+                                // parse_transcript via a sliding window so
+                                // the latest accesses always survive.
+                                if let Some(file_path) = item
+                                    .get("input")
+                                    .and_then(|i| i.get("file_path"))
+                                    .and_then(|f| f.as_str())
                                 {
-                                    for item in content {
-                                        if item.get("type").and_then(|t| t.as_str())
-                                            == Some("tool_use")
-                                        {
-                                            has_tool_use = true;
-                                            let tool = item
-                                                .get("name")
-                                                .and_then(|n| n.as_str())
-                                                .unwrap_or("?");
-                                            let arg = extract_tool_arg(item);
-                                            // Last tool_use in forward order wins current_task
-                                            result.current_task = format!("{} {}", tool, arg);
-                                            if result.tool_calls.len() < 500 {
-                                                result.tool_calls.push(crate::model::ToolCall {
-                                                    name: tool.to_string(),
-                                                    arg: truncate(&arg, 40),
-                                                    duration_ms: 0, // filled on next user turn
-                                                });
-                                            }
-                                            // Extract file access audit entries.
-                                            // Cap is applied once at the end of
-                                            // parse_transcript via a sliding window so
-                                            // the latest accesses always survive.
-                                            if let Some(file_path) = item
-                                                .get("input")
-                                                .and_then(|i| i.get("file_path"))
-                                                .and_then(|f| f.as_str())
-                                            {
-                                                let op = match tool {
-                                                    "Read" => Some(FileOp::Read),
-                                                    "Edit" => Some(FileOp::Edit),
-                                                    "Write" => Some(FileOp::Write),
-                                                    _ => None,
-                                                };
-                                                if let Some(op) = op {
-                                                    result.file_accesses.push(FileAccess {
-                                                        path: file_path.to_string(),
-                                                        operation: op,
-                                                        turn_index: result.turn_count,
-                                                    });
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                // Save timestamp for duration calculation — only when
-                                // tool_use is present, so we can detect "tools pending".
-                                if entry_ts_ms > 0 && has_tool_use {
-                                    result.last_assistant_ts_ms = entry_ts_ms;
-                                }
-                                // Any assistant turn closes the prior "thinking" window.
-                                result.last_user_ts_ms = 0;
-                                result.saw_turn = true;
-                            }
-                        }
-                        Some("user") => {
-                            // Compute tool call duration: time from assistant turn to this user turn
-                            if entry_ts_ms > 0 && result.last_assistant_ts_ms > 0 {
-                                let duration =
-                                    entry_ts_ms.saturating_sub(result.last_assistant_ts_ms);
-                                // Distribute duration across tool calls from that assistant turn
-                                // (approximation: divide equally among pending zero-duration calls)
-                                let pending: Vec<usize> = result
-                                    .tool_calls
-                                    .iter()
-                                    .enumerate()
-                                    .rev()
-                                    .take_while(|(_, tc)| tc.duration_ms == 0)
-                                    .map(|(i, _)| i)
-                                    .collect();
-                                if !pending.is_empty() {
-                                    let per_call = duration / pending.len() as u64;
-                                    for idx in pending {
-                                        result.tool_calls[idx].duration_ms = per_call;
-                                    }
-                                }
-                                result.last_assistant_ts_ms = 0;
-                            }
-                            // Mark the start of a thinking window — next assistant
-                            // turn clears it. **Skip synthetic user lines**:
-                            // Claude Code serializes both real prompts and a number
-                            // of non-prompt entries (tool_result wrappers, slash
-                            // commands like /plugin, ! bash invocations, meta
-                            // caveats) as `user`-role lines. Only real prompts
-                            // mean "model has been asked, no reply yet"; the
-                            // others either belong inside an existing turn or
-                            // are pure local operations that never invoke the
-                            // model. Treating them as a thinking window pins
-                            // the session in Thinking forever (e.g. /plugin
-                            // update flushes 3 user-role lines and no
-                            // assistant reply ever arrives to clear them).
-                            let synthetic = is_synthetic_user_msg(&val);
-                            if entry_ts_ms > 0 && !synthetic {
-                                result.last_user_ts_ms = entry_ts_ms;
-                            }
-                            result.saw_turn = true;
-                            if let Some(v) = val.get("version").and_then(|v| v.as_str()) {
-                                result.version = v.to_string();
-                            }
-                            if let Some(b) = val.get("gitBranch").and_then(|b| b.as_str()) {
-                                result.git_branch = b.to_string();
-                            }
-                            // Extract first user prompt as session title — also
-                            // skip synthetic lines so the title isn't
-                            // "<command-name>/plugin..." or a bash stdout dump.
-                            if result.initial_prompt.is_empty() && !synthetic {
-                                if let Some(msg) = val.get("message") {
-                                    result.initial_prompt = extract_prompt_text(msg);
-                                }
-                            }
-                            if !synthetic {
-                                if let Some(msg) = val.get("message") {
-                                    let user_text = extract_chat_text(msg);
-                                    if !user_text.is_empty() {
-                                        push_chat_message(
-                                            &mut result.chat_messages,
-                                            ChatRole::User,
-                                            user_text,
-                                        );
+                                    let op = match tool {
+                                        "Read" => Some(FileOp::Read),
+                                        "Edit" => Some(FileOp::Edit),
+                                        "Write" => Some(FileOp::Write),
+                                        _ => None,
+                                    };
+                                    if let Some(op) = op {
+                                        result.file_accesses.push(FileAccess {
+                                            path: file_path.to_string(),
+                                            operation: op,
+                                            turn_index: result.turn_count,
+                                        });
                                     }
                                 }
                             }
                         }
-                        _ => {}
+                    }
+                    // Save timestamp for duration calculation — only when
+                    // tool_use is present, so we can detect "tools pending".
+                    if entry_ts_ms > 0 && has_tool_use {
+                        result.last_assistant_ts_ms = entry_ts_ms;
+                    }
+                    // Any assistant turn closes the prior "thinking" window.
+                    result.last_user_ts_ms = 0;
+                    result.saw_turn = true;
+                }
+            }
+            Some("user") => {
+                // Transcript-only context is not a new turn, including
+                // when it arrives in a separate incremental read.
+                if val["isCompactSummary"] == true || val["isVisibleInTranscriptOnly"] == true {
+                    return;
+                }
+                // Compute tool call duration: time from assistant turn to this user turn
+                if entry_ts_ms > 0 && result.last_assistant_ts_ms > 0 {
+                    let duration = entry_ts_ms.saturating_sub(result.last_assistant_ts_ms);
+                    // Distribute duration across tool calls from that assistant turn
+                    // (approximation: divide equally among pending zero-duration calls)
+                    let pending: Vec<usize> = result
+                        .tool_calls
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .take_while(|(_, tc)| tc.duration_ms == 0)
+                        .map(|(i, _)| i)
+                        .collect();
+                    if !pending.is_empty() {
+                        let per_call = duration / pending.len() as u64;
+                        for idx in pending {
+                            result.tool_calls[idx].duration_ms = per_call;
+                        }
+                    }
+                    result.last_assistant_ts_ms = 0;
+                }
+                // Mark the start of a thinking window — next assistant
+                // turn clears it. **Skip synthetic user lines**:
+                // Claude Code serializes both real prompts and a number
+                // of non-prompt entries (tool_result wrappers, slash
+                // commands like /plugin, ! bash invocations, meta
+                // caveats) as `user`-role lines. Only real prompts
+                // mean "model has been asked, no reply yet"; the
+                // others either belong inside an existing turn or
+                // are pure local operations that never invoke the
+                // model. Treating them as a thinking window pins
+                // the session in Thinking forever (e.g. /plugin
+                // update flushes 3 user-role lines and no
+                // assistant reply ever arrives to clear them).
+                let synthetic = is_synthetic_user_msg(val);
+                if entry_ts_ms > 0 && !synthetic {
+                    result.last_user_ts_ms = entry_ts_ms;
+                }
+                result.saw_turn = true;
+                if let Some(v) = val.get("version").and_then(|v| v.as_str()) {
+                    result.version = v.to_string();
+                }
+                if let Some(b) = val.get("gitBranch").and_then(|b| b.as_str()) {
+                    result.git_branch = b.to_string();
+                }
+                // Extract first user prompt as session title — also
+                // skip synthetic lines so the title isn't
+                // "<command-name>/plugin..." or a bash stdout dump.
+                if result.initial_prompt.is_empty() && !synthetic {
+                    if let Some(msg) = val.get("message") {
+                        result.initial_prompt = extract_prompt_text(msg);
+                    }
+                }
+                if !synthetic {
+                    if let Some(msg) = val.get("message") {
+                        let user_text = extract_chat_text(msg);
+                        if !user_text.is_empty() {
+                            push_chat_message(&mut result.chat_messages, ChatRole::User, user_text);
+                        }
                     }
                 }
             }
-            Err(_) => break,
+            Some("system")
+                if val["subtype"] == "compact_boundary"
+                    && val["compactMetadata"]["trigger"] == "manual" =>
+            {
+                // Manual /compact finishes locally; no assistant reply
+                // follows to close its thinking window. Auto compaction
+                // belongs to an ongoing turn and must preserve activity.
+                result.last_user_ts_ms = 0;
+                result.last_assistant_ts_ms = 0;
+                result.current_task.clear();
+                result.saw_turn = true;
+                result.saw_task_state = true;
+            }
+            _ => {}
         }
+    });
+    if let Some(activity) = activity {
+        activity.parent_read(read.readable, read.skipped);
     }
 
     // Sliding window cap: keep the most recent MAX_FILE_ACCESSES, drop
@@ -1764,7 +1882,7 @@ fn parse_transcript_with_previous(
         result.file_accesses.drain(..len - MAX_FILE_ACCESSES);
     }
 
-    result.new_offset = bytes_read;
+    result.new_offset = read.offset;
     result
 }
 
@@ -1773,7 +1891,7 @@ fn parse_transcript_with_previous(
 /// Encode a cwd path to match Claude Code's project directory naming.
 /// Claude Code replaces '/', '_', and '.' with '-'.
 /// True iff a `user`-role transcript entry is *synthetic* — i.e. not a
-/// real human prompt that the model still owes a reply for. Three forms:
+/// real human prompt that the model still owes a reply for. Recognized forms:
 ///
 /// 1. `isMeta: true` — Claude Code's explicit marker for non-prompt
 ///    entries (e.g. the `<local-command-caveat>` line).
@@ -1787,17 +1905,28 @@ fn parse_transcript_with_previous(
 ///    `<bash-input>...`. These are pure local operations that never
 ///    invoke the model, so treating them as a prompt would leave
 ///    `last_user_ts_ms` stuck and pin the session in Thinking forever.
+/// 4. Compaction summaries and transcript-only entries are stored context,
+///    not fresh user input.
 fn is_synthetic_user_msg(entry: &Value) -> bool {
-    if entry.get("isMeta").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if entry["isCompactSummary"] == true || entry["isVisibleInTranscriptOnly"] == true {
         return true;
     }
-    let Some(message) = entry.get("message") else { return false };
+    if entry
+        .get("isMeta")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let Some(message) = entry.get("message") else {
+        return false;
+    };
     match message.get("content") {
         Some(Value::Array(arr)) => {
             !arr.is_empty()
-                && arr.iter().all(|block| {
-                    block.get("type").and_then(|t| t.as_str()) == Some("tool_result")
-                })
+                && arr
+                    .iter()
+                    .all(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
         }
         Some(Value::String(s)) => {
             let t = s.trim_start();
@@ -2255,6 +2384,223 @@ mod tests {
     }
 
     #[test]
+    fn child_lifecycle_survives_delayed_and_missing_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = ConfigDir::new(temp.path().join("profile"));
+        fs::create_dir_all(&config.sessions_dir).unwrap();
+        let cwd = temp.path().join("repo");
+        let session_file = config.sessions_dir.join("4242.json");
+        write_session_file(&session_file, 4242, "delayed-parent", &cwd);
+        let project = config
+            .projects_dir
+            .join(encode_cwd_path(cwd.to_str().unwrap()));
+        let parent = project.join("delayed-parent.jsonl");
+        let children = project.join("delayed-parent").join("subagents");
+        fs::create_dir_all(&children).unwrap();
+        let child = children.join("agent-one.jsonl");
+        append_model_usage(&child, "child-model", [1, 2, 3, 4]);
+
+        let paths = vec![(session_file, config)];
+        let process = make_proc_info(4242, "claude");
+        let ctx = build_discovery_context(&paths, &process, 0);
+        let mut collector = ClaudeCollector::new();
+        let collect = |collector: &mut ClaudeCollector| {
+            let sessions = collector.load_session_paths(
+                &paths,
+                &process,
+                &HashMap::new(),
+                &HashMap::new(),
+                &ctx,
+            );
+            collector.evict_stale_cache(&sessions);
+            assert_eq!(sessions.len(), 1);
+            sessions.into_iter().next().unwrap()
+        };
+        let assert_usage = |session: &AgentSession, totals: [u64; 4]| {
+            assert_eq!(
+                [
+                    session.total_input_tokens,
+                    session.total_output_tokens,
+                    session.total_cache_read,
+                    session.total_cache_create,
+                ],
+                totals
+            );
+            let total_tokens = totals.iter().sum();
+            assert_eq!(session.subagents.len(), 1);
+            assert_eq!(session.subagents[0].tokens, total_tokens);
+            assert_eq!(
+                session.model_usage,
+                vec![ModelUsage {
+                    model: "child-model".into(),
+                    total_tokens,
+                }]
+            );
+        };
+
+        // Reading a child before the parent exists must retain both consumers' state.
+        let session = collect(&mut collector);
+        assert_usage(&session, [1, 2, 3, 4]);
+        assert_eq!(session.subagent_counts, Default::default());
+        fs::write(&parent, "{}\n").unwrap();
+        for _ in 0..2 {
+            let session = collect(&mut collector);
+            assert_usage(&session, [1, 2, 3, 4]);
+            assert_eq!(session.subagents[0].status, "working");
+            assert_eq!(session.subagent_counts.working, 1);
+            assert_eq!(session.subagent_counts.unknown, 0);
+        }
+
+        // A completion read during a later parent-file gap must also survive.
+        let saved_parent = parent.with_extension("saved");
+        fs::rename(&parent, &saved_parent).unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(&child).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "model": "child-model",
+                    "stop_reason": "end_turn",
+                    "usage": {
+                        "input_tokens": 5,
+                        "output_tokens": 6,
+                        "cache_read_input_tokens": 7,
+                        "cache_creation_input_tokens": 8
+                    }
+                }
+            })
+        )
+        .unwrap();
+        let session = collect(&mut collector);
+        assert_usage(&session, [6, 8, 10, 12]);
+        assert_eq!(session.subagent_counts, Default::default());
+        fs::rename(&saved_parent, &parent).unwrap();
+        for _ in 0..2 {
+            let session = collect(&mut collector);
+            assert_usage(&session, [6, 8, 10, 12]);
+            assert_eq!(session.subagents[0].status, "done");
+            assert_eq!(session.subagent_counts, Default::default());
+        }
+
+        // Removing the session evicts evidence together with its read cursors.
+        collector.evict_stale_cache(&[]);
+        assert!(collector.transcript_cache.is_empty());
+        assert!(collector.subagent_cache.is_empty());
+        assert!(collector.activity.is_empty());
+    }
+
+    #[test]
+    fn shared_records_keep_usage_and_lifecycle_in_step() {
+        use super::super::activity::State;
+        let temp = tempfile::tempdir().unwrap();
+        let config = ConfigDir::new(temp.path().join("profile"));
+        fs::create_dir_all(&config.sessions_dir).unwrap();
+        let cwd = temp.path().join("repo");
+        let session_file = config.sessions_dir.join("4242.json");
+        write_session_file(&session_file, 4242, "shared", &cwd);
+        let parent = write_transcript(&config.projects_dir, &cwd, "shared", "Work");
+        let children = parent.with_extension("").join("subagents");
+        fs::create_dir_all(&children).unwrap();
+        let child = children.join("agent-one.jsonl");
+        let done = serde_json::json!({"type":"assistant", "timestamp":"2020-01-01T00:00:02Z", "message":{"stop_reason":"end_turn", "usage":{"input_tokens":7}}}).to_string();
+        // Both parent and child accept a valid final record without a newline.
+        let launch = serde_json::json!({"type":"user", "timestamp":"2020-01-01T00:00:01Z", "toolUseResult":{"agentId":"one", "isAsync":true}}).to_string();
+        fs::write(&parent, &launch).unwrap();
+        fs::write(&child, &done).unwrap();
+        // Discovery may return the same session file through multiple roots.
+        let paths = vec![
+            (session_file.clone(), config.clone()),
+            (session_file, config),
+        ];
+        let process = make_proc_info(4242, "claude");
+        let ctx = build_discovery_context(&paths, &process, 0);
+        let collect = |collector: &mut ClaudeCollector| {
+            collector.load_session_paths(&paths, &process, &HashMap::new(), &HashMap::new(), &ctx)
+        };
+        // Read initially on a worker and return the actual warmed cursors.
+        let (mut collector, sessions) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let mut collector = ClaudeCollector::new();
+                    READ_COUNTS.with(|c| c.set((0, 0)));
+                    let sessions = collect(&mut collector);
+                    READ_COUNTS.with(|c| assert_eq!(c.get(), (2, 1)));
+                    (collector, sessions)
+                })
+                .join()
+                .unwrap()
+        });
+        assert_eq!(sessions[0].total_input_tokens, 7);
+        assert_eq!(sessions[0].subagents[0].status, "done");
+        READ_COUNTS.with(|c| c.set((0, 0)));
+        assert_eq!(collect(&mut collector)[0].total_input_tokens, 7);
+        READ_COUNTS.with(|c| assert_eq!(c.get(), (0, 1)));
+        // Later newline, malformed complete line, and incomplete record.
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new().append(true).open(&child).unwrap();
+        write!(file, "\nnot-json\n{{\"type\":\"user\"").unwrap();
+        assert_eq!(collect(&mut collector)[0].total_input_tokens, 7);
+        write!(
+            file,
+            ",\"timestamp\":\"2020-01-01T00:00:03Z\",\"message\":{{\"content\":\"go\"}}}}"
+        )
+        .unwrap();
+        let sessions = collect(&mut collector);
+        assert_eq!(sessions[0].total_input_tokens, 7);
+        assert_eq!(sessions[0].subagents[0].status, "working");
+        // Truncation resets both consumers, even when the new parsed offset
+        // would otherwise be mistaken for an incremental delta.
+        fs::write(&parent, "{}\n").unwrap();
+        fs::write(&child, &done).unwrap();
+        let sessions = collect(&mut collector);
+        assert_eq!(sessions[0].total_input_tokens, 7);
+        assert_eq!(sessions[0].subagents[0].status, "done");
+        // Same-size replacement is detected by identity, not length.
+        let replacement = children.join("replacement");
+        fs::write(&replacement, done.replace(":7", ":9")).unwrap();
+        fs::rename(&replacement, &child).unwrap();
+        assert_eq!(collect(&mut collector)[0].total_input_tokens, 9);
+        fs::remove_file(&child).unwrap();
+        let sessions = collect(&mut collector);
+        assert_eq!(sessions[0].total_input_tokens, 9);
+        assert!(sessions[0].subagents.is_empty());
+        assert_eq!(collector.activity[&parent].states["one"], State::Done);
+    }
+
+    #[test]
+    fn oversized_child_keeps_evidence_incomplete_until_reset() {
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp.path().join("agent-large.jsonl");
+        fs::write(&child, vec![b'x'; 10 * 1024 * 1024 + 1]).unwrap();
+        let mut activity = super::super::activity::ClaudeActivity::default();
+        let mut cache = HashMap::new();
+        let paths = vec![child.clone()];
+        for _ in 0..2 {
+            ClaudeCollector::collect_subagents_from_inventory(
+                temp.path(),
+                &mut cache,
+                &paths,
+                &mut activity,
+            );
+            assert_eq!(activity.reconcile(temp.path(), &paths).unknown, 1);
+        }
+        // A replacement resets the incomplete evidence together with usage.
+        let replacement = temp.path().join("replacement");
+        fs::write(&replacement, r#"{"type":"assistant","message":{"stop_reason":"end_turn","usage":{"input_tokens":3}}}"#).unwrap();
+        fs::rename(replacement, &child).unwrap();
+        let (_, totals) = ClaudeCollector::collect_subagents_from_inventory(
+            temp.path(),
+            &mut cache,
+            &paths,
+            &mut activity,
+        );
+        assert_eq!(totals[0], 3);
+        assert_eq!(activity.reconcile(temp.path(), &paths), Default::default());
+    }
+
+    #[test]
     fn workflow_usage_updates_parent_totals_and_rates_without_parent_activity() {
         let temp = tempfile::tempdir().unwrap();
         let config = ConfigDir::new(temp.path().join("profile"));
@@ -2297,14 +2643,16 @@ mod tests {
             Default::default(),
         );
         let start = std::time::Instant::now();
+        READ_COUNTS.with(|c| c.set((0, 0)));
         app.sessions = collect();
+        READ_COUNTS.with(|c| assert_eq!(c.get(), (4, 1)));
         let session = &app.sessions[0];
         assert_eq!(session.total_input_tokens, 23);
         assert_eq!(session.total_output_tokens, 28);
         assert_eq!(session.total_cache_read, 36);
         assert_eq!(session.total_cache_create, 44);
         assert_eq!(session.subagents.len(), 2);
-        assert_eq!(session.status, SessionStatus::Executing);
+        assert_eq!(session.status, SessionStatus::Waiting);
         assert_eq!(
             session.model_usage,
             vec![
@@ -2323,7 +2671,9 @@ mod tests {
         app.update_session_token_rates(start);
 
         append_model_usage(&nested, "claude-haiku-4-5", [5, 6, 7, 8]);
+        READ_COUNTS.with(|c| c.set((0, 0)));
         app.sessions = collect();
+        READ_COUNTS.with(|c| assert_eq!(c.get(), (1, 1)));
         let now = start + std::time::Duration::from_secs(2);
         app.update_session_token_rates(now);
         assert_eq!(
@@ -2342,7 +2692,9 @@ mod tests {
         assert_eq!(app.sessions[0].total_cache_read, 43);
         assert_eq!(app.sessions[0].total_cache_create, 52);
         // Unchanged files must not add their lifetime usage again.
+        READ_COUNTS.with(|c| c.set((0, 0)));
         app.sessions = collect();
+        READ_COUNTS.with(|c| assert_eq!(c.get(), (0, 1)));
         assert_eq!(app.sessions[0].total_input_tokens, 28);
         assert_eq!(app.sessions[0].total_output_tokens, 34);
         assert_eq!(app.sessions[0].total_cache_read, 43);
@@ -2675,6 +3027,61 @@ mod tests {
     }
 
     #[test]
+    fn manual_compaction_closes_activity_and_auto_compaction_preserves_it() {
+        for trigger in ["manual", "auto"] {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            write_lines(
+                &mut file,
+                &[
+                    r#"{"type":"user","timestamp":"2026-10-12T12:34:07Z","message":{"content":"/compact"}}"#,
+                ],
+            );
+            let offset = fs::metadata(file.path()).unwrap().len();
+            let boundary = serde_json::json!({
+                "type":"system", "subtype":"compact_boundary",
+                "timestamp":"2026-10-12T12:35:03Z",
+                "compactMetadata":{"trigger":trigger,"postTokens":100,"durationMs":1000}
+            })
+            .to_string();
+            write_lines(&mut file, &[&boundary]);
+            for marker in ["isCompactSummary", "isVisibleInTranscriptOnly"] {
+                let summary = serde_json::json!({
+                    "type":"user", "timestamp":"2026-10-12T12:35:02Z",
+                    marker:true,"message":{"content":"stored context"}
+                })
+                .to_string();
+                let summary_offset = fs::metadata(file.path()).unwrap().len();
+                write_lines(&mut file, &[&summary]);
+                let delta = parse_transcript(file.path(), summary_offset);
+                assert!(
+                    !delta.saw_turn,
+                    "stored context must not overwrite cached activity"
+                );
+                assert!(!delta.saw_task_state);
+            }
+            let full = parse_transcript(file.path(), 0);
+            let delta = parse_transcript(file.path(), offset);
+            if trigger == "manual" {
+                assert_eq!(full.last_user_ts_ms, 0);
+                assert_eq!(delta.last_user_ts_ms, 0);
+                assert!(delta.saw_turn);
+                assert!(delta.saw_task_state);
+            } else {
+                assert!(full.last_user_ts_ms > 0);
+                assert!(!delta.saw_turn);
+                assert!(!delta.saw_task_state);
+            }
+            write_lines(
+                &mut file,
+                &[
+                    r#"{"type":"user","timestamp":"2026-10-12T12:36:00Z","message":{"content":"new work"}}"#,
+                ],
+            );
+            assert!(parse_transcript(file.path(), 0).last_user_ts_ms > 0);
+        }
+    }
+
+    #[test]
     fn test_parse_transcript_no_new_bytes_does_not_set_saw_turn() {
         // Regression for the merge fix: a no-op poll (from_offset == file_len)
         // must return saw_turn=false so the cached pending/thinking markers
@@ -2869,15 +3276,18 @@ mod tests {
         // forever (Think generating reply). All three line shapes must be
         // treated as synthetic.
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        write_lines(&mut file, &[
-            // Real prompt + assistant reply to seed a clean Wait state.
-            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"hi"}}"#,
-            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:01Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"hello"}]}}"#,
-            // The three user-role lines `/plugin update` writes:
-            r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat: ...</local-command-caveat>"}}"#,
-            r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<command-name>/plugin</command-name>\n<command-args>update foo</command-args>"}}"#,
-            r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<local-command-stdout>Updated foo</local-command-stdout>"}}"#,
-        ]);
+        write_lines(
+            &mut file,
+            &[
+                // Real prompt + assistant reply to seed a clean Wait state.
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"hi"}}"#,
+                r#"{"type":"assistant","timestamp":"2026-03-28T15:00:01Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"hello"}]}}"#,
+                // The three user-role lines `/plugin update` writes:
+                r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat: ...</local-command-caveat>"}}"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<command-name>/plugin</command-name>\n<command-args>update foo</command-args>"}}"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<local-command-stdout>Updated foo</local-command-stdout>"}}"#,
+            ],
+        );
 
         let result = parse_transcript(file.path(), 0);
 
@@ -2895,11 +3305,14 @@ mod tests {
         // `!ls` and friends serialize as <bash-input>/<bash-stdout> user-role
         // lines with no assistant reply. Same failure mode as /plugin.
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        write_lines(&mut file, &[
-            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:00Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"ok"}]}}"#,
-            r#"{"type":"user","timestamp":"2026-03-28T15:00:05Z","message":{"role":"user","content":"<bash-input>ls</bash-input>"}}"#,
-            r#"{"type":"user","timestamp":"2026-03-28T15:00:05Z","message":{"role":"user","content":"<bash-stdout>a\nb</bash-stdout><bash-stderr></bash-stderr>"}}"#,
-        ]);
+        write_lines(
+            &mut file,
+            &[
+                r#"{"type":"assistant","timestamp":"2026-03-28T15:00:00Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"ok"}]}}"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:05Z","message":{"role":"user","content":"<bash-input>ls</bash-input>"}}"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:05Z","message":{"role":"user","content":"<bash-stdout>a\nb</bash-stdout><bash-stderr></bash-stderr>"}}"#,
+            ],
+        );
 
         let result = parse_transcript(file.path(), 0);
 
@@ -3118,14 +3531,22 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
             (session_path.clone(), config),
         ];
         let ctx = build_discovery_context(&session_paths, &process_info, 0);
-        let sessions = collector.load_session_paths(
+        let mut published = Vec::new();
+        let sessions = collector.load_session_paths_with_observer(
             &session_paths,
             &process_info,
             &HashMap::new(),
             &HashMap::new(),
             &ctx,
+            &mut |session| published.push(session.clone()),
         );
 
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].session_id, session_id);
+        assert_eq!(
+            published[0].total_input_tokens,
+            sessions[0].total_input_tokens
+        );
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, session_id);
     }
@@ -3730,7 +4151,10 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
     #[test]
     fn test_context_window_for_model() {
         // Base model with low token usage → 200K
-        assert_eq!(crate::collector::context_window_for_model("claude-opus-4-6", "", 50_000), 200_000);
+        assert_eq!(
+            crate::collector::context_window_for_model("claude-opus-4-6", "", 50_000),
+            200_000
+        );
         // Explicit [1m] suffix in transcript model → 1M regardless of token count
         assert_eq!(
             crate::collector::context_window_for_model("claude-opus-4-6[1m]", "", 0),
@@ -3745,7 +4169,10 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
             crate::collector::context_window_for_model("claude-sonnet-4-6", "", 100_000),
             200_000
         );
-        assert_eq!(crate::collector::context_window_for_model("unknown-model", "", 0), 200_000);
+        assert_eq!(
+            crate::collector::context_window_for_model("unknown-model", "", 0),
+            200_000
+        );
         // Token usage exceeds 200K → must be 1M window
         assert_eq!(
             crate::collector::context_window_for_model("claude-opus-4-6", "", 250_000),
@@ -4216,10 +4643,9 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
     }
 
     #[test]
-    fn test_load_session_working_async_subagent_is_executing() {
-        // Regression for #156: an async Agent tool returns immediately, so the
-        // parent has no pending tool while its subagent keeps working. The
-        // working subagent must keep the parent Executing instead of Waiting.
+    fn test_load_session_working_async_subagent_counts_independently_of_idle_parent() {
+        // An async Agent tool returns immediately. Once the parent's own turn
+        // finishes, only the child contributes to the working-agent count.
         let temp = tempfile::tempdir().unwrap();
         let profile = temp.path().join(".claude");
         let sessions_dir = profile.join("sessions");
@@ -4261,6 +4687,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
 "#,
         )
         .unwrap();
+        append_model_usage(&subagent_transcript, "child-model", [3, 4, 5, 6]);
         set_mtime(&subagent_transcript, 0);
 
         let config = ConfigDir::new(profile.clone());
@@ -4270,22 +4697,32 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
 
         let session_paths = vec![(session_path, config)];
         let ctx = build_discovery_context(&session_paths, &process_info, 0);
-        let sessions = collector.load_session_paths(
+        let mut published = Vec::new();
+        let sessions = collector.load_session_paths_with_observer(
             &session_paths,
             &process_info,
             &HashMap::new(),
             &HashMap::new(),
             &ctx,
+            &mut |session| published.push(session.clone()),
         );
 
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].total_input_tokens, 5);
+        assert_eq!(published[0].model_usage, sessions[0].model_usage);
+        assert_eq!(published[0].subagent_counts.working, 1);
+        assert_eq!(published[0].subagents[0].tokens, 18);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].subagents.len(), 1);
         assert_eq!(sessions[0].subagents[0].status, "working");
         assert_eq!(
             sessions[0].status,
-            SessionStatus::Executing,
-            "a working async subagent must keep its parent Executing",
+            SessionStatus::Waiting,
+            "a working async subagent must not count its idle parent as working",
         );
+        let mut totals = crate::model::AgentTotals::default();
+        totals.add_session(&sessions[0]);
+        assert_eq!(totals.claude.working, 1);
     }
 
     #[test]

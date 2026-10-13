@@ -1,3 +1,4 @@
+mod activity;
 pub mod claude;
 pub mod codex;
 pub mod mcp;
@@ -107,6 +108,22 @@ pub trait AgentCollector {
     /// Used to feed rate limit lookups across all active config dirs.
     fn discovered_config_dirs(&self) -> Vec<std::path::PathBuf> {
         Vec::new()
+    }
+}
+
+/// Startup-only publication of complete sessions. Providers with a batch
+/// finalization step keep it through the default implementation.
+pub(crate) trait StartupCollector: AgentCollector {
+    fn collect_startup(
+        &mut self,
+        shared: &SharedProcessData,
+        completed: &mut dyn FnMut(&mut AgentSession),
+    ) -> Vec<AgentSession> {
+        let mut sessions = self.collect(shared);
+        for session in &mut sessions {
+            completed(session);
+        }
+        sessions
     }
 }
 
@@ -284,7 +301,7 @@ impl Drop for DesktopRolloutScanner {
 
 /// Aggregates sessions from multiple collectors (Claude, Codex, etc.)
 pub struct MultiCollector {
-    collectors: Vec<Box<dyn AgentCollector>>,
+    collectors: Vec<Box<dyn StartupCollector + Send>>,
     codex_enabled: bool,
     tick_count: u32,
     cached_ports: HashMap<u32, Vec<u16>>,
@@ -310,6 +327,13 @@ pub struct MultiCollector {
 const SLOW_POLL_INTERVAL: u32 = 5;
 
 impl MultiCollector {
+    #[cfg(test)]
+    pub(crate) fn controlled(collectors: Vec<Box<dyn StartupCollector + Send>>) -> Self {
+        let mut state = Self::with_hidden(&["claude".into(), "codex".into(), "opencode".into()]);
+        state.collectors = collectors;
+        state
+    }
+
     /// Build a collector, skipping agents whose identifier is in `hidden`.
     /// Identifiers are matched case-insensitively against each collector's
     /// `agent_cli` name (e.g. `"claude"`, `"codex"`).
@@ -323,7 +347,7 @@ impl MultiCollector {
         claude_config_dirs: &[PathBuf],
     ) -> Self {
         let is_hidden = |name: &str| hidden.iter().any(|h| h.eq_ignore_ascii_case(name));
-        let mut collectors: Vec<Box<dyn AgentCollector>> = Vec::new();
+        let mut collectors: Vec<Box<dyn StartupCollector + Send>> = Vec::new();
         if !is_hidden("claude") {
             collectors.push(Box::new(ClaudeCollector::with_configured_dirs(
                 claude_config_dirs.to_vec(),
@@ -372,6 +396,21 @@ impl MultiCollector {
     }
 
     pub fn collect(&mut self) -> Vec<AgentSession> {
+        self.collect_with_observer(None)
+    }
+
+    /// Publish complete sessions after their normal enrichment, during startup only.
+    pub(crate) fn collect_progressively(
+        &mut self,
+        mut publish: impl FnMut(&AgentSession),
+    ) -> Vec<AgentSession> {
+        self.collect_with_observer(Some(&mut publish))
+    }
+
+    fn collect_with_observer(
+        &mut self,
+        mut publish: Option<&mut dyn FnMut(&AgentSession)>,
+    ) -> Vec<AgentSession> {
         let slow_tick = self.tick_count >= SLOW_POLL_INTERVAL;
         if slow_tick {
             self.tick_count = 0;
@@ -412,36 +451,36 @@ impl MultiCollector {
         }
 
         let mut all = Vec::new();
-        for collector in &mut self.collectors {
-            all.extend(collector.collect(&shared));
-        }
-
-        // Git stats: refresh only on slow tick
         if slow_tick {
             self.cached_git.clear();
-            for s in &mut all {
-                let stats = process::collect_git_stats(&s.cwd);
-                self.cached_git.insert(s.cwd.clone(), stats);
-                s.git_added = stats.0;
-                s.git_modified = stats.1;
-            }
-        } else {
-            for s in &mut all {
-                if let Some(&(added, modified)) = self.cached_git.get(&s.cwd) {
-                    s.git_added = added;
-                    s.git_modified = modified;
-                } else {
-                    // New cwd not yet in cache — compute on demand to avoid false clean
-                    let stats = process::collect_git_stats(&s.cwd);
-                    self.cached_git.insert(s.cwd.clone(), stats);
-                    s.git_added = stats.0;
-                    s.git_modified = stats.1;
-                }
-            }
         }
-
-        // Hide dead sessions: Codex uses pid==0 sentinel, Claude is filtered in collect().
-        all.retain(|s| !matches!(s.status, SessionStatus::Done));
+        let startup = publish.is_some();
+        for collector in &mut self.collectors {
+            let mut completed = |session: &mut AgentSession| {
+                let stats = self
+                    .cached_git
+                    .entry(session.cwd.clone())
+                    .or_insert_with(|| process::collect_git_stats(&session.cwd));
+                session.git_added = stats.0;
+                session.git_modified = stats.1;
+                if !matches!(session.status, SessionStatus::Done) {
+                    if let Some(publish) = publish.as_mut() {
+                        publish(session);
+                    }
+                }
+            };
+            let mut sessions = if startup {
+                collector.collect_startup(&shared, &mut completed)
+            } else {
+                let mut sessions = collector.collect(&shared);
+                for session in &mut sessions {
+                    completed(session);
+                }
+                sessions
+            };
+            sessions.retain(|s| !matches!(s.status, SessionStatus::Done));
+            all.extend(sessions);
+        }
         all.sort_by_key(|s| std::cmp::Reverse(s.started_at));
 
         // --- Orphan port detection ---

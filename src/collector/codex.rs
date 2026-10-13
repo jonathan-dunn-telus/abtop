@@ -1,7 +1,7 @@
 use super::process::{self, ProcInfo};
 use crate::model::{
-    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface, ModelUsage,
-    RateLimitInfo, SessionStatus, ToolCall, MAX_CHAT_MESSAGES, MAX_FILE_ACCESSES,
+    AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface,
+    ModelUsage, RateLimitInfo, SessionStatus, ToolCall, MAX_CHAT_MESSAGES, MAX_FILE_ACCESSES,
 };
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -30,6 +30,7 @@ pub struct CodexCollector {
     /// Latest rate limit info parsed from Codex JSONL token_count events.
     pub last_rate_limit: Option<RateLimitInfo>,
     desktop_recent_scanner: DesktopRecentRolloutScanner,
+    activity: super::activity::CodexActivity,
 }
 
 #[derive(Clone, Copy)]
@@ -112,6 +113,7 @@ impl CodexCollector {
             sessions_dir: home.join(".codex").join("sessions"),
             last_rate_limit: None,
             desktop_recent_scanner: DesktopRecentRolloutScanner::new(),
+            activity: Default::default(),
         }
     }
 
@@ -131,6 +133,14 @@ impl CodexCollector {
             Self::find_codex_pids_from_shared(&shared.process_info, &shared.mcp_server_pids);
         let just_pids: Vec<u32> = codex_pids.iter().map(|(p, _)| *p).collect();
         let pid_to_jsonl = Self::map_pid_to_jsonl(&just_pids, &self.sessions_dir);
+        for (_, path) in &pid_to_jsonl {
+            self.activity.observe(path.clone());
+        }
+        for paths in shared.desktop_rollout_fd_map.values() {
+            for path in paths {
+                self.activity.observe(path.clone());
+            }
+        }
         let pid_is_exec: HashMap<u32, bool> = codex_pids.into_iter().collect();
 
         let mut sessions = Vec::new();
@@ -138,6 +148,9 @@ impl CodexCollector {
 
         // Active sessions: running codex processes with open JSONL files
         for (pid, jsonl_path) in &pid_to_jsonl {
+            if seen_jsonl.contains(jsonl_path) {
+                continue;
+            }
             let is_exec = pid_is_exec.get(pid).copied().unwrap_or(false);
             if let Some((session, rl)) = self.load_session_with_rate_limit(
                 CodexProcessContext {
@@ -335,6 +348,7 @@ impl CodexCollector {
             }
         }
 
+        self.activity.update(&self.sessions_dir, &mut sessions);
         sessions.sort_by_key(|s| std::cmp::Reverse(s.started_at));
         sessions
     }
@@ -534,6 +548,10 @@ impl CodexCollector {
         children_map: &HashMap<u32, Vec<u32>>,
         ports: &HashMap<u32, Vec<u16>>,
     ) -> Option<(AgentSession, Option<RateLimitInfo>)> {
+        // Classify every discovery route before loading root statistics.
+        if super::activity::codex_meta(jsonl_path).is_some_and(|m| m.parent.is_some()) {
+            return None;
+        }
         let result = parse_codex_jsonl(jsonl_path)?;
 
         let proc = process_ctx.pid.and_then(|p| process_info.get(&p));
@@ -658,6 +676,7 @@ impl CodexCollector {
                 context_history: vec![],
                 compaction_count: 0,
                 context_window: result.context_window,
+                subagent_counts: Default::default(),
                 subagents: vec![],
                 mem_file_count: 0,
                 mem_line_count: 0,
@@ -751,12 +770,12 @@ impl CodexCollector {
     /// JSONL files and assigns them to discovered PIDs, since Windows has no
     /// equivalent of lsof for enumerating open file descriptors.
     /// Falls back to lsof on macOS/other platforms.
-    fn map_pid_to_jsonl(pids: &[u32], sessions_dir: &Path) -> HashMap<u32, PathBuf> {
+    fn map_pid_to_jsonl(pids: &[u32], sessions_dir: &Path) -> Vec<(u32, PathBuf)> {
         // sessions_dir is consumed only by the windows arm below.
         #[cfg(not(target_os = "windows"))]
         let _ = sessions_dir;
 
-        let mut map = HashMap::new();
+        let mut map = Vec::new();
         if pids.is_empty() {
             return map;
         }
@@ -770,8 +789,7 @@ impl CodexCollector {
                         .and_then(|n| n.to_str())
                         .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"));
                     if is_rollout {
-                        map.insert(pid, target);
-                        break;
+                        map.push((pid, target));
                     }
                 }
             }
@@ -797,7 +815,11 @@ impl CodexCollector {
                         }
                         if let Ok(meta) = fs::metadata(&path) {
                             if let Ok(modified) = meta.modified() {
-                                candidates.push((path, modified));
+                                if super::activity::codex_meta(&path)
+                                    .is_some_and(|m| m.parent.is_none())
+                                {
+                                    candidates.push((path, modified));
+                                }
                             }
                         }
                     }
@@ -810,7 +832,7 @@ impl CodexCollector {
             // Assign candidates to PIDs (most recent file → first PID)
             for (i, &pid_u32) in pids.iter().enumerate() {
                 if i < candidates.len() {
-                    map.insert(pid_u32, candidates[i].0.clone());
+                    map.push((pid_u32, candidates[i].0.clone()));
                 }
             }
 
@@ -836,7 +858,7 @@ impl CodexCollector {
                     } else if let Some(name) = line.strip_prefix('n') {
                         if let Some(pid) = current_pid {
                             if name.contains("rollout-") && name.ends_with(".jsonl") {
-                                map.insert(pid, PathBuf::from(name));
+                                map.push((pid, PathBuf::from(name)));
                             }
                         }
                     }
@@ -852,6 +874,10 @@ impl Default for CodexCollector {
         Self::new()
     }
 }
+
+// Child counts are finalized across the entire root set. Keep that pass intact
+// before the default startup implementation publishes completed sessions.
+impl super::StartupCollector for CodexCollector {}
 
 impl super::AgentCollector for CodexCollector {
     fn collect(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
@@ -1717,6 +1743,42 @@ mod tests {
         file.set_modified(when).unwrap();
     }
 
+    #[test]
+    fn child_rollouts_never_load_as_root_sessions_or_change_root_usage() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("rollout-root.jsonl");
+        let child = temp.path().join("rollout-child.jsonl");
+        write_jsonl(&root, &[SESSION_META]);
+        write_jsonl(
+            &child,
+            &[r#"{"type":"session_meta","payload":{"id":"child","parent_thread_id":"sess-123"}}"#],
+        );
+        let collector = CodexCollector::new();
+        let info = HashMap::from([(42, proc_info(42, 1, "codex"))]);
+        let context = owned_process(42);
+        let before = collector
+            .load_session_with_rate_limit(context, &root, &info, &HashMap::new(), &HashMap::new())
+            .unwrap()
+            .0;
+        assert!(collector
+            .load_session_with_rate_limit(context, &child, &info, &HashMap::new(), &HashMap::new())
+            .is_none());
+        let after = collector
+            .load_session_with_rate_limit(context, &root, &info, &HashMap::new(), &HashMap::new())
+            .unwrap()
+            .0;
+        assert_eq!(before.total_tokens(), after.total_tokens());
+        assert_eq!(before.model_usage, after.model_usage);
+        #[cfg(target_os = "linux")]
+        {
+            let _root_fd = fs::File::open(&root).unwrap();
+            let _child_fd = fs::File::open(&child).unwrap();
+            let paths = CodexCollector::map_pid_to_jsonl(&[std::process::id()], temp.path());
+            assert!(paths.iter().any(|(_, path)| path == &root));
+            assert!(paths.iter().any(|(_, path)| path == &child));
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn find_codex_pids_windows_keeps_real_child_over_wrappers() {
@@ -1989,6 +2051,7 @@ mod tests {
             sessions_dir: sessions.path().to_path_buf(),
             last_rate_limit: None,
             desktop_recent_scanner: DesktopRecentRolloutScanner::new(),
+            activity: Default::default(),
         };
         let mut shared = super::super::SharedProcessData {
             process_info: HashMap::new(),

@@ -87,6 +87,7 @@ fn build_app(theme: theme::Theme, cfg: &config::AppConfig) -> App {
         &cfg.claude_config_dirs,
     );
     app.stats_scope = cfg.stats_scope;
+    app.agent_scope = cfg.agent_scope;
     app.show_cache_read_rate = cfg.show_cache_read_rate;
     app
 }
@@ -233,7 +234,7 @@ fn run_app(
     if demo_mode {
         demo::populate_demo(&mut app);
     } else {
-        app.tick();
+        app.start_initial_collection()?;
     }
 
     let mut last_tick = std::time::Instant::now();
@@ -266,6 +267,15 @@ fn run_app(
             false
         };
 
+        if app.should_quit {
+            break;
+        }
+        let startup_completed = !demo_mode && app.poll_initial_collection()?;
+        if startup_completed {
+            app.drain_and_retry_summaries();
+            last_tick = std::time::Instant::now();
+        }
+
         if demo_mode {
             if last_tick.elapsed() >= tick_interval {
                 demo::advance_token_rates(&mut app);
@@ -274,7 +284,7 @@ fn run_app(
                 }
                 last_tick = std::time::Instant::now();
             }
-        } else if !had_input && last_tick.elapsed() >= tick_interval {
+        } else if !app.initializing() && !had_input && last_tick.elapsed() >= tick_interval {
             // Data tick every 2s — skip when handling input to avoid lag
             app.tick();
             last_tick = std::time::Instant::now();
@@ -302,11 +312,12 @@ fn handle_key_press(
         match key.code {
             KeyCode::Esc | KeyCode::Char('v') => app.view_open = false,
             KeyCode::Char('a') => app.toggle_stats_scope(),
+            KeyCode::Char('g') => app.toggle_agent_scope(),
             KeyCode::Char('C') => app.toggle_cache_read_rate(),
             KeyCode::Char('T') => app.tree_view = !app.tree_view,
             KeyCode::Char('l') => app.toggle_timeline(),
             KeyCode::Char('f') => app.toggle_file_audit(),
-            KeyCode::Char(c @ '1'..='9') => app.toggle_panel(c as u8 - b'0'),
+            KeyCode::Char(c @ '0'..='9') => app.toggle_panel(c as u8 - b'0'),
             KeyCode::Char('M') => app.toggle_mcp_session_suppression(),
             KeyCode::Char('t') => app.cycle_theme(),
             _ => {}
@@ -333,6 +344,7 @@ fn handle_key_press(
         match key.code {
             KeyCode::Char('q') => app.quit(),
             KeyCode::Char('a') => app.toggle_stats_scope(),
+            KeyCode::Char('g') => app.toggle_agent_scope(),
             KeyCode::Char('C') => app.toggle_cache_read_rate(),
             KeyCode::Char('r') if !demo_mode => app.tick(),
             KeyCode::Down | KeyCode::Char('j') => app.select_next(),
@@ -349,7 +361,7 @@ fn handle_key_press(
             KeyCode::Char('t') => app.cycle_theme(),
             KeyCode::Char('T') => app.tree_view = !app.tree_view,
             KeyCode::Char('l') | KeyCode::Char('L') => app.toggle_timeline(),
-            KeyCode::Char(c @ '1'..='9') => app.toggle_panel(c as u8 - b'0'),
+            KeyCode::Char(c @ '0'..='9') => app.toggle_panel(c as u8 - b'0'),
             KeyCode::Char('M') => app.toggle_mcp_session_suppression(),
             KeyCode::Char('c') => app.toggle_config(),
             KeyCode::Char('v') => app.toggle_view_menu(),
@@ -377,6 +389,7 @@ fn handle_mouse_event(app: &mut App, mouse: MouseEvent, area: Rect) {
             if let Some(target) = ui::click_target(app, area, mouse.column, mouse.row) {
                 match target {
                     ui::ClickTarget::StatsScope => app.toggle_stats_scope(),
+                    ui::ClickTarget::AgentScope => app.toggle_agent_scope(),
                     ui::ClickTarget::NarrowTab(tab) => app.set_narrow_tab(tab),
                     ui::ClickTarget::NarrowSection(section) => {
                         app.set_active_narrow_section(section);
@@ -580,6 +593,40 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     #[test]
+    fn agent_controls_persist_independently_and_filter_consumes_the_keys() {
+        let mut app = build_app(theme::Theme::default(), &config::AppConfig::default());
+        app.save_panel_visibility = |_| Ok(());
+        app.save_agent_scope = |_| Ok(());
+        assert!(app.show_agents);
+        assert_eq!(app.agent_scope, app::StatsScope::AllLive);
+        let scope = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE);
+        let show = KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE);
+        handle_key_press(&mut app, scope, true, false, |_| panic!("must not jump"));
+        assert_eq!(app.agent_scope, app::StatsScope::Selected);
+        assert_eq!(app.stats_scope, app::StatsScope::Selected);
+        handle_key_press(&mut app, show, true, false, |_| panic!("must not jump"));
+        assert!(!app.show_agents);
+        app.view_open = true;
+        handle_key_press(&mut app, show, true, false, |_| panic!("must not jump"));
+        assert!(app.show_agents);
+        app.view_open = false;
+        app.filter_active = true;
+        handle_key_press(&mut app, scope, true, false, |_| panic!("must not jump"));
+        assert_eq!(app.filter_text, "g");
+        assert_eq!(app.agent_scope, app::StatsScope::Selected);
+        app.clear_filter();
+        app.save_agent_scope = |_| Err("storage failure".into());
+        app.toggle_agent_scope();
+        assert_eq!(app.agent_scope, app::StatsScope::AllLive);
+        assert!(app
+            .status_msg
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("storage failure"));
+    }
+
+    #[test]
     fn token_rate_keyboard_menu_and_config_persist_independently() {
         thread_local! {
             static SAVED: std::cell::RefCell<Vec<(bool, bool)>> = const {
@@ -656,9 +703,7 @@ mod tests {
         assert!(app.show_cache_read_rate);
         app.view_open = false;
         app.toggle_config();
-        for _ in 0..app.config_item_count() {
-            app.config_select_next();
-        }
+        app.config_selected = 10; // Cache chart keeps its existing configuration position.
         handle_key_press(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),

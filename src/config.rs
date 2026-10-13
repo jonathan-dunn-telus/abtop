@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 #[derive(Clone, Copy)]
 pub struct PanelVisibility {
+    pub agents: bool,
     pub context: bool,
     pub token_rate: bool,
     pub quota: bool,
@@ -17,6 +18,7 @@ pub struct PanelVisibility {
 impl Default for PanelVisibility {
     fn default() -> Self {
         Self {
+            agents: true,
             context: true,
             token_rate: true,
             quota: true,
@@ -33,6 +35,7 @@ impl Default for PanelVisibility {
 pub struct AppConfig {
     pub theme: String,
     pub stats_scope: StatsScope,
+    pub agent_scope: StatsScope,
     pub show_cache_read_rate: bool,
     /// Agent CLI names to exclude from the TUI (e.g. ["codex"] to hide Codex).
     /// Matched case-insensitively against each collector's agent_cli identifier.
@@ -51,6 +54,7 @@ impl Default for AppConfig {
         Self {
             theme: "btop".to_string(),
             stats_scope: StatsScope::default(),
+            agent_scope: StatsScope::AllLive,
             show_cache_read_rate: false,
             hidden_agents: Vec::new(),
             claude_config_dirs: Vec::new(),
@@ -105,6 +109,14 @@ fn parse_config_body(content: &str) -> AppConfig {
             }
             let val = val.trim_matches('"').trim_matches('\'');
             match key {
+                "show_agents" => config.panels.agents = parse_bool(val).unwrap_or(true),
+                "agent_scope" => {
+                    config.agent_scope = if val == "selected" {
+                        StatsScope::Selected
+                    } else {
+                        StatsScope::AllLive
+                    }
+                }
                 "stats_scope" => {
                     config.stats_scope = match val {
                         "all_live" => StatsScope::AllLive,
@@ -185,12 +197,17 @@ pub fn save_stats_scope(scope: StatsScope) -> Result<(), String> {
     write_with_updates(&[("stats_scope", format!("\"{}\"", scope.config_value()))])
 }
 
+pub fn save_agent_scope(scope: StatsScope) -> Result<(), String> {
+    write_with_updates(&[("agent_scope", format!("\"{}\"", scope.config_value()))])
+}
+
 pub fn save_cache_read_rate(visible: bool) -> Result<(), String> {
     write_with_updates(&[("show_cache_read_rate", visible.to_string())])
 }
 
 pub fn save_panel_visibility(panels: &PanelVisibility) -> Result<(), String> {
     write_with_updates(&[
+        ("show_agents", panels.agents.to_string()),
         ("show_context", panels.context.to_string()),
         ("show_token_rate", panels.token_rate.to_string()),
         ("show_quota", panels.quota.to_string()),
@@ -251,6 +268,27 @@ fn rewrite_kv_lines(content: &str, updates: &[(&str, String)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_preferences_default_and_round_trip_independently() {
+        for body in ["", "show_agents = invalid\nagent_scope = invalid"] {
+            let cfg = parse_config_body(body);
+            assert!(cfg.panels.agents);
+            assert_eq!(cfg.agent_scope, StatsScope::AllLive);
+        }
+        let text = rewrite_kv_lines(
+            "future_key = 42\nstats_scope = \"all_live\"\n",
+            &[
+                ("show_agents", "false".into()),
+                ("agent_scope", "\"selected\"".into()),
+            ],
+        );
+        let cfg = parse_config_body(&text);
+        assert!(!cfg.panels.agents);
+        assert_eq!(cfg.agent_scope, StatsScope::Selected);
+        assert_eq!(cfg.stats_scope, StatsScope::AllLive);
+        assert!(text.contains("future_key = 42"));
+    }
 
     #[test]
     fn cache_chart_defaults_off_and_round_trips_independently() {

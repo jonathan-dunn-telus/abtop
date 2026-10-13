@@ -77,6 +77,12 @@ Press **`C` (Shift+C)** to add an optional **Cache reads/min** chart below the e
 
 Both rate labels use tokens observed during the preceding 60 seconds, based on elapsed time rather than a fixed number of refreshes. Startup usage is not extrapolated, and already-observed activity remains in the window until it expires even after a session closes. **Reuse %** is `100 × cache reads / (input + cache reads + cache writes)` over that same window; output is excluded, and `—` means there were no input-side tokens. This measures the share of reported input-side tokens served from cache. It is not a percentage of money saved: prices depend on the provider, model, and billing arrangement, and abtop does not estimate dollar costs.
 
+The **Agents** panel (`0`) sits above Sessions and charts the preceding 15 minutes of concurrent Claude Code and Codex agent work, including main sessions and subagents. Braille bars use the same rendering style as Token rate, with theme gradients distinguishing the two stacked providers; the legend shows current counts and the observed peak. Press `g` (or click the panel title with `--mouse`) to switch between **All live**, the default, and **Selected**. This scope is independent of Tokens/Models. Each actively working main session counts once, even without subagents. Its working descendants each count once as well: one working main session with two working subagents counts as three. Waiting and rate-limited main sessions do not contribute to the working count; their working children still do. Shell commands and workflow containers are excluded. The narrow Work tab supports the same panel and zoom controls. Short layouts retain its summary before hiding its chart.
+
+A child counts as working during an unfinished work turn, including model generation and tool execution. Quiet periods do not automatically mark it done. Claude uses child transcripts, launch/completion records, and workflow journal starts, results, and failures; Codex uses child-thread relationships and turn start/completion/interruption events. A small **Unknown** count identifies incomplete lifecycle evidence. Discovery is best-effort and can lag a refresh; filesystem-only Codex children can take up to the 10-second discovery interval to appear. OpenCode subagent tracking is unavailable.
+
+Agent history starts when abtop observes activity, continues while the pane is hidden, and remains in memory for 15 minutes. Closing a session lowers the current count without deleting its history. Each bar preserves a real simultaneous peak sample when the window is wider than the chart. History resets when abtop exits; it is not reconstructed from old transcripts. Token and model totals keep their existing accounting.
+
 The desktop layout reserves minimum widths for enabled panes and switches to tabs when they cannot fit (134 columns with all panes enabled). In the Usage tab, Token rate hides first, then Context, when height is limited, preserving both quota windows and all four token categories. Quota bars shrink before values are clipped, reset countdowns move inline in shorter panes, and Models combines overflow when needed. These automatic layout changes do not alter saved visibility settings.
 
 Model totals include input, output, cache reads, and cache writes, matching the Tokens pane in either scope. Distinct model versions stay separate, and OpenCode entries include the provider. Missing model metadata is counted as `Unknown`. Codex attributes increases in cumulative usage to the current turn's model; if counters decrease, the replacement baseline becomes `Unknown` and subsequent increases resume model attribution.
@@ -149,6 +155,9 @@ theme = "btop"
 stats_scope = "selected"
 # Show per-model usage for the current stats scope (enabled by default).
 show_models = true
+# Agent concurrency panel and its independent scope (0 / g).
+show_agents = true
+agent_scope = "all_live"
 # Independent top-row panes (1: Context, 9: Token rate).
 show_context = true
 show_token_rate = true
@@ -180,6 +189,8 @@ When `language` is unset, abtop auto-detects from `LANG` — any value starting 
 
 | Key                | Action                               |
 | ------------------ | ------------------------------------ |
+| `0`                | Toggle Agents panel               |
+| `g`                | Agents: all live / selected        |
 | `↑`/`↓` or `k`/`j` | Select session                       |
 | `Enter`            | Jump to session terminal             |
 | `x`                | Kill selected session                |
@@ -229,6 +240,8 @@ Stats scope affects the TUI only; `--once` and JSON snapshots retain their per-s
 ## Privacy
 
 abtop reads local files and local process/open-file metadata only. No API keys, no auth. In the TUI and `--once` output, tool names and file paths are shown, but file contents and prompt text are never displayed. Session summaries are generated via `claude --print`, which makes its own API call — this is the only indirect network usage.
+
+JSON snapshots add `subagent_counts` to each session (`working`, `unknown`) and to the top level (separate `claude` and `codex` counts). These remain child-only counts. The top-level `agent_counts` field includes working main sessions and their working children, matching the Agents chart. Both are complete current counts, independent of UI scope and the capped subagent detail list; history is not exported. A one-shot snapshot may precede background discovery of Codex children without open file descriptors.
 
 The JSON snapshot includes richer local dashboard data, including `summary`, `chat_messages`, working directories, config roots, tool-call previews, child process commands, token counts, and port metadata. Chat text is bounded and redacted by the collectors, but it is still derived from local transcripts and may contain sensitive project context. Treat JSON snapshots as local/private data and avoid writing them to shared logs or exposing them on a network without your own access controls.
 
