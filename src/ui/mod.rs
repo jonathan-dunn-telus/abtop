@@ -1792,10 +1792,10 @@ mod tests {
                     (
                         NarrowSection::Tokens,
                         vec![
-                            "Total:", "48.2k", "12.8k", "excl", "1.4M", "CacheW:", "185k",
+                            "Total:", "48.2k", "12.8k", "CacheR:", "1.4M", "CacheW:", "185k",
                         ],
                     ),
-                    (NarrowSection::Models, vec!["models", "%"]),
+                    (NarrowSection::Models, vec!["models", "%", "/min"]),
                 ] {
                     let pane = sections
                         .iter()

@@ -1,6 +1,6 @@
 use super::{App, TokenRates};
 use crate::model::{token_total, AgentSession, ModelUsage, SessionStatus};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 /// The sessions whose usage is displayed in the Tokens and Models panes.
@@ -38,6 +38,7 @@ pub(crate) struct UsageStats {
     pub turns: u64,
     pub model_usage: Vec<ModelUsage>,
     pub rates: TokenRates,
+    pub model_rates: HashMap<String, u64>,
 }
 
 impl UsageStats {
@@ -103,6 +104,10 @@ impl App {
             stats.cache_write += session.total_cache_create;
             stats.turns += u64::from(session.turn_count);
             ModelUsage::merge(&mut stats.model_usage, &session.model_usage);
+            for usage in &session.model_usage {
+                *stats.model_rates.entry(usage.model.clone()).or_default() +=
+                    self.model_token_rate(session, &usage.model, now);
+            }
             stats.rates.add(&self.session_token_rates(session, now));
         }
         stats
@@ -195,6 +200,37 @@ mod tests {
         assert_eq!(app.usage_stats(Instant::now()).total_tokens(), 270);
         app.stats_scope = StatsScope::Selected;
         assert_eq!(app.usage_stats(Instant::now()).total_tokens(), 80);
+    }
+
+    #[test]
+    fn model_rates_share_scope_membership_and_drop_closed_sessions() {
+        let mut app = fixture();
+        app.stats_scope = StatsScope::AllLive;
+        let start = Instant::now();
+        app.update_session_token_rates(start);
+        for (session, delta) in app.sessions.iter_mut().zip([10, 20, 30]) {
+            session.total_input_tokens += delta;
+            ModelUsage::add(&mut session.model_usage, "shared", delta);
+        }
+        let now = start + Duration::from_secs(2);
+        app.update_session_token_rates(now);
+        // Duplicate discovery must not count the same session's rate twice.
+        app.sessions.push(app.sessions[0].clone());
+        app.filter_text = "no matching session".into();
+        app.selected = 1;
+        assert_eq!(app.usage_stats(now).model_rates["shared"], 60);
+
+        app.stats_scope = StatsScope::Selected;
+        assert_eq!(app.usage_stats(now).model_rates["shared"], 20);
+        app.stats_scope = StatsScope::AllLive;
+        app.sessions[1].status = SessionStatus::Done;
+        assert_eq!(app.usage_stats(now).model_rates["shared"], 40);
+        app.sessions[2].status = SessionStatus::Unknown;
+        assert_eq!(app.usage_stats(now).model_rates["shared"], 10);
+        assert_eq!(
+            app.usage_stats(start + Duration::from_secs(62)).model_rates["shared"],
+            0
+        );
     }
 
     #[test]

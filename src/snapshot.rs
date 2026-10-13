@@ -391,6 +391,10 @@ mod tests {
         let snapshot = app.to_snapshot(2_000);
         let json = serde_json::to_value(&snapshot).unwrap();
         for (index, session) in snapshot.sessions.iter().enumerate() {
+            for usage in json["sessions"][index]["model_usage"].as_array().unwrap() {
+                assert_eq!(usage.as_object().unwrap().len(), 2);
+                assert!(usage.get("active_tokens").is_none());
+            }
             assert_eq!(
                 session
                     .model_usage

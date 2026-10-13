@@ -2686,6 +2686,14 @@ mod tests {
         let now = start + std::time::Duration::from_secs(2);
         app.update_session_token_rates(now);
         assert_eq!(
+            app.model_token_rate(&app.sessions[0], "claude-haiku-4-5", now),
+            19
+        );
+        assert_eq!(
+            app.model_token_rate(&app.sessions[0], "claude-sonnet-4-6", now),
+            0
+        );
+        assert_eq!(
             app.session_token_rates(&app.sessions[0], now),
             crate::app::TokenRates {
                 input: 5,
@@ -2709,6 +2717,22 @@ mod tests {
         assert_eq!(app.sessions[0].total_cache_read, 43);
         assert_eq!(app.sessions[0].total_cache_create, 52);
         app.update_session_token_rates(start + std::time::Duration::from_secs(4));
+        assert_eq!(
+            app.model_token_rate(
+                &app.sessions[0],
+                "claude-haiku-4-5",
+                start + std::time::Duration::from_secs(4)
+            ),
+            19
+        );
+        assert_eq!(
+            app.model_token_rate(
+                &app.sessions[0],
+                "claude-haiku-4-5",
+                start + std::time::Duration::from_secs(62)
+            ),
+            0
+        );
         assert_eq!(
             app.session_token_rates(&app.sessions[0], start + std::time::Duration::from_secs(62)),
             crate::app::TokenRates::default(),
@@ -3973,7 +3997,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
                 },
                 ModelUsage {
                     model: "Unknown".into(),
-                    total_tokens: 2
+                    total_tokens: 2,
                 },
             ]
         );
@@ -3996,7 +4020,7 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
             reset.model_usage,
             vec![ModelUsage {
                 model: "replacement".into(),
-                total_tokens: 1
+                total_tokens: 1,
             }]
         );
     }

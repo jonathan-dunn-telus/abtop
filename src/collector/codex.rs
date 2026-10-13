@@ -1415,7 +1415,10 @@ fn parse_codex_jsonl(path: &Path) -> Option<CodexJSONLResult> {
                             // leaves the attributed total unchanged or even higher.
                             let previous_with_cache = previous + result.total_cache_read;
                             let current_with_cache = current + cache;
-                            if current_with_cache < previous_with_cache || current < previous {
+                            if current_with_cache < previous_with_cache
+                                || current < previous
+                                || cache < result.total_cache_read
+                            {
                                 // A replacement baseline cannot be attributed to the latest model.
                                 result.model_usage.clear();
                                 ModelUsage::add(&mut result.model_usage, "Unknown", current);
@@ -2252,6 +2255,38 @@ mod tests {
                         total_tokens: 40,
                     },
                 ]
+            );
+        }
+    }
+
+    #[test]
+    fn model_usage_rebaselines_cache_corrections_without_total_decreases() {
+        for (cached, expected_active) in [(180, 40), (20, 200)] {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            let corrected = serde_json::json!({
+                "type": "event_msg", "payload": {"type": "token_count", "info": {
+                    "total_token_usage": {"input_tokens": 200, "output_tokens": 20,
+                        "cached_input_tokens": cached}
+                }}
+            })
+            .to_string();
+            write_lines(
+                &mut file,
+                &[
+                    SESSION_META,
+                    r#"{"type":"turn_context","payload":{"model":"gpt-5-codex"}}"#,
+                    r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":200,"output_tokens":20,"cached_input_tokens":100}}}}"#,
+                    &corrected,
+                    &corrected,
+                ],
+            );
+            let result = parse_codex_jsonl(file.path()).unwrap();
+            assert_eq!(
+                result.model_usage,
+                vec![ModelUsage {
+                    model: "Unknown".into(),
+                    total_tokens: expected_active,
+                }]
             );
         }
     }

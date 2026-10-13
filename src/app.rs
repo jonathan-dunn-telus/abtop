@@ -100,6 +100,7 @@ struct SessionTokenRates {
     output: TokenRateCounter,
     cache_read: TokenRateCounter,
     cache_write: TokenRateCounter,
+    models: HashMap<String, TokenRateCounter>,
     last_seen: Instant,
 }
 
@@ -110,11 +111,53 @@ impl SessionTokenRates {
             output: TokenRateCounter::new(session.total_output_tokens),
             cache_read: TokenRateCounter::new(session.total_cache_read),
             cache_write: TokenRateCounter::new(session.total_cache_create),
+            models: session
+                .model_usage
+                .iter()
+                .map(|usage| {
+                    (
+                        usage.model.clone(),
+                        TokenRateCounter::new(usage.total_tokens),
+                    )
+                })
+                .collect(),
             last_seen: now,
         }
     }
 
     fn update(&mut self, session: &AgentSession, now: Instant) -> TokenRates {
+        let previous_total = token_total(
+            self.input.previous,
+            self.output.previous,
+            self.cache_write.previous,
+        );
+        // A reset or replacement of attribution invalidates model baselines,
+        // including newly introduced Unknown entries. Do not count a replacement
+        // baseline as fresh work just because its model identity changed.
+        let reset_models = session.total_tokens() < previous_total
+            || session.total_tokens() + session.total_cache_read
+                < previous_total + self.cache_read.previous
+            || session.total_cache_read < self.cache_read.previous
+            || self.models.iter().any(|(model, counter)| {
+                session
+                    .model_usage
+                    .iter()
+                    .find(|usage| &usage.model == model)
+                    .is_none_or(|usage| usage.total_tokens < counter.previous)
+            });
+        if reset_models {
+            self.models.clear();
+        }
+        for usage in &session.model_usage {
+            self.models
+                .entry(usage.model.clone())
+                .or_insert_with(|| {
+                    // A model first used in an already observed session starts
+                    // at zero so its first batch contributes to the rate.
+                    TokenRateCounter::new(if reset_models { usage.total_tokens } else { 0 })
+                })
+                .update(usage.total_tokens, now);
+        }
         self.last_seen = now;
         TokenRates {
             input: self.input.update(session.total_input_tokens, now),
@@ -892,6 +935,19 @@ impl App {
             .unwrap_or_default()
     }
 
+    pub(crate) fn model_token_rate(
+        &self,
+        session: &AgentSession,
+        model: &str,
+        now: Instant,
+    ) -> u64 {
+        self.session_token_rates
+            .get(&(session.agent_cli.to_string(), session.session_id.clone()))
+            .and_then(|rates| rates.models.get(model))
+            .map(|counter| counter.rate(now))
+            .unwrap_or_default()
+    }
+
     /// Drain completed summary results and spawn retries. Does NOT recollect
     /// sessions, so it is safe for `--once` mode (stable snapshot).
     pub fn drain_and_retry_summaries(&mut self) {
@@ -1361,7 +1417,103 @@ fn is_killable_agent_command(cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::LaunchSurface;
+    use crate::model::{LaunchSurface, ModelUsage};
+
+    fn add_model_usage(session: &mut AgentSession, model: &str, tokens: [u64; 4]) {
+        let [input, output, cache_read, cache_write] = tokens;
+        session.total_input_tokens += input;
+        session.total_output_tokens += output;
+        session.total_cache_read += cache_read;
+        session.total_cache_create += cache_write;
+        ModelUsage::add(
+            &mut session.model_usage,
+            model,
+            token_total(input, output, cache_write),
+        );
+    }
+
+    #[test]
+    fn model_rates_count_new_work_and_expire_without_extrapolating() {
+        let start = Instant::now();
+        let mut session = waiting_session("claude");
+        add_model_usage(&mut session, "model-a", [100, 50, 10_000, 25]);
+        let mut rates = SessionTokenRates::new(&session, start);
+        assert_eq!(rates.models["model-a"].rate(start), 0);
+
+        add_model_usage(&mut session, "model-a", [10, 20, 3_000, 40]);
+        add_model_usage(&mut session, "model-b", [1, 2, 400, 4]);
+        add_model_usage(&mut session, "", [0, 0, 400, 0]);
+        let now = start + Duration::from_secs(2);
+        rates.update(&session, now);
+        assert_eq!(rates.models["model-a"].rate(now), 70);
+        assert_eq!(rates.models["model-b"].rate(now), 7);
+        assert!(!rates.models.contains_key("Unknown"));
+        let categories = rates.rates(now);
+        assert_eq!(
+            rates
+                .models
+                .values()
+                .map(|counter| counter.rate(now))
+                .sum::<u64>(),
+            categories.input + categories.output + categories.cache_write
+        );
+
+        // Neither unchanged polls nor cache reads add to model rates.
+        rates.update(&session, start + Duration::from_secs(3));
+        add_model_usage(&mut session, "model-a", [0, 0, 1_000, 0]);
+        rates.update(&session, start + Duration::from_secs(4));
+        assert_eq!(
+            rates.models["model-a"].rate(start + Duration::from_secs(61)),
+            70
+        );
+        for counter in rates.models.values() {
+            assert_eq!(counter.rate(start + Duration::from_secs(62)), 0);
+        }
+    }
+
+    #[test]
+    fn model_rates_rebaseline_replacements_and_decreasing_counters() {
+        let start = Instant::now();
+        let mut session = waiting_session("codex");
+        add_model_usage(&mut session, "model-a", [100, 0, 0, 0]);
+        let mut rates = SessionTokenRates::new(&session, start);
+        add_model_usage(&mut session, "model-a", [20, 0, 0, 0]);
+        rates.update(&session, start + Duration::from_secs(2));
+
+        // A new identity replacing the old attribution is a baseline even if
+        // the overall total grew. It must not appear as a new-model spike.
+        session = waiting_session("codex");
+        add_model_usage(&mut session, "Unknown", [500, 0, 0, 0]);
+        let now = start + Duration::from_secs(4);
+        rates.update(&session, now);
+        assert!(!rates.models.contains_key("model-a"));
+        assert_eq!(rates.models["Unknown"].rate(now), 0);
+        add_model_usage(&mut session, "model-a", [10, 0, 0, 0]);
+        let now = start + Duration::from_secs(6);
+        rates.update(&session, now);
+        assert_eq!(rates.models["model-a"].rate(now), 10);
+
+        session = waiting_session("codex");
+        add_model_usage(&mut session, "model-a", [5, 0, 0, 0]);
+        let now = start + Duration::from_secs(8);
+        rates.update(&session, now);
+        assert_eq!(rates.models["model-a"].rate(now), 0);
+        add_model_usage(&mut session, "model-a", [3, 0, 0, 0]);
+        let now = start + Duration::from_secs(10);
+        rates.update(&session, now);
+        assert_eq!(rates.models["model-a"].rate(now), 3);
+
+        // Reclassifying cached tokens as input is a correction, even with the
+        // same model and unchanged overall total; it is not new active work.
+        add_model_usage(&mut session, "model-a", [0, 0, 100, 0]);
+        rates.update(&session, start + Duration::from_secs(12));
+        session.total_cache_read -= 10;
+        session.total_input_tokens += 10;
+        session.model_usage[0].total_tokens += 10;
+        let now = start + Duration::from_secs(14);
+        rates.update(&session, now);
+        assert_eq!(rates.models["model-a"].rate(now), 0);
+    }
 
     fn waiting_session(cli: &'static str) -> AgentSession {
         AgentSession {
@@ -2026,12 +2178,16 @@ mod tests {
         app.sessions[3].session_id = "another-session".into();
         app.update_session_token_rates(start);
         for (index, session) in app.sessions.iter_mut().enumerate() {
-            session.total_input_tokens = (index as u64 + 1) * 100;
+            add_model_usage(session, "shared-model", [(index as u64 + 1) * 100, 0, 0, 0]);
         }
         let now = start + Duration::from_secs(2);
         app.update_session_token_rates(now);
         for selected in [3, 1, 0, 2] {
             app.selected = selected;
+            assert_eq!(
+                app.model_token_rate(&app.sessions[app.selected], "shared-model", now),
+                (selected as u64 + 1) * 100
+            );
             assert_eq!(
                 app.session_token_rates(&app.sessions[app.selected], now)
                     .input,
@@ -2041,6 +2197,10 @@ mod tests {
         app.sessions.reverse();
         app.update_session_token_rates(start + Duration::from_secs(4));
         for session in &app.sessions {
+            assert_eq!(
+                app.model_token_rate(session, "shared-model", start + Duration::from_secs(4)),
+                session.total_input_tokens
+            );
             assert_eq!(
                 app.session_token_rates(session, start + Duration::from_secs(4))
                     .input,
@@ -2054,22 +2214,27 @@ mod tests {
         let start = Instant::now();
         let mut app = App::new_with_config(Theme::default(), &[], Default::default());
         let mut session = waiting_session("claude");
-        session.total_input_tokens = 1_000;
+        add_model_usage(&mut session, "shared-model", [1_000, 0, 0, 0]);
         app.sessions = vec![session.clone()];
         app.update_session_token_rates(start);
         assert_eq!(
             app.session_token_rates(&session, start),
             TokenRates::default()
         );
-        app.sessions[0].total_input_tokens = 1_200;
+        assert_eq!(app.model_token_rate(&session, "shared-model", start), 0);
+        add_model_usage(&mut app.sessions[0], "shared-model", [200, 0, 0, 0]);
         app.update_session_token_rates(start + Duration::from_secs(2));
         app.sessions.clear();
         app.update_session_token_rates(start + Duration::from_secs(4));
         assert_eq!(app.session_token_rates.len(), 1);
 
-        session.total_input_tokens = 1_250;
+        add_model_usage(&mut session, "shared-model", [250, 0, 0, 0]);
         app.sessions.push(session.clone());
         app.update_session_token_rates(start + Duration::from_secs(20));
+        assert_eq!(
+            app.model_token_rate(&session, "shared-model", start + Duration::from_secs(20)),
+            250
+        );
         assert_eq!(
             app.session_token_rates(&session, start + Duration::from_secs(20))
                 .input,
@@ -2081,9 +2246,13 @@ mod tests {
         app.update_session_token_rates(start + Duration::from_secs(80));
         assert!(app.session_token_rates.is_empty());
 
-        session.total_input_tokens = 50_000;
+        add_model_usage(&mut session, "shared-model", [48_750, 0, 0, 0]);
         app.sessions.push(session.clone());
         app.update_session_token_rates(start + Duration::from_secs(81));
+        assert_eq!(
+            app.model_token_rate(&session, "shared-model", start + Duration::from_secs(81)),
+            0
+        );
         assert_eq!(
             app.session_token_rates(&session, start + Duration::from_secs(81)),
             TokenRates::default()
