@@ -14,6 +14,19 @@ use super::{
     stats_panel_title, styled_label,
 };
 
+/// Keep the cache-read exclusion visible even when bars must disappear.
+fn cache_read_label(inner_width: usize, value_width: usize) -> String {
+    let label = t("tokens.cache_r");
+    [
+        format!(" {label} excluded:"),
+        format!(" {label} excl:"),
+        "CR excl".to_string(),
+    ]
+    .into_iter()
+    .find(|label| label.width() + 1 + value_width <= inner_width)
+    .unwrap_or_else(|| "CR excl".to_string())
+}
+
 struct TokenRow<'a> {
     label: String,
     total_text: String,
@@ -57,11 +70,12 @@ pub(crate) fn draw_tokens_panel_active(
     let cache_read = stats.cache_read;
     let cache_write = stats.cache_write;
     let total = stats.total_tokens();
+    let raw_total = total + cache_read;
     let turns = stats.turns;
     let avg = stats.average_tokens();
     let panel_title = stats_panel_title(app, "tokens", area.width, active);
     let block = btop_block_active(&panel_title, "³", theme.mem_box, theme, active);
-    if app.stats_scope == StatsScope::AllLive && total == 0 {
+    if app.stats_scope == StatsScope::AllLive && raw_total == 0 {
         let message = if stats.session_count == 0 {
             "No live sessions"
         } else {
@@ -76,13 +90,13 @@ pub(crate) fn draw_tokens_panel_active(
         return;
     }
 
-    // Compute percentages for mini meter bars
-    let (in_pct, out_pct, cache_r_pct, cache_w_pct) = if total > 0 {
+    // Category bars show shares of all raw usage, including excluded cache reads.
+    let (in_pct, out_pct, cache_r_pct, cache_w_pct) = if raw_total > 0 {
         (
-            total_in as f64 / total as f64 * 100.0,
-            total_out as f64 / total as f64 * 100.0,
-            cache_read as f64 / total as f64 * 100.0,
-            cache_write as f64 / total as f64 * 100.0,
+            total_in as f64 / raw_total as f64 * 100.0,
+            total_out as f64 / raw_total as f64 * 100.0,
+            cache_read as f64 / raw_total as f64 * 100.0,
+            cache_write as f64 / raw_total as f64 * 100.0,
         )
     } else {
         (0.0, 0.0, 0.0, 0.0)
@@ -116,7 +130,7 @@ pub(crate) fn draw_tokens_panel_active(
     ];
 
     let rates = stats.rates;
-    let rows = [
+    let mut rows = [
         TokenRow::new(
             format!(" {} :", t("tokens.input")),
             total_in,
@@ -132,7 +146,10 @@ pub(crate) fn draw_tokens_panel_active(
             &used_grad,
         ),
         TokenRow::new(
-            format!(" {}:", t("tokens.cache_r")),
+            cache_read_label(
+                area.width.saturating_sub(2) as usize,
+                fmt_tokens(cache_read).width(),
+            ),
             cache_read,
             rates.cache_read,
             cache_r_pct,
@@ -150,14 +167,26 @@ pub(crate) fn draw_tokens_panel_active(
     // Reserve text space before allocating bars, using the same bar width and
     // rate visibility for every row. Account for the panel's two borders.
     let inner_w = area.width.saturating_sub(2) as usize;
-    let rate_text_w = rows
-        .iter()
-        .map(|row| row.label.width() + row.total_text.width() + row.rate_text.width())
-        .max()
-        .unwrap_or(0);
-    let show_rates = rate_text_w <= inner_w;
+    let rate_text_w = |rows: &[TokenRow<'_>]| {
+        rows.iter()
+            .map(|row| row.label.width() + row.total_text.width() + row.rate_text.width())
+            .max()
+            .unwrap_or(0)
+    };
+    // Shorten the exclusion label before hiding rates, then restore its fuller
+    // form when even compact labels cannot keep every category's rate visible.
+    if rate_text_w(&rows) > inner_w {
+        rows[2].label = cache_read_label(
+            inner_w,
+            rows[2].total_text.width() - 1 + rows[2].rate_text.width(),
+        );
+    }
+    let show_rates = rate_text_w(&rows) <= inner_w;
+    if !show_rates {
+        rows[2].label = cache_read_label(inner_w, rows[2].total_text.width() - 1);
+    }
     let text_w = if show_rates {
-        rate_text_w
+        rate_text_w(&rows)
     } else {
         rows.iter()
             .map(|row| row.label.width() + row.total_text.width())
@@ -280,6 +309,40 @@ mod tests {
     }
 
     #[test]
+    fn tokens_exclude_reads_and_keep_the_exclusion_and_values_visible() {
+        let mut app = app_with_rates([100, 50, 200, 30], [0; 4]);
+        app.sessions[0].turn_count = 2;
+        for scope in [StatsScope::Selected, StatsScope::AllLive] {
+            app.stats_scope = scope;
+            for width in [15, 20, 32, 60] {
+                let lines = render(&app, width);
+                assert!(lines[1].contains("180"), "{width}: {}", lines[1]);
+                assert!(lines[4].contains("200"), "{width}: {}", lines[4]);
+                assert!(lines[4].contains("excl"), "{width}: {}", lines[4]);
+                assert!(lines[5].contains("30"), "{width}: {}", lines[5]);
+                if width >= 32 {
+                    assert!(lines[7].contains("90/t"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cache_only_and_zero_turn_usage_stay_visible_without_invalid_averages() {
+        let mut app = app_with_rates([0, 0, 200, 0], [0; 4]);
+        app.sessions[0].turn_count = 0;
+        for scope in [StatsScope::Selected, StatsScope::AllLive] {
+            app.stats_scope = scope;
+            let lines = render(&app, 32);
+            assert!(lines[1].contains("Total: 0"));
+            assert!(lines[4].contains("200"));
+            assert!(lines[4].contains("excl"));
+            assert!(lines[7].contains("0/t"));
+            assert!(!lines.join("\n").contains("NaN"));
+        }
+    }
+
+    #[test]
     fn aggregate_tokens_show_combined_categories_and_time_based_history() {
         let mut app = app_with_rates([100, 200, 300, 400], [1, 2, 3, 4]);
         let mut other = app.sessions[0].clone();
@@ -289,7 +352,7 @@ mod tests {
         app.stats_scope = StatsScope::AllLive;
         let lines = render(&app, 60);
         assert!(lines[0].contains("tokens · All live"));
-        assert!(lines[1].contains("2k"));
+        assert!(lines[1].contains("1.4k"));
         for (row, values) in [
             (2, "200  1/min"),
             (3, "400  2/min"),
@@ -301,7 +364,7 @@ mod tests {
         assert!(lines[6].contains("tokens/min"));
         app.stats_scope = StatsScope::Selected;
         let selected = render(&app, 60);
-        assert!(selected[1].contains("1k"));
+        assert!(selected[1].contains("700"));
         assert!(!selected[6].contains("tokens/min"));
     }
 
@@ -325,7 +388,7 @@ mod tests {
             for (row, label, values) in [
                 (2, "Input", "402k  12.3k/min"),
                 (3, "Output", "89k  4.5k/min"),
-                (4, "CacheR", "710k  6.8k/min"),
+                (4, "excl", "710k  6.8k/min"),
                 (5, "CacheW", "12k  0/min"),
             ] {
                 assert!(lines[row].contains(label), "{}", lines[row]);

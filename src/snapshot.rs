@@ -33,11 +33,11 @@ pub struct Snapshot {
     pub subagent_counts: crate::model::AgentTotals,
     /// Working main agents plus their working subagents, independent of UI scope.
     pub agent_counts: crate::model::AgentTotals,
-    /// Most recent per-tick token rate: the delta of *active* tokens, where
-    /// active = input + output + cache_create (cache_read is excluded to avoid
-    /// inflated rates). It therefore will NOT equal successive `total_tokens`
-    /// diffs (which include cache_read). `0.0` on the first tick of a fresh
-    /// process (no prior totals to diff against).
+    /// Most recent per-tick delta of input + output + cache writes, excluding
+    /// cache reads, on the same accounting basis as `total_tokens`.
+    /// First observations establish baselines rather than activity spikes;
+    /// session churn means this need not equal a diff of aggregate totals.
+    /// `0.0` on the first tick of a fresh process.
     pub token_rate: f64,
     /// Collector tick interval in milliseconds. Divide `token_rate` by
     /// `interval_ms / 1000` for a per-second rate.
@@ -81,7 +81,7 @@ pub struct SubAgentView {
     pub name: String,
     /// Free-text status reported for the subagent (e.g. `"working"`, `"done"`).
     pub status: String,
-    /// Tokens attributed to this subagent.
+    /// Input + output + cache writes attributed to this subagent; excludes reads.
     pub tokens: u64,
 }
 
@@ -115,7 +115,7 @@ pub struct SessionView {
     pub context_percent: f64,
     /// Total context-window size in tokens (e.g. 200000).
     pub context_window: u64,
-    /// All token classes summed: input + output + cache read + cache write.
+    /// Input + output + cache writes; excludes cache reads.
     pub total_tokens: u64,
     /// Lifetime usage per model, including the same subagents as the session totals.
     pub model_usage: Vec<ModelUsage>,
@@ -123,7 +123,7 @@ pub struct SessionView {
     pub input_tokens: u64,
     /// Cumulative output (completion) tokens for the session.
     pub output_tokens: u64,
-    /// Cumulative cache-read tokens (excluded from the active-token rate).
+    /// Cumulative cache-read tokens (excluded from totals and activity rates).
     pub cache_read_tokens: u64,
     /// Cumulative cache-write (cache-creation) tokens.
     pub cache_create_tokens: u64,
@@ -151,9 +151,8 @@ pub struct SessionView {
     // --- richer fields for the per-session detail view ---
     /// Number of detected context-compaction events.
     pub compaction_count: u32,
-    /// Per-turn token totals for a sparkline (trimmed tail). The absolute scale
-    /// differs by agent (Claude counts cache tokens, Codex does not), so use it
-    /// as a relative per-session trend, not for cross-session magnitude.
+    /// Per-turn input + output + cache writes for a sparkline (trimmed tail).
+    /// Cache reads are excluded. Turn boundaries remain agent-specific.
     pub token_history: Vec<u64>,
     /// Spawned subagents, if any.
     pub subagents: Vec<SubAgentView>,
@@ -377,6 +376,7 @@ mod tests {
         for s in &snap.sessions {
             // Bounded tails.
             assert!(s.token_history.len() <= 64);
+            assert!(s.token_history.iter().sum::<u64>() <= s.total_tokens);
             assert!(s.tool_calls.len() <= 24);
             // Chat roles map to the stable wire strings only.
             for m in &s.chat_messages {
@@ -409,6 +409,28 @@ mod tests {
             );
         }
         assert_eq!(snapshot.sessions[0].model_usage.len(), 2);
+    }
+
+    #[test]
+    fn snapshot_total_excludes_reads_and_preserves_raw_counters() {
+        let mut app = demo_app();
+        let session = &mut app.sessions[0];
+        session.total_input_tokens = 100;
+        session.total_output_tokens = 50;
+        session.total_cache_read = 200;
+        session.total_cache_create = 30;
+        session.model_usage = vec![ModelUsage {
+            model: session.model.clone(),
+            total_tokens: 180,
+        }];
+        let json = serde_json::to_value(app.to_snapshot(2_000)).unwrap();
+        let session = &json["sessions"][0];
+        assert_eq!(session["total_tokens"], 180);
+        assert_eq!(session["input_tokens"], 100);
+        assert_eq!(session["output_tokens"], 50);
+        assert_eq!(session["cache_read_tokens"], 200);
+        assert_eq!(session["cache_create_tokens"], 30);
+        assert_eq!(session["model_usage"][0]["total_tokens"], 180);
     }
 
     #[test]

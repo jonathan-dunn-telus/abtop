@@ -1,5 +1,5 @@
 use super::{App, TokenRates};
-use crate::model::{AgentSession, ModelUsage, SessionStatus};
+use crate::model::{token_total, AgentSession, ModelUsage, SessionStatus};
 use std::collections::HashSet;
 use std::time::Instant;
 
@@ -42,7 +42,7 @@ pub(crate) struct UsageStats {
 
 impl UsageStats {
     pub fn total_tokens(&self) -> u64 {
-        self.input + self.output + self.cache_read + self.cache_write
+        token_total(self.input, self.output, self.cache_write)
     }
 
     pub fn average_tokens(&self) -> u64 {
@@ -137,11 +137,11 @@ mod tests {
             session.status = status;
             session.model_usage.clear();
         }
-        ModelUsage::add(&mut app.sessions[0].model_usage, "shared", 400);
+        ModelUsage::add(&mut app.sessions[0].model_usage, "shared", 100);
         ModelUsage::add(&mut app.sessions[0].model_usage, "Unknown", 60);
-        ModelUsage::add(&mut app.sessions[1].model_usage, "shared", 50);
+        ModelUsage::add(&mut app.sessions[1].model_usage, "shared", 30);
         ModelUsage::add(&mut app.sessions[1].model_usage, "shared-v2", 50);
-        ModelUsage::add(&mut app.sessions[2].model_usage, "provider/shared", 40);
+        ModelUsage::add(&mut app.sessions[2].model_usage, "provider/shared", 30);
         app
     }
 
@@ -174,27 +174,27 @@ mod tests {
             ],
             [150, 60, 330, 60]
         );
-        assert_eq!(stats.total_tokens(), 600);
+        assert_eq!(stats.total_tokens(), 270);
         assert_eq!(stats.turns, 10);
-        assert_eq!(stats.average_tokens(), 60);
+        assert_eq!(stats.average_tokens(), 27);
         assert_eq!(
             stats
                 .model_usage
                 .iter()
                 .map(|entry| entry.total_tokens)
                 .sum::<u64>(),
-            600
+            270
         );
         let sorted = ModelUsage::sorted(&stats.model_usage);
-        assert_eq!((&*sorted[0].model, sorted[0].total_tokens), ("shared", 450));
+        assert_eq!((&*sorted[0].model, sorted[0].total_tokens), ("shared", 130));
         assert_eq!(sorted.len(), 4);
 
         app.filter_text = "no matching session".into();
         assert!(app.visible_indices().is_empty());
         app.selected = 1;
-        assert_eq!(app.usage_stats(Instant::now()).total_tokens(), 600);
+        assert_eq!(app.usage_stats(Instant::now()).total_tokens(), 270);
         app.stats_scope = StatsScope::Selected;
-        assert_eq!(app.usage_stats(Instant::now()).total_tokens(), 100);
+        assert_eq!(app.usage_stats(Instant::now()).total_tokens(), 80);
     }
 
     #[test]
@@ -226,16 +226,16 @@ mod tests {
         );
         assert_eq!(
             app.live_token_history.iter().copied().collect::<Vec<_>>(),
-            vec![0, 60]
+            vec![0, 42]
         );
 
         app.sessions.retain(|session| session.agent_cli != "claude");
         let now = start + Duration::from_secs(4);
         app.update_session_token_rates(now);
-        assert_eq!(app.usage_stats(now).total_tokens(), 190);
-        assert_eq!(app.live_token_history.back(), Some(&50));
+        assert_eq!(app.usage_stats(now).total_tokens(), 145);
+        assert_eq!(app.live_token_history.back(), Some(&35));
         // Past samples keep their membership from the time they were observed.
-        assert_eq!(app.live_token_history[1], 60);
+        assert_eq!(app.live_token_history[1], 42);
 
         let mut arriving = app.sessions[0].clone();
         arriving.session_id = "new-session".into();
@@ -243,7 +243,7 @@ mod tests {
         app.sessions.push(arriving);
         let now = start + Duration::from_secs(6);
         app.update_session_token_rates(now);
-        assert_eq!(app.live_token_history.back(), Some(&50));
+        assert_eq!(app.live_token_history.back(), Some(&35));
         app.update_session_token_rates(start + Duration::from_secs(62));
         assert_eq!(app.live_token_history.back(), Some(&0));
         app.sessions.clear();
@@ -252,6 +252,38 @@ mod tests {
             app.usage_stats(start + Duration::from_secs(64))
                 .session_count,
             0
+        );
+    }
+
+    #[test]
+    fn cache_only_updates_preserve_totals_averages_and_zero_activity_histories() {
+        let mut app = fixture();
+        app.clear_global_token_history();
+        app.stats_scope = StatsScope::AllLive;
+        let start = Instant::now();
+        app.update_session_token_rates(start);
+        let before = app.usage_stats(start);
+        app.sessions[0].total_cache_read += 200;
+        let now = start + Duration::from_secs(2);
+        app.update_session_token_rates(now);
+        let after = app.usage_stats(now);
+        assert_eq!(after.total_tokens(), before.total_tokens());
+        assert_eq!(after.average_tokens(), before.average_tokens());
+        assert_eq!(after.model_usage, before.model_usage);
+        assert_eq!(after.cache_read, before.cache_read + 200);
+        assert_eq!(app.live_token_history.back(), Some(&0));
+        assert_eq!(app.token_rates.back(), Some(&0.0));
+        assert_eq!(app.cache_read_rates.back(), Some(&200.0));
+        assert_eq!(app.global_token_rates(now).cache_read, 200);
+        assert_eq!(
+            app.global_token_rates(now).cache_reuse_percent(),
+            Some(100.0)
+        );
+        app.sessions.clear();
+        assert_eq!(app.global_token_rates(now).cache_read, 200);
+        assert_eq!(
+            app.global_token_rates(start + Duration::from_secs(62)),
+            TokenRates::default()
         );
     }
 

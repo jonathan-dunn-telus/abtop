@@ -134,6 +134,44 @@ mod tests {
     }
 
     #[test]
+    fn cache_reads_do_not_change_shares_order_or_overflow_in_either_scope() {
+        let mut app = app_with_usage();
+        app.sessions.truncate(1);
+        for scope in [StatsScope::Selected, StatsScope::AllLive] {
+            app.stats_scope = scope;
+            for (width, height) in [(20, 4), (20, 6), (50, 6)] {
+                let before = render(&app, width, height);
+                app.sessions[0].total_cache_read += 1_000_000;
+                assert_eq!(render(&app, width, height), before);
+            }
+            let stats = app.usage_stats(Instant::now());
+            assert_eq!(
+                stats
+                    .model_usage
+                    .iter()
+                    .map(|entry| entry.total_tokens)
+                    .sum::<u64>(),
+                stats.total_tokens()
+            );
+        }
+    }
+
+    #[test]
+    fn cache_only_models_have_an_explicit_empty_state_in_both_scopes() {
+        let mut app = app_with_usage();
+        app.sessions.truncate(1);
+        app.sessions[0].total_input_tokens = 0;
+        app.sessions[0].total_cache_read = 200;
+        app.sessions[0].model_usage.clear();
+        for scope in [StatsScope::Selected, StatsScope::AllLive] {
+            app.stats_scope = scope;
+            let text = render(&app, 40, 6);
+            assert!(text.contains("No usage yet"));
+            assert!(!text.contains('%'));
+        }
+    }
+
+    #[test]
     fn aggregate_models_use_combined_denominator_and_explicit_scope() {
         let mut app = app_with_usage();
         app.sessions.truncate(1);
