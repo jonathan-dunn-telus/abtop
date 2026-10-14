@@ -70,8 +70,14 @@ through a merge. It ignores the `Merge branch 'x' into remix` commit itself.
    `Cargo.lock`, `.release-please-manifest.json`, and `CHANGELOG.md`.
 2. Review the version and changelog in the PR, then merge it. CI does not run on this PR,
    because GitHub does not start workflows for PRs opened with `GITHUB_TOKEN`.
-3. release-please tags the merge commit `vX.Y.Z-remix.N` and creates the GitHub Release.
-4. Update your local copy: `git switch remix && git pull raphberube remix && git fetch raphberube --tags`.
+3. release-please tags the merge commit `vX.Y.Z-remix.N` and creates the GitHub Release. GitHub
+   marks it as a prerelease because of the `-remix.N` suffix, so `/releases/latest` never points
+   to it. Link to releases by tag.
+4. The `build` job in the same workflow builds `abtop` for each target in its matrix. It uploads
+   `abtop-<tag>-<target>.tar.gz` (`.zip` on Windows) and a matching `.sha256` file to the
+   release. If a target fails, re-run the failed job from the Actions tab. Uploads replace any
+   files that already exist.
+5. Update your local copy: `git switch remix && git pull raphberube remix && git fetch raphberube --tags`.
 
 The first run needs **Settings → Actions → General → Allow GitHub Actions to create and approve
 pull requests** turned on, or release-please cannot open its PR.
@@ -133,7 +139,7 @@ on any path above.
 | Workflow | File | State in the fork |
 |---|---|---|
 | CI | `ci.yml` | Enabled. Runs on pushes and PRs to `remix` |
-| release-please | `release-please.yml` | Enabled. Runs on pushes to `remix` |
+| release-please | `release-please.yml` | Enabled. Runs on pushes to `remix`, and builds release binaries when it creates a release |
 | Publish to crates.io | `publish.yml` | **Disabled, no automatic triggers. MUST NEVER be enabled** |
 | Release | `release.yml` | **Disabled, no automatic triggers. MUST NEVER be enabled** |
 
