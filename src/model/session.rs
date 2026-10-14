@@ -62,6 +62,9 @@ pub enum SessionStatus {
     Thinking,
     /// Running a tool (descendant CPU active OR current_task non-empty)
     Executing,
+    /// Main turn ended, but background work (workflow / async agent) is still
+    /// pending; the session resumes on its own when it reports back
+    Background,
     /// Idle, waiting for user input or permission prompt
     Waiting,
     /// Session appears recent, but process ownership is not confirmed
@@ -75,7 +78,10 @@ pub enum SessionStatus {
 impl SessionStatus {
     /// Returns true for states where the agent is actively doing work.
     pub fn is_active(&self) -> bool {
-        matches!(self, SessionStatus::Thinking | SessionStatus::Executing)
+        matches!(
+            self,
+            SessionStatus::Thinking | SessionStatus::Executing | SessionStatus::Background
+        )
     }
 }
 
@@ -101,6 +107,25 @@ pub struct SubAgent {
     pub name: String,
     pub status: String,
     pub tokens: u64,
+    /// Workflow name when the agent belongs to a Claude Code workflow run
+    /// (`subagents/workflows/<runId>/`). `None` for plain Agent subagents.
+    pub workflow: Option<String>,
+}
+
+impl SubAgent {
+    /// Label for lists: `"<workflow> · <name>"` for workflow agents (workflow
+    /// part capped so the agent name stays visible), else just the name.
+    pub fn display_name(&self) -> String {
+        const MAX_WORKFLOW_CHARS: usize = 16;
+        match &self.workflow {
+            Some(wf) if wf.chars().count() > MAX_WORKFLOW_CHARS => {
+                let short: String = wf.chars().take(MAX_WORKFLOW_CHARS - 1).collect();
+                format!("{short}… · {}", self.name)
+            }
+            Some(wf) => format!("{wf} · {}", self.name),
+            None => self.name.clone(),
+        }
+    }
 }
 
 /// A single tool invocation from a session transcript.
@@ -196,6 +221,12 @@ pub struct AgentSession {
     /// Context window size for this session's model (e.g. 200K, 1M).
     pub context_window: u64,
     pub subagents: Vec<SubAgent>,
+    /// Background workflows still pending as of the latest finished turn
+    /// (Claude Code's `turn_duration.pendingWorkflowCount`).
+    pub pending_workflows: u32,
+    /// Async Agent tasks still pending as of the latest finished turn
+    /// (Claude Code's `turn_duration.pendingBackgroundAgentCount`).
+    pub pending_bg_agents: u32,
     pub mem_file_count: u32,
     pub mem_line_count: u32,
     pub children: Vec<ChildProcess>,
@@ -322,6 +353,8 @@ mod tests {
             compaction_count: 0,
             context_window: 0,
             subagents: Vec::new(),
+            pending_workflows: 0,
+            pending_bg_agents: 0,
             mem_file_count: 0,
             mem_line_count: 0,
             children: Vec::new(),
@@ -346,5 +379,24 @@ mod tests {
     fn test_active_tokens() {
         let session = make_session(100, 50, 200, 30);
         assert_eq!(session.active_tokens(), 180); // 100 + 50 + 30, excludes cache_read
+    }
+
+    #[test]
+    fn test_subagent_display_name() {
+        let agent = |workflow: Option<&str>| SubAgent {
+            name: "selector".into(),
+            status: "working".into(),
+            tokens: 0,
+            workflow: workflow.map(str::to_string),
+        };
+        assert_eq!(agent(None).display_name(), "selector");
+        assert_eq!(
+            agent(Some("stress-test")).display_name(),
+            "stress-test · selector"
+        );
+        assert_eq!(
+            agent(Some("stress-test-r3-select")).display_name(),
+            "stress-test-r3-… · selector",
+        );
     }
 }

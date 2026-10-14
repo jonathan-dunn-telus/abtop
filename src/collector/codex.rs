@@ -658,6 +658,8 @@ impl CodexCollector {
                 compaction_count: 0,
                 context_window: result.context_window,
                 subagents: vec![],
+                pending_workflows: 0,
+                pending_bg_agents: 0,
                 mem_file_count: 0,
                 mem_line_count: 0,
                 children,

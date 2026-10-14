@@ -491,6 +491,9 @@ impl ClaudeCollector {
                         prev.last_assistant_ts_ms = delta.last_assistant_ts_ms;
                         prev.last_user_ts_ms = delta.last_user_ts_ms;
                     }
+                    if delta.pending_background.is_some() {
+                        prev.pending_background = delta.pending_background;
+                    }
                     if prev.initial_prompt.is_empty() && !delta.initial_prompt.is_empty() {
                         prev.initial_prompt = delta.initial_prompt;
                     }
@@ -538,6 +541,7 @@ impl ClaudeCollector {
             last_assistant_ts_ms: 0,
             last_user_ts_ms: 0,
             saw_turn: false,
+            pending_background: None,
             file_accesses: Vec::new(),
         };
         let cached = self
@@ -577,23 +581,29 @@ impl ClaudeCollector {
             .unwrap_or_else(|| config.projects_dir.join(encode_cwd_path(&sf.cwd)));
 
         // Collect subagents before deriving the parent status so asynchronous
-        // Agent work keeps the parent active after its tool_result has returned.
-        let subagents_dir = project_dir.join(&sf.session_id).join("subagents");
-        let subagents = Self::collect_subagents(&subagents_dir);
+        // Agent and workflow work keeps the parent active after its
+        // tool_result has returned.
+        let (subagents, running_workflows) =
+            Self::collect_subagents(&project_dir.join(&sf.session_id));
         let has_working_subagent = subagents.iter().any(|agent| agent.status == "working");
+        let (pending_workflows, pending_bg_agents) = cached.pending_background.unwrap_or((0, 0));
 
-        // Status is best-effort. Signals we trust:
-        //   1. Active descendant CPU → tool is running.
-        //   2. current_task non-empty → latest assistant turn left a
-        //      tool_use unanswered. Catches I/O-bound tools (Read, Edit)
-        //      whose descendants stay under 5% CPU, so the CPU heuristic
-        //      alone would flicker to Waiting while the tool runs.
-        //   3. A working subagent → an async Agent call is still running even
-        //      though its tool_result has already returned to the parent.
-        //   4. last_user_ts_ms > 0 → trailing transcript line is a real
+        // Status is best-effort. Signals are checked main-thread first:
+        //   1. current_task non-empty → latest assistant turn left a
+        //      tool_use unanswered. Catches fast and I/O-bound tools
+        //      (`Bash rm ...`, Read, Edit) whose descendants finish or stay
+        //      under 5% CPU between samples.
+        //   2. last_user_ts_ms > 0 → trailing transcript line is a real
         //      user prompt with no assistant reply yet, so the model is
         //      generating. tool_result wrappers are skipped at the
         //      parser level so this only fires for actual prompts.
+        //   3. Background work → the turn ended but Claude Code reported
+        //      pending workflows / async agents on its last `turn_duration`
+        //      line, or a subagent transcript is still being written. The
+        //      session resumes on its own when that work reports back, so it
+        //      is not waiting for the user. Checked before descendant CPU:
+        //      workflow agents' Bash calls are descendants of this pid.
+        //   4. Active descendant CPU → a tool is running.
         //
         // We drop the mtime freshness gate intentionally: Claude Code
         // writes the assistant turn atomically when it lands, so during
@@ -603,17 +613,18 @@ impl ClaudeCollector {
         // and an idle session can't get stuck Thinking because the
         // tool_result skip means last_user only flips on real prompts.
         let status = {
-            let has_active_descendant =
-                process::has_active_descendant(sf.pid, children_map, process_info, 5.0);
-            // Non-empty current_task = latest assistant turn left a tool_use
-            // unanswered. Catches fast tools (`Bash rm ...`) that finish
-            // between CPU samples, so has_active_descendant alone misses them.
             let pending_tool = !cached.current_task.is_empty();
             let model_generating = cached.last_user_ts_ms > 0;
-            if has_active_descendant || pending_tool || has_working_subagent {
+            let background_pending =
+                pending_workflows + pending_bg_agents > 0 || has_working_subagent;
+            if pending_tool {
                 SessionStatus::Executing
             } else if model_generating {
                 SessionStatus::Thinking
+            } else if background_pending {
+                SessionStatus::Background
+            } else if process::has_active_descendant(sf.pid, children_map, process_info, 5.0) {
+                SessionStatus::Executing
             } else {
                 SessionStatus::Waiting
             }
@@ -633,6 +644,13 @@ impl ClaudeCollector {
             vec!["finished".to_string()]
         } else if matches!(status, SessionStatus::Waiting) {
             vec!["waiting for input".to_string()]
+        } else if matches!(status, SessionStatus::Background) {
+            vec![background_task_line(
+                &subagents,
+                &running_workflows,
+                pending_workflows,
+                pending_bg_agents,
+            )]
         } else {
             vec!["thinking...".to_string()]
         };
@@ -701,6 +719,8 @@ impl ClaudeCollector {
             compaction_count,
             context_window,
             subagents,
+            pending_workflows,
+            pending_bg_agents,
             mem_file_count,
             mem_line_count,
             children,
@@ -715,12 +735,53 @@ impl ClaudeCollector {
         })
     }
 
-    fn collect_subagents(subagents_dir: &Path) -> Vec<SubAgent> {
+    /// Collect the session's subagents: plain Agent subagents directly under
+    /// `<session>/subagents/`, plus workflow agents under
+    /// `<session>/subagents/workflows/<runId>/`. Also returns the names of
+    /// workflow runs that have not written their completion record
+    /// (`<session>/workflows/<runId>.json`) yet.
+    fn collect_subagents(session_dir: &Path) -> (Vec<SubAgent>, Vec<String>) {
         let mut subagents = Vec::new();
+        let mut running_workflows = Vec::new();
+        let subagents_dir = session_dir.join("subagents");
+        Self::collect_agents_in(&subagents_dir, None, false, &mut subagents);
 
-        let entries = match fs::read_dir(subagents_dir) {
+        let runs = match fs::read_dir(subagents_dir.join("workflows")) {
             Ok(e) => e,
-            Err(_) => return subagents,
+            Err(_) => return (subagents, running_workflows),
+        };
+        for entry in runs.flatten() {
+            // `file_type()` does not follow symlinks, so symlinked run dirs
+            // are skipped like symlinked agent files.
+            if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let run_id = entry.file_name().to_string_lossy().into_owned();
+            let name = workflow_name(session_dir, &run_id);
+            let finished = session_dir
+                .join("workflows")
+                .join(format!("{run_id}.json"))
+                .exists();
+            if !finished {
+                running_workflows.push(name.clone());
+            }
+            Self::collect_agents_in(&entry.path(), Some(&name), finished, &mut subagents);
+        }
+
+        (subagents, running_workflows)
+    }
+
+    /// Read every `agent-*.meta.json` (+ sibling `.jsonl`) in `dir`. Agents
+    /// of a `finished` workflow run are "done" regardless of mtime.
+    fn collect_agents_in(
+        dir: &Path,
+        workflow: Option<&str>,
+        finished: bool,
+        subagents: &mut Vec<SubAgent>,
+    ) {
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
         };
 
         // Collect meta files and their corresponding jsonl files
@@ -786,7 +847,7 @@ impl ClaudeCollector {
                 let since = std::time::SystemTime::now()
                     .duration_since(last_activity)
                     .unwrap_or_default();
-                if since.as_secs() < 30 {
+                if !finished && since.as_secs() < 30 {
                     "working".to_string()
                 } else {
                     "done".to_string()
@@ -800,10 +861,9 @@ impl ClaudeCollector {
                 name,
                 status,
                 tokens,
+                workflow: workflow.map(str::to_string),
             });
         }
-
-        subagents
     }
 
     fn collect_memory_status(memory_dir: &Path) -> (u32, u32) {
@@ -1285,6 +1345,11 @@ struct TranscriptResult {
     /// must not overwrite cached state - otherwise a no-new-data tick
     /// would clear the live pending/thinking markers.
     saw_turn: bool,
+    /// `(pendingWorkflowCount, pendingBackgroundAgentCount)` from the latest
+    /// `system/turn_duration` line. Claude Code omits each key when its count
+    /// is zero, so a later turn without them resets the counts. `None` when
+    /// this parse saw no `turn_duration` line and must not overwrite cache.
+    pending_background: Option<(u32, u32)>,
     /// File access audit log extracted from tool_use entries.
     file_accesses: Vec<FileAccess>,
 }
@@ -1360,6 +1425,7 @@ fn parse_transcript_with_previous(
         last_assistant_ts_ms: 0,
         last_user_ts_ms: 0,
         saw_turn: false,
+        pending_background: None,
         file_accesses: Vec::new(),
     };
 
@@ -1692,6 +1758,18 @@ fn parse_transcript_with_previous(
                                 }
                             }
                         }
+                        Some("system")
+                            if val.get("subtype").and_then(|s| s.as_str())
+                                == Some("turn_duration") =>
+                        {
+                            let count = |key: &str| {
+                                val.get(key).and_then(|v| v.as_u64()).unwrap_or(0) as u32
+                            };
+                            result.pending_background = Some((
+                                count("pendingWorkflowCount"),
+                                count("pendingBackgroundAgentCount"),
+                            ));
+                        }
                         _ => {}
                     }
                 }
@@ -1909,6 +1987,61 @@ fn shorten_path(path: &str) -> String {
     } else {
         format!("{}/{}", parts[1], parts[0])
     }
+}
+
+/// Workflow name for `run_id`, taken from Claude Code's persisted script
+/// `<session>/workflows/scripts/<name>-<runId>.js`. Falls back to the run id.
+fn workflow_name(session_dir: &Path, run_id: &str) -> String {
+    let suffix = format!("-{run_id}.js");
+    fs::read_dir(session_dir.join("workflows").join("scripts"))
+        .ok()
+        .and_then(|entries| {
+            entries.flatten().find_map(|entry| {
+                let file_name = entry.file_name().to_string_lossy().into_owned();
+                file_name
+                    .strip_suffix(&suffix)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+            })
+        })
+        .unwrap_or_else(|| run_id.to_string())
+}
+
+/// Second-line text for a `Background` session: name the work the session
+/// is waiting on instead of "waiting for input".
+fn background_task_line(
+    subagents: &[SubAgent],
+    running_workflows: &[String],
+    pending_workflows: u32,
+    pending_bg_agents: u32,
+) -> String {
+    let working = |in_workflow: bool| {
+        subagents
+            .iter()
+            .rev()
+            .find(|a| a.status == "working" && a.workflow.is_some() == in_workflow)
+    };
+    let plural =
+        |n: u32, noun: &str| format!("waiting on {n} {noun}{}", if n == 1 { "" } else { "s" });
+    if let Some(agent) = working(true) {
+        let workflow = agent.workflow.as_deref().unwrap_or_default();
+        return format!("workflow {workflow} · {}", agent.name);
+    }
+    if pending_workflows > 0 {
+        // Only trust a run dir's name while Claude Code still reports a
+        // pending workflow: a crashed run never writes its completion record.
+        return match running_workflows.last() {
+            Some(name) if pending_workflows == 1 => format!("workflow {name}"),
+            _ => plural(pending_workflows, "workflow"),
+        };
+    }
+    if let Some(agent) = working(false) {
+        return format!("background agent {}", agent.name);
+    }
+    if pending_bg_agents > 0 {
+        return plural(pending_bg_agents, "agent");
+    }
+    "background work".to_string()
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -2306,6 +2439,47 @@ mod tests {
         assert!(result.saw_turn);
         assert!(result.last_user_ts_ms > 0);
         assert_eq!(result.last_assistant_ts_ms, 0);
+    }
+
+    #[test]
+    fn test_parse_transcript_turn_duration_pending_counts() {
+        // Claude Code records pending background work on the turn_duration
+        // line and omits each key when its count is zero, so the latest line
+        // wins and a later turn without the keys resets the counts.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut file,
+            &[
+                r#"{"type":"system","subtype":"turn_duration","durationMs":10,"pendingWorkflowCount":1,"pendingBackgroundAgentCount":2}"#,
+            ],
+        );
+        assert_eq!(
+            parse_transcript(file.path(), 0).pending_background,
+            Some((1, 2))
+        );
+
+        write_lines(
+            &mut file,
+            &[r#"{"type":"system","subtype":"turn_duration","durationMs":10}"#],
+        );
+        assert_eq!(
+            parse_transcript(file.path(), 0).pending_background,
+            Some((0, 0))
+        );
+    }
+
+    #[test]
+    fn test_parse_transcript_without_turn_duration_leaves_pending_unset() {
+        // Deltas with no turn_duration must not overwrite cached counts.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write_lines(
+            &mut file,
+            &[
+                r#"{"type":"system","subtype":"stop_hook_summary","hookCount":1}"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:10Z","message":{"role":"user","content":"next"}}"#,
+            ],
+        );
+        assert_eq!(parse_transcript(file.path(), 0).pending_background, None);
     }
 
     #[test]
@@ -3662,10 +3836,11 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
     }
 
     #[test]
-    fn test_load_session_working_async_subagent_is_executing() {
+    fn test_load_session_working_async_subagent_is_background() {
         // Regression for #156: an async Agent tool returns immediately, so the
         // parent has no pending tool while its subagent keeps working. The
-        // working subagent must keep the parent Executing instead of Waiting.
+        // working subagent must keep the parent active (Background) instead
+        // of Waiting.
         let temp = tempfile::tempdir().unwrap();
         let profile = temp.path().join(".claude");
         let sessions_dir = profile.join("sessions");
@@ -3729,9 +3904,184 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
         assert_eq!(sessions[0].subagents[0].status, "working");
         assert_eq!(
             sessions[0].status,
-            SessionStatus::Executing,
-            "a working async subagent must keep its parent Executing",
+            SessionStatus::Background,
+            "a working async subagent must keep its parent in Background",
         );
+        assert_eq!(sessions[0].current_tasks, vec!["background agent research"]);
+    }
+
+    /// Lay out a session whose turn ended after launching workflow
+    /// `wf_abc-123` ("stress-test"): main transcript ending in `end_turn` +
+    /// `turn_duration` (with `turn_duration_extra` keys), and one workflow
+    /// agent "selector" whose transcript mtime is `agent_mtime_secs` from now.
+    /// Returns the loaded sessions.
+    fn load_workflow_session(
+        turn_duration_extra: &str,
+        agent_mtime_secs: i64,
+        completed: bool,
+    ) -> Vec<AgentSession> {
+        let (_temp, _transcript, mut load) =
+            setup_workflow_session(turn_duration_extra, agent_mtime_secs, completed);
+        load()
+    }
+
+    /// Same layout as `load_workflow_session`, but returns the temp dir, the
+    /// main transcript path and a loader that reuses one collector (and its
+    /// transcript cache) across calls.
+    #[allow(clippy::type_complexity)]
+    fn setup_workflow_session(
+        turn_duration_extra: &str,
+        agent_mtime_secs: i64,
+        completed: bool,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        Box<dyn FnMut() -> Vec<AgentSession>>,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join(".claude");
+        let sessions_dir = profile.join("sessions");
+        let projects = profile.join("projects");
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let pid = 9105;
+        let sid = "workflow-session";
+        let session_path = sessions_dir.join(format!("{}.json", pid));
+        write_session_file(&session_path, pid, sid, &cwd);
+
+        let project_dir = projects.join(encode_cwd_path(cwd.to_str().unwrap()));
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let transcript = project_dir.join(format!("{}.jsonl", sid));
+        std::fs::write(
+            &transcript,
+            format!(
+                r#"{{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{{"role":"user","content":"run the selector"}}}}
+{{"type":"assistant","timestamp":"2026-03-28T15:00:05Z","message":{{"model":"claude-sonnet-4-6","usage":{{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"content":[{{"type":"tool_use","name":"Workflow","id":"wf-tool-1","input":{{"script":"..."}}}}]}}}}
+{{"type":"user","timestamp":"2026-03-28T15:00:06Z","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"wf-tool-1","content":"Workflow launched in background. Run ID: wf_abc-123"}}]}}}}
+{{"type":"assistant","timestamp":"2026-03-28T15:00:07Z","message":{{"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"content":[{{"type":"text","text":"I'll continue when it reports."}}]}}}}
+{{"type":"system","subtype":"turn_duration","timestamp":"2026-03-28T15:00:07Z","durationMs":7000,"messageCount":4{}}}
+"#,
+                turn_duration_extra
+            ),
+        )
+        .unwrap();
+
+        let session_dir = project_dir.join(sid);
+        let scripts_dir = session_dir.join("workflows").join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        std::fs::write(scripts_dir.join("stress-test-wf_abc-123.js"), "").unwrap();
+        if completed {
+            std::fs::write(
+                session_dir.join("workflows").join("wf_abc-123.json"),
+                r#"{"runId":"wf_abc-123","status":"completed"}"#,
+            )
+            .unwrap();
+        }
+        let run_dir = session_dir
+            .join("subagents")
+            .join("workflows")
+            .join("wf_abc-123");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(
+            run_dir.join("agent-sel-1.meta.json"),
+            r#"{"agentType":"workflow-subagent","description":"selector"}"#,
+        )
+        .unwrap();
+        let agent_transcript = run_dir.join("agent-sel-1.jsonl");
+        std::fs::write(
+            &agent_transcript,
+            r#"{"type":"user","timestamp":"2026-03-28T15:00:06Z","message":{"role":"user","content":"select"}}
+"#,
+        )
+        .unwrap();
+        set_mtime(&agent_transcript, agent_mtime_secs);
+
+        let config = ConfigDir::new(profile.clone());
+        let process_info = make_proc_info(pid, "claude");
+        let mut collector = ClaudeCollector::new();
+        collector.config_dirs = vec![config.clone()];
+        let session_paths = vec![(session_path, config)];
+        let load = move || {
+            let ctx = build_discovery_context(&session_paths, &process_info, 0);
+            collector.load_session_paths(
+                &session_paths,
+                &process_info,
+                &HashMap::new(),
+                &HashMap::new(),
+                &ctx,
+            )
+        };
+        (temp, transcript, Box::new(load))
+    }
+
+    #[test]
+    fn test_load_session_pending_counts_survive_non_turn_delta() {
+        // Claude Code appends metadata lines (`last-prompt`, `mode`, ...)
+        // after the turn_duration line. That incremental delta carries no
+        // turn_duration and must not wipe the cached pending counts.
+        let (_temp, transcript, mut load) =
+            setup_workflow_session(r#","pendingWorkflowCount":1"#, -600, false);
+        assert_eq!(load()[0].pending_workflows, 1);
+
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"last-prompt","lastPrompt":"run the selector"}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let sessions = load();
+        assert_eq!(sessions[0].pending_workflows, 1);
+        assert_eq!(sessions[0].status, SessionStatus::Background);
+    }
+
+    #[test]
+    fn test_load_session_pending_workflow_with_working_agent_is_background() {
+        // The main turn ended (`end_turn`) while a launched workflow is still
+        // running. The session resumes on its own, so it must not read as
+        // "waiting for input".
+        let sessions = load_workflow_session(r#","pendingWorkflowCount":1"#, 0, false);
+
+        assert_eq!(sessions.len(), 1);
+        let s = &sessions[0];
+        assert_eq!(s.status, SessionStatus::Background);
+        assert_eq!(s.pending_workflows, 1);
+        assert_eq!(s.pending_bg_agents, 0);
+        assert_eq!(s.current_tasks, vec!["workflow stress-test · selector"]);
+        assert_eq!(s.subagents.len(), 1);
+        assert_eq!(s.subagents[0].status, "working");
+        assert_eq!(s.subagents[0].workflow.as_deref(), Some("stress-test"));
+    }
+
+    #[test]
+    fn test_load_session_pending_workflow_with_quiet_agent_is_background() {
+        // A workflow agent busy in a long tool call stops writing its
+        // transcript; Claude Code's pending count still keeps the parent in
+        // Background.
+        let sessions = load_workflow_session(r#","pendingWorkflowCount":1"#, -600, false);
+
+        assert_eq!(sessions[0].status, SessionStatus::Background);
+        assert_eq!(sessions[0].subagents[0].status, "done");
+        assert_eq!(sessions[0].current_tasks, vec!["workflow stress-test"]);
+    }
+
+    #[test]
+    fn test_load_session_completed_workflow_is_waiting() {
+        // Completion record written and the follow-up turn reported no
+        // pending work: the session is idle again, even if the agent
+        // transcript was touched moments ago.
+        let sessions = load_workflow_session("", 0, true);
+
+        assert_eq!(sessions[0].status, SessionStatus::Waiting);
+        assert_eq!(sessions[0].pending_workflows, 0);
+        assert_eq!(sessions[0].subagents[0].status, "done");
+        assert_eq!(sessions[0].current_tasks, vec!["waiting for input"]);
     }
 
     #[test]

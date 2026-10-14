@@ -80,6 +80,8 @@ pub struct SubAgentView {
     pub status: String,
     /// Tokens attributed to this subagent.
     pub tokens: u64,
+    /// Workflow name when the subagent belongs to a Claude Code workflow run.
+    pub workflow: Option<String>,
 }
 
 /// A single session, flattened and curated for JSON consumers.
@@ -152,6 +154,10 @@ pub struct SessionView {
     pub token_history: Vec<u64>,
     /// Spawned subagents, if any.
     pub subagents: Vec<SubAgentView>,
+    /// Background workflows still pending as of the latest finished turn.
+    pub pending_workflows: u32,
+    /// Async Agent tasks still pending as of the latest finished turn.
+    pub pending_bg_agents: u32,
     /// Recent tool-call timeline (trimmed tail, newest last).
     pub tool_calls: Vec<ToolCallView>,
     /// Recent chat transcript tail (user/assistant only).
@@ -241,8 +247,11 @@ impl App {
                         name: a.name.clone(),
                         status: a.status.clone(),
                         tokens: a.tokens,
+                        workflow: a.workflow.clone(),
                     })
                     .collect(),
+                pending_workflows: s.pending_workflows,
+                pending_bg_agents: s.pending_bg_agents,
                 tool_calls: tail(&s.tool_calls, 24)
                     .iter()
                     .map(|t| ToolCallView {
@@ -332,6 +341,7 @@ mod tests {
         for (status, wire) in [
             (SessionStatus::Thinking, "\"Thinking\""),
             (SessionStatus::Executing, "\"Executing\""),
+            (SessionStatus::Background, "\"Background\""),
             (SessionStatus::Waiting, "\"Waiting\""),
             (SessionStatus::Unknown, "\"Unknown\""),
             (SessionStatus::RateLimited, "\"RateLimited\""),

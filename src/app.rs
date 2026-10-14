@@ -1041,6 +1041,8 @@ mod tests {
             context_history: vec![],
             context_window: 0,
             subagents: vec![],
+            pending_workflows: 0,
+            pending_bg_agents: 0,
             mem_file_count: 0,
             mem_line_count: 0,
             children: vec![],

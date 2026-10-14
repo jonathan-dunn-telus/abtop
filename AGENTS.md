@@ -56,7 +56,7 @@ src/
 │ 7d ██ 14%    ││             ││  main ✓clean ││                    │
 └──────────────┘└─────────────┘└──────────────┘└────────────────────┘
 ┌─ ⁵sessions ─────────────────────────────────────────────────────────┐
-│ ►*CC 7336 abtop  ● Work opus  82% 1.2M  48  Edit src/pay.rs       │
+│ ►*CC 7336 abtop  ● Exec opus  82% 1.2M  48  Edit src/pay.rs       │
 │  >CD 8840 pred   ◌ Wait sonn  91% 340k  12  waiting                │
 │ ─────────────────────────────────────────────────────────────────── │
 │  SESSION 7336 · /Users/graykode/abtop                               │
@@ -173,9 +173,21 @@ Rate limits extracted from `token_count` events:
 - Match live PIDs to DB sessions by process cwd. OpenCode does not expose a PID/session mapping, so when multiple DB rows share one cwd, only live PIDs should be assigned and older rows should not be shown as live duplicates.
 - OpenCode contributes session/token/project/port data, but not quota data. Quota remains Claude + Codex only.
 
-### 5. Subagents: `~/.claude/projects/{path}/{sessionId}/subagents/`
-- `agent-{hash}.jsonl` — same JSONL format as main transcript
-- `agent-{hash}.meta.json` — `{ "agentType": "general-purpose", "description": "..." }`
+### 5. Subagents and workflows: `~/.claude/projects/{path}/{sessionId}/`
+- `subagents/agent-{hash}.jsonl` — same JSONL format as main transcript
+- `subagents/agent-{hash}.meta.json` — `{ "agentType": "general-purpose", "description": "..." }`
+- `subagents/workflows/{runId}/agent-{hash}.{jsonl,meta.json}` — agents of a Workflow run (`runId` like `wf_f13c2bf8-4a9`), same format
+- `workflows/scripts/{name}-{runId}.js` — the run's script; abtop takes the workflow name from this filename
+- `workflows/{runId}.json` — completion record (`status`, `durationMs`, ...), written only when the run ends. Absent while running.
+
+Claude Code also records pending background work on the main transcript's
+`turn_duration` line, written at the end of every turn:
+```json
+{ "type": "system", "subtype": "turn_duration", "durationMs": 463584, "pendingWorkflowCount": 1, "pendingBackgroundAgentCount": 1 }
+```
+Each `pending*` key is omitted when its count is 0, so the latest `turn_duration` line is the current snapshot. Background Bash (`run_in_background`) and Monitor tasks are **not** counted there.
+
+Full on-disk reference for background work (launch results, task notifications, completion records, signals that look useful but aren't): [docs/claude-code-background-work.md](./docs/claude-code-background-work.md).
 
 ### 6. Process tree: `ps` + `lsof`
 ```bash
@@ -220,26 +232,32 @@ File format read by abtop:
 
 ## Session Status Detection
 
+Claude Code (`src/collector/claude.rs`), checked in order, first match wins:
+
 ```
-● Working  = PID alive + transcript mtime < 30s ago
-◌ Waiting  = PID alive + transcript mtime > 30s ago
-✗ Error    = PID alive + last assistant has error content
-✓ Done     = PID dead (detected via kill(pid, 0) failure)
+● Exec  = latest assistant turn left a tool_use unanswered
+◉ Think = trailing transcript line is a real user prompt (no assistant reply yet)
+◐ Bg    = turn ended, but background work is pending: the latest turn_duration
+          reports pendingWorkflowCount / pendingBackgroundAgentCount > 0, or a
+          subagent / workflow-agent transcript was written < 30s ago
+● Exec  = a descendant process uses >= 5% CPU
+◌ Wait  = none of the above
 ```
 
-**Done detection**: session files are deleted on normal exit, but may linger briefly or survive crashes. When PID is dead but file exists, show as Done and clean up on next tick.
+There is no transcript-mtime gate: Claude Code writes an assistant turn atomically, so mtime goes stale during long streamed replies. `◐ Bg` is checked before descendant CPU because a workflow agent's Bash calls are descendants of the session's pid. A Claude session whose pid is gone is dropped, not shown as Done. Codex and OpenCode have their own rules in their collectors and never emit `◐ Bg`. `⏳ Rate` is applied afterwards (`app.rs`) to `Waiting` sessions whose agent is above 90% rate-limit usage.
 
 **PID reuse risk**: verify PID is still the expected agent process (Claude, Codex, or OpenCode) by checking `ps -p {pid} -o command=`. Don't trust PID alone.
 
 Current task (2nd line under each session):
-- Working → last `tool_use` name + first arg (e.g. `Edit src/main.rs`)
-- Waiting → "waiting for user input"
-- Error → last error message (truncated)
-- Done → "finished {duration} ago"
+- Exec → last `tool_use` name + first arg (e.g. `Edit src/main.rs`)
+- Think → "thinking..."
+- Bg → `workflow {name} · {working agent}`, `workflow {name}`, `waiting on N workflows`, `background agent {name}` or `waiting on N agents`
+- Wait → "waiting for input"
 
 **Known limitations** (all heuristic):
-- Cannot distinguish model-thinking vs tool-executing vs rate-limit-waiting vs permission-prompt
-- "Waiting" may be wrong if a long-running tool (cargo build, npm test) is running
+- Cannot distinguish rate-limit-waiting vs permission-prompt
+- Background Bash (`run_in_background`) and Monitor tasks are not tracked: a session waiting only on those shows `◌ Wait` (or `● Exec` while the process burns CPU)
+- If background work dies without a follow-up turn, the last `turn_duration` counts can keep the session in `◐ Bg` until the next turn
 - Status is best-effort, not authoritative
 
 ## Session Summary Generation

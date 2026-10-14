@@ -61,17 +61,19 @@ pub fn populate_demo(app: &mut App) {
             subagents: vec![
                 SubAgent {
                     name: "Explore test coverage".into(),
-
                     status: "done".into(),
                     tokens: 12_400,
+                    workflow: None,
                 },
                 SubAgent {
                     name: "Run integration tests".into(),
-
                     status: "working".into(),
                     tokens: 8_200,
+                    workflow: None,
                 },
             ],
+            pending_workflows: 0,
+            pending_bg_agents: 0,
             mem_file_count: 4,
             mem_line_count: 12,
             children: vec![
@@ -289,6 +291,8 @@ pub fn populate_demo(app: &mut App) {
             compaction_count: 1,
             context_window: 200_000,
             subagents: vec![],
+            pending_workflows: 0,
+            pending_bg_agents: 0,
             mem_file_count: 2,
             mem_line_count: 8,
             children: vec![],
@@ -341,6 +345,8 @@ pub fn populate_demo(app: &mut App) {
             compaction_count: 0,
             context_window: 200_000,
             subagents: vec![],
+            pending_workflows: 0,
+            pending_bg_agents: 0,
             mem_file_count: 1,
             mem_line_count: 3,
             children: vec![
@@ -444,6 +450,8 @@ pub fn populate_demo(app: &mut App) {
             compaction_count: 0,
             context_window: 200_000,
             subagents: vec![],
+            pending_workflows: 0,
+            pending_bg_agents: 0,
             mem_file_count: 0,
             mem_line_count: 0,
             children: vec![ChildProcess {
@@ -501,6 +509,8 @@ pub fn populate_demo(app: &mut App) {
             compaction_count: 0,
             context_window: 200_000,
             subagents: vec![],
+            pending_workflows: 0,
+            pending_bg_agents: 0,
             mem_file_count: 0,
             mem_line_count: 0,
             children: vec![],
