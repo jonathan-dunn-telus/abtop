@@ -121,6 +121,7 @@ here, keep the fork's side and then add downstream's change by hand where the ru
 | `.github/workflows/release-please.yml`, `release-please-config.json`, `.release-please-manifest.json`, `CHANGELOG.md` | Fork-only. Keep them as they are, with `release-please.yml`'s `uses:` pinned to a full commit SHA like `ci.yml`. |
 | `version` in `Cargo.toml` | Keep the fork's `X.Y.Z-remix.N`. The new base arrives through the `Release-As` footer and the release PR, not through the merge. |
 | `Cargo.lock` | Take downstream's dependency changes, then run `cargo build` so the `abtop` entry matches the fork's `Cargo.toml` version again. |
+| `on:` block of `.github/workflows/publish.yml` and `.github/workflows/release.yml` | Keep the fork's `workflow_dispatch`-only block and its `remix fork` comment. Downstream's changes to the rest of these files may be merged. |
 | `docs/remix-release.md` and the pointer to it at the top of `AGENTS.md` | Fork-only. Keep them. |
 | Fork features in `src/`, the rest of `AGENTS.md`, and `docs/` | Combine both sides by hand. Never resolve them by taking downstream's version. |
 
@@ -133,21 +134,23 @@ on any path above.
 |---|---|---|
 | CI | `ci.yml` | Enabled. Runs on pushes and PRs to `remix` |
 | release-please | `release-please.yml` | Enabled. Runs on pushes to `remix` |
-| Publish to crates.io | `publish.yml` | **Disabled. MUST NEVER be enabled** |
-| Release | `release.yml` | **Disabled. MUST NEVER be enabled** |
+| Publish to crates.io | `publish.yml` | **Disabled, no automatic triggers. MUST NEVER be enabled** |
+| Release | `release.yml` | **Disabled, no automatic triggers. MUST NEVER be enabled** |
 
-- **`publish.yml`** runs `cargo publish` on every `v*` tag, including `vX.Y.Z-remix.N`. That
+- **`publish.yml`**, as downstream ships it, runs `cargo publish` on every `v*` tag, including `vX.Y.Z-remix.N`. That
   publishes downstream's `abtop` crate.
-- **`release.yml`** is downstream's cargo-dist pipeline (`dist-workspace.toml`). It runs on every
-  PR. On a tag it creates a GitHub Release, which clashes with release-please's release, and it
+- **`release.yml`** is downstream's cargo-dist pipeline (`dist-workspace.toml`). As downstream
+  ships it, it runs on every PR. On a tag it creates a GitHub Release, which clashes with release-please's release, and it
   pushes a Homebrew formula to `graykode/homebrew-tap`.
 
-Both are disabled in GitHub's Actions settings, not by deleting the files, so downstream edits to
-them merge cleanly. Downstream may keep changing them. Accept those changes in merges and leave
-the workflows disabled.
+Each one has two safeguards. It is disabled in GitHub's Actions settings, and its `on:` block is
+reduced to `workflow_dispatch`, so nothing triggers it even if it gets enabled again. The files
+are kept rather than deleted, so downstream's edits outside the `on:` block still merge. Keep
+the fork's `on:` block (see [Merge rules](#merge-rules)).
 
-After every downstream sync, list the workflows and disable any new one that publishes, releases,
-or writes to a downstream-owned repo:
+After every downstream sync, list the workflows. Disable any new one that publishes, releases,
+or writes to a downstream-owned repo, and reduce its `on:` block to `workflow_dispatch` the same
+way:
 
 ```bash
 gh workflow list -R raphberube/abtop --all
@@ -155,4 +158,4 @@ gh workflow disable "<name>" -R raphberube/abtop
 ```
 
 GitHub treats a renamed workflow file as a new, enabled workflow. If downstream renames
-`publish.yml` or `release.yml`, disable the new one.
+`publish.yml` or `release.yml`, give the renamed file the same two safeguards.
