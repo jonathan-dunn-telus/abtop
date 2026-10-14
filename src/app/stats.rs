@@ -75,6 +75,7 @@ impl App {
                     session.status,
                     SessionStatus::Thinking
                         | SessionStatus::Executing
+                        | SessionStatus::Background
                         | SessionStatus::Waiting
                         | SessionStatus::RateLimited
                 )

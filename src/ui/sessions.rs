@@ -160,6 +160,7 @@ pub(crate) fn draw_sessions_panel_active(
         let (status_icon_str, status_color) = match &session.status {
             crate::model::SessionStatus::Thinking => (t("sess.think"), theme.proc_misc),
             crate::model::SessionStatus::Executing => (t("sess.exec"), theme.hi_fg),
+            crate::model::SessionStatus::Background => (t("sess.bg"), theme.proc_misc),
             crate::model::SessionStatus::Waiting => (t("sess.wait"), grad_at(&proc_grad, 50.0)),
             crate::model::SessionStatus::Unknown => (t("sess.unknown"), theme.inactive_fg),
             crate::model::SessionStatus::RateLimited => (t("sess.rate"), theme.status_fg),
@@ -323,7 +324,7 @@ pub(crate) fn draw_sessions_panel_active(
                     sa_cells.push(Cell::from(""));
                 }
                 sa_cells.push(Cell::from(Span::styled(
-                    truncate_str(&sa.name, project_w as usize),
+                    truncate_str(&sa.display_name(), project_w as usize),
                     Style::default().fg(theme.graph_text),
                 )));
                 if show_session_id {
@@ -773,7 +774,7 @@ pub(crate) fn draw_sessions_panel_active(
                                     format!(
                                         "  {} {:<w$}",
                                         icon,
-                                        truncate_str(&sa.name, name_w),
+                                        truncate_str(&sa.display_name(), name_w),
                                         w = name_w
                                     ),
                                     Style::default().fg(fg),
@@ -795,7 +796,7 @@ pub(crate) fn draw_sessions_panel_active(
                                         format!(
                                             "  {} {:<w$}",
                                             icon_r,
-                                            truncate_str(&sa_r.name, name_w),
+                                            truncate_str(&sa_r.display_name(), name_w),
                                             w = name_w
                                         ),
                                         Style::default().fg(fg_r),
@@ -821,7 +822,7 @@ pub(crate) fn draw_sessions_panel_active(
                                         format!(
                                             "  {} {:<w$}",
                                             icon,
-                                            truncate_str(&sa.name, name_w),
+                                            truncate_str(&sa.display_name(), name_w),
                                             w = name_w
                                         ),
                                         Style::default().fg(fg),
@@ -1317,6 +1318,8 @@ mod tests {
             context_window: 258_400,
             subagent_counts: Default::default(),
             subagents: Vec::new(),
+            pending_workflows: 0,
+            pending_bg_agents: 0,
             mem_file_count: 0,
             mem_line_count: 0,
             children: Vec::new(),
@@ -1520,6 +1523,8 @@ mod tests {
             context_window: 200_000,
             subagent_counts: Default::default(),
             subagents: Vec::new(),
+            pending_workflows: 0,
+            pending_bg_agents: 0,
             mem_file_count: 0,
             mem_line_count: 0,
             children: Vec::new(),

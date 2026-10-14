@@ -64,18 +64,20 @@ pub fn populate_demo(app: &mut App) {
                 SubAgent {
                     activity_key: String::new(),
                     name: "Explore test coverage".into(),
-
                     status: "done".into(),
                     tokens: 12_400,
+                    workflow: None,
                 },
                 SubAgent {
                     activity_key: String::new(),
                     name: "Run integration tests".into(),
-
                     status: "working".into(),
                     tokens: 8_200,
+                    workflow: None,
                 },
             ],
+            pending_workflows: 0,
+            pending_bg_agents: 0,
             mem_file_count: 4,
             mem_line_count: 12,
             children: vec![
@@ -295,6 +297,8 @@ pub fn populate_demo(app: &mut App) {
             context_window: 200_000,
             subagent_counts: Default::default(),
             subagents: vec![],
+            pending_workflows: 0,
+            pending_bg_agents: 0,
             mem_file_count: 2,
             mem_line_count: 8,
             children: vec![],
@@ -349,6 +353,8 @@ pub fn populate_demo(app: &mut App) {
             context_window: 200_000,
             subagent_counts: Default::default(),
             subagents: vec![],
+            pending_workflows: 0,
+            pending_bg_agents: 0,
             mem_file_count: 1,
             mem_line_count: 3,
             children: vec![
@@ -454,6 +460,8 @@ pub fn populate_demo(app: &mut App) {
             context_window: 200_000,
             subagent_counts: Default::default(),
             subagents: vec![],
+            pending_workflows: 0,
+            pending_bg_agents: 0,
             mem_file_count: 0,
             mem_line_count: 0,
             children: vec![ChildProcess {
@@ -513,6 +521,8 @@ pub fn populate_demo(app: &mut App) {
             context_window: 200_000,
             subagent_counts: Default::default(),
             subagents: vec![],
+            pending_workflows: 0,
+            pending_bg_agents: 0,
             mem_file_count: 0,
             mem_line_count: 0,
             children: vec![],

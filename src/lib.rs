@@ -468,6 +468,7 @@ fn print_snapshot(app: &App) {
         let status = match &session.status {
             model::SessionStatus::Thinking => "◉ Think",
             model::SessionStatus::Executing => "● Exec",
+            model::SessionStatus::Background => "◐ Bg",
             model::SessionStatus::Waiting => "◌ Wait",
             model::SessionStatus::Unknown => "? Unknown",
             model::SessionStatus::RateLimited => "⏳ Rate",

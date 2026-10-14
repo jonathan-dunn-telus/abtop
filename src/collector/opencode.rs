@@ -231,6 +231,8 @@ impl OpenCodeCollector {
                 context_window,
                 subagent_counts: Default::default(),
                 subagents: vec![],
+                pending_workflows: 0,
+                pending_bg_agents: 0,
                 mem_file_count: 0,
                 mem_line_count: 0,
                 children,

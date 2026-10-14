@@ -185,6 +185,7 @@ mod tests {
         for (status, expected) in [
             (SessionStatus::Thinking, 3),
             (SessionStatus::Executing, 3),
+            (SessionStatus::Background, 2),
             (SessionStatus::Waiting, 2),
             (SessionStatus::RateLimited, 2),
             (SessionStatus::Done, 0),

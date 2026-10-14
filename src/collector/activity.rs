@@ -502,7 +502,8 @@ impl ClaudeActivity {
                 .and_then(Path::file_name)
                 .and_then(|s| s.to_str())
                 .unwrap_or("");
-            let closed = self.parent.data.workflow_closed(run)
+            let closed = workflow_finished(directory, run)
+                || self.parent.data.workflow_closed(run)
                 || self
                     .children
                     .values()
@@ -571,6 +572,17 @@ impl ClaudeActivity {
         }
         counts
     }
+}
+
+/// Claude Code writes `<session>/workflows/<runId>.json` only when a run
+/// ends, so its presence closes every agent of the run.
+pub(super) fn workflow_finished(subagents_dir: &Path, run: &str) -> bool {
+    fs::symlink_metadata(
+        subagents_dir
+            .with_file_name("workflows")
+            .join(format!("{run}.json")),
+    )
+    .is_ok_and(|meta| meta.is_file())
 }
 
 pub(super) fn activity_key(root: &Path, directory: &Path, id: &str) -> String {
