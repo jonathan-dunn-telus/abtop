@@ -1,9 +1,8 @@
 name: Publish to crates.io
 
+# remix fork: automatic triggers removed. See docs/remix-release.md.
 on:
-  push:
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
 
 jobs:
   publish:

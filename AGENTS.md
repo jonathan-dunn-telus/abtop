@@ -4,6 +4,8 @@ AI agent monitor for your terminal. Like btop++, but for AI coding agents.
 
 Supports Claude Code, Codex CLI, and OpenCode sessions.
 
+> **Fork:** this repo is the `raphberube/abtop` fork, and its default branch is `remix`. Releases, merges from downstream (`graykode/abtop`), and GitHub Actions follow [docs/remix-release.md](docs/remix-release.md), which overrides the *Release Process* section below.
+
 ## Language Policy
 
 English is mandatory for all project-facing work and communication.
