@@ -54,12 +54,19 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ needs.release-please.outputs.tag_name }}
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - id: toolchain
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          key: ${{ matrix.target }}
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ matrix.target }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.target }}-${{ steps.toolchain.outputs.cachekey }}-
       - run: cargo build --profile dist --locked --target "$TARGET"
       - name: Package
         run: |
