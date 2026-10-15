@@ -49,9 +49,12 @@ transcript; their tokens and models are included in the session's totals. Status
 while a tool call is pending, `◉ Think` while the model generates, and `◐ Bg` while a subagent
 works after the turn ended; otherwise CPU of the process and its descendants decides.
 
-Not supported: quota (neither agent exposes an account-level rate limit), memory status, and
-model-specific context windows. Context % uses the Claude window sizes (200K, or 1M once the
-context goes past 200K), so it is approximate for other models.
+Context % uses the window that OMP's model cache (`<agent dir>/models.db`, read with the
+`sqlite3` CLI) lists for the session's provider and model, since the same model can have
+different windows per provider. Without a match, such as on a Pi install with no cache or
+without `sqlite3`, it falls back to the Claude sizes (200K, or 1M once the context goes past
+200K). Not supported: quota (neither agent exposes an account-level rate limit) and memory
+status.
 
 ## Token accounting
 

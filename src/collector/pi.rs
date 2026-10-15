@@ -33,6 +33,57 @@ struct SubagentCacheEntry {
     exited: bool,
 }
 
+/// Context windows from the harness's `<agent dir>/models.db` model cache, keyed by
+/// `(provider, model id)`: the same model id can have different windows per provider.
+#[derive(Default)]
+struct ModelWindows {
+    by_model: HashMap<(String, String), u64>,
+    /// Window per model id when every provider agrees, for transcripts without a provider.
+    by_id: HashMap<String, Option<u64>>,
+    /// Modification times of `models.db` and its WAL when last loaded.
+    stamp: Option<(std::time::SystemTime, Option<std::time::SystemTime>)>,
+    /// Set on slow ticks so the next lookup checks whether the database changed.
+    recheck: bool,
+}
+
+impl ModelWindows {
+    fn get(&self, provider: &str, model_id: &str) -> Option<u64> {
+        if !provider.is_empty() {
+            return self
+                .by_model
+                .get(&(provider.to_string(), model_id.to_string()))
+                .copied();
+        }
+        self.by_id.get(model_id).copied().flatten()
+    }
+
+    fn from_rows(rows: &[Value]) -> Self {
+        let mut windows = Self::default();
+        for row in rows {
+            let (Some(provider), Some(id), Some(window)) = (
+                row.get("provider").and_then(Value::as_str),
+                row.get("id").and_then(Value::as_str),
+                row.get("context_window").and_then(Value::as_u64),
+            ) else {
+                continue;
+            };
+            windows
+                .by_model
+                .insert((provider.to_string(), id.to_string()), window);
+            windows
+                .by_id
+                .entry(id.to_string())
+                .and_modify(|w| {
+                    if *w != Some(window) {
+                        *w = None;
+                    }
+                })
+                .or_insert(Some(window));
+        }
+        windows
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct PiHarnessSpec {
     pub agent_cli: &'static str,
@@ -65,6 +116,7 @@ pub struct PiCollector {
     subagent_cache: HashMap<PathBuf, HashMap<PathBuf, SubagentCacheEntry>>,
     cached_git_branch: HashMap<String, String>,
     cached_versions: HashMap<PathBuf, String>,
+    model_windows: HashMap<PathBuf, ModelWindows>,
 }
 
 struct TranscriptState {
@@ -73,6 +125,9 @@ struct TranscriptState {
     started_at: u64,
     title: String,
     model: String,
+    /// Provider and raw model id of the latest model, for the context window lookup.
+    provider: String,
+    model_id: String,
     effort: String,
     total_input: u64,
     total_output: u64,
@@ -106,6 +161,8 @@ impl Default for TranscriptState {
             started_at: 0,
             title: String::new(),
             model: "-".to_string(),
+            provider: String::new(),
+            model_id: String::new(),
             effort: String::new(),
             total_input: 0,
             total_output: 0,
@@ -143,6 +200,7 @@ impl PiCollector {
             subagent_cache: HashMap::new(),
             cached_git_branch: HashMap::new(),
             cached_versions: HashMap::new(),
+            model_windows: HashMap::new(),
         }
     }
 
@@ -165,6 +223,35 @@ impl PiCollector {
             std::env::var_os(AGENT_DIR_ENV).map(PathBuf::from),
             std::env::var_os(SESSION_DIR_ENV).map(PathBuf::from),
         );
+    }
+
+    /// The agent dir's model windows, reloaded when `models.db` changed since the
+    /// last slow tick. Pi installs without the database fall back to Claude sizes.
+    fn model_windows<'a>(
+        cache: &'a mut HashMap<PathBuf, ModelWindows>,
+        agent_dir: &Path,
+    ) -> &'a ModelWindows {
+        let db = agent_dir.join("models.db");
+        let windows = cache
+            .entry(agent_dir.to_path_buf())
+            .or_insert_with(|| ModelWindows {
+                recheck: true,
+                ..Default::default()
+            });
+        if windows.recheck {
+            let stamp = models_db_stamp(&db);
+            if stamp != windows.stamp {
+                let rows = stamp
+                    .and_then(|_| query_model_windows(&db))
+                    .unwrap_or_default();
+                *windows = ModelWindows {
+                    stamp,
+                    ..ModelWindows::from_rows(&rows)
+                };
+            }
+            windows.recheck = false;
+        }
+        windows
     }
 
     fn default_agent_dir(&self) -> Option<PathBuf> {
@@ -244,6 +331,9 @@ impl PiCollector {
         if shared.slow_tick || self.agent_dirs.is_empty() {
             self.refresh_agent_dirs();
             self.cached_git_branch.clear();
+            for windows in self.model_windows.values_mut() {
+                windows.recheck = true;
+            }
         }
 
         let self_pid = std::process::id();
@@ -627,8 +717,11 @@ impl PiCollector {
             vec!["thinking...".to_string()]
         };
 
-        let context_window =
-            super::context_window_for_model(&state.model, "", state.max_context_tokens);
+        let context_window = Self::model_windows(&mut self.model_windows, agent_dir)
+            .get(&state.provider, &state.model_id)
+            .unwrap_or_else(|| {
+                super::context_window_for_model(&state.model, "", state.max_context_tokens)
+            });
         let context_percent = if context_window > 0 {
             (state.last_context_tokens as f64 / context_window as f64) * 100.0
         } else {
@@ -1010,6 +1103,17 @@ fn update_transcript_state(path: &Path, state: &mut TranscriptState) {
                     };
                     if !m.is_empty() && m != "-" {
                         state.model = m;
+                        let raw = val
+                            .get("model")
+                            .or_else(|| val.get("modelId"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let (provider, id) = match val.get("provider").and_then(Value::as_str) {
+                            Some(provider) => (provider, raw),
+                            None => raw.split_once('/').unwrap_or(("", raw)),
+                        };
+                        state.provider = super::sanitize_terminal_text(provider);
+                        state.model_id = super::sanitize_terminal_text(id);
                     }
                 }
             }
@@ -1124,6 +1228,9 @@ fn update_transcript_state(path: &Path, state: &mut TranscriptState) {
                         );
                         if msg_model != "-" {
                             state.model = msg_model.clone();
+                            let field = |key| msg.get(key).and_then(Value::as_str).unwrap_or("");
+                            state.provider = super::sanitize_terminal_text(field("provider"));
+                            state.model_id = super::sanitize_terminal_text(field("model"));
                         }
 
                         if let Some(effort) = msg
@@ -2014,6 +2121,35 @@ fn parse_env_dirs(environ: &[u8]) -> (Option<PathBuf>, Option<PathBuf>) {
     dirs
 }
 
+fn models_db_stamp(db: &Path) -> Option<(std::time::SystemTime, Option<std::time::SystemTime>)> {
+    let modified = |path: &Path| fs::metadata(path).and_then(|m| m.modified()).ok();
+    Some((modified(db)?, modified(&db.with_extension("db-wal"))))
+}
+
+/// `(provider, id, context_window)` for every cached model, via the `sqlite3` CLI
+/// (as for OpenCode). `None` when the CLI or the table is unavailable.
+fn query_model_windows(db: &Path) -> Option<Vec<Value>> {
+    const SQL: &str = "SELECT json_extract(m.value, '$.provider') AS provider, \
+        json_extract(m.value, '$.id') AS id, \
+        json_extract(m.value, '$.contextWindow') AS context_window \
+        FROM model_cache, json_each(model_cache.models) AS m \
+        WHERE context_window > 0";
+    let output = std::process::Command::new("sqlite3")
+        .args(["-readonly", "-json"])
+        .arg(db)
+        .arg(SQL)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    serde_json::from_str(stdout.trim()).ok()
+}
+
 fn resolve_git_branch(cwd: &str) -> String {
     if !Path::new(cwd).is_dir() {
         return String::new();
@@ -2155,6 +2291,79 @@ mod tests {
         assert_eq!(terminal_session_name("/dev/tty1").as_deref(), Some("tty1"));
         assert_eq!(terminal_session_name("/dev/"), None);
         assert_eq!(terminal_session_name("/home/u/file"), None);
+    }
+
+    #[test]
+    fn model_change_records_provider_and_model_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl = dir.path().join("2026-10-15T19-22-15-457Z_sid.jsonl");
+        fs::write(
+            &jsonl,
+            r#"{"type":"model_change","id":"1","timestamp":"2026-10-15T19:22:15.500Z","model":"openrouter/anthropic/claude-opus-5-5"}
+"#,
+        )
+        .unwrap();
+        let mut state = TranscriptState::default();
+        update_transcript_state(&jsonl, &mut state);
+        assert_eq!(
+            (state.provider.as_str(), state.model_id.as_str()),
+            ("openrouter", "anthropic/claude-opus-5-5")
+        );
+    }
+
+    #[test]
+    fn model_windows_are_per_provider_with_an_agreeing_fallback() {
+        let rows: Vec<Value> = serde_json::from_str(
+            r#"[
+                {"provider":"anthropic","id":"claude-opus-5-5","context_window":1000000},
+                {"provider":"factory-droid","id":"claude-opus-5-5","context_window":872000},
+                {"provider":"openai","id":"gpt-5.4","context_window":400000}
+            ]"#,
+        )
+        .unwrap();
+        let windows = ModelWindows::from_rows(&rows);
+        assert_eq!(windows.get("anthropic", "claude-opus-5-5"), Some(1_000_000));
+        assert_eq!(
+            windows.get("factory-droid", "claude-opus-5-5"),
+            Some(872_000)
+        );
+        assert_eq!(windows.get("venice", "claude-opus-5-5"), None);
+        // Without a provider, only an id every provider agrees on resolves.
+        assert_eq!(windows.get("", "claude-opus-5-5"), None);
+        assert_eq!(windows.get("", "gpt-5.4"), Some(400_000));
+    }
+
+    #[test]
+    fn reads_context_windows_from_the_models_db_cache() {
+        if std::process::Command::new("sqlite3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("Skipping SQLite integration test: sqlite3 is not installed");
+            return;
+        }
+        let agent_dir = tempfile::tempdir().unwrap();
+        let db = agent_dir.path().join("models.db");
+        let setup = std::process::Command::new("sqlite3")
+            .arg(&db)
+            .arg(
+                r#"CREATE TABLE model_cache (provider_id TEXT PRIMARY KEY, models TEXT NOT NULL);
+INSERT INTO model_cache VALUES ('anthropic', '[{"id":"claude-opus-5-5","provider":"anthropic","contextWindow":1000000},{"id":"no-window","provider":"anthropic"}]');"#,
+            )
+            .output()
+            .unwrap();
+        assert!(setup.status.success());
+
+        let mut cache = HashMap::new();
+        let windows = PiCollector::model_windows(&mut cache, agent_dir.path());
+        assert_eq!(windows.get("anthropic", "claude-opus-5-5"), Some(1_000_000));
+        assert_eq!(windows.get("anthropic", "no-window"), None);
+        // A Pi install without models.db yields no windows.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(PiCollector::model_windows(&mut cache, empty.path())
+            .by_model
+            .is_empty());
     }
 
     #[test]
@@ -2317,6 +2526,10 @@ mod tests {
         assert_eq!(state.cwd, "/Users/test/abtop");
         assert_eq!(state.title, "Add omp and pi support");
         assert_eq!(state.model, "gemini-4-argon");
+        assert_eq!(
+            (state.provider.as_str(), state.model_id.as_str()),
+            ("fuelix", "gemini-4-argon")
+        );
         assert_eq!(state.effort, "low");
         assert_eq!(state.turn_count, 2);
         assert_eq!(state.total_input, 2200);
