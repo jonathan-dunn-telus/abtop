@@ -63,7 +63,7 @@ Aggregate model shares use the combined token total, and average tokens per turn
 
 ## Token rate and Context panes
 
-The top row has two independent panes: **Token rate** (`9`) shows the global token activity chart and tokens/min; **Context** (`1`) shows each session's project name, context usage, window size, and compaction count. Token rate counts input, output, and cache creation across collected sessions, excluding cache reads. It stays global regardless of selection or the Tokens/Models scope toggle. On desktop, the panes share the row at 65%/35%; hiding either lets the other use the full width. Both toggles are available in the View menu and configuration overlay and persist across restarts.
+The top row has two independent panes: **Token rate** (`9`) shows the global token activity chart and tokens/min; **Context** (`1`) shows each session's project name, context usage, window size, and compaction count. Token rate counts input, output, and cache creation across collected sessions, excluding cache reads. It stays global regardless of selection or the Tokens/Models scope toggle. They share one row at 65%/35% on desktop and side by side in the narrow Usage tab, where Context keeps its full table; hiding either lets the other use the full width. Other panes shrink to their minimum before the row is hidden, so a long session list no longer pushes it off screen. Both toggles are available in the View menu and configuration overlay and persist across restarts.
 
 If `show_token_rate` is omitted, it inherits `show_context` (which defaults to `true`), preserving the old combined pane preference. Once saved, the two settings are independent.
 
@@ -105,7 +105,7 @@ arrives.
 
 ## Responsive layout
 
-The desktop layout reserves minimum widths for enabled panes and switches to tabs when they cannot fit (134 columns with all panes enabled). In the Usage tab, Token rate hides first, then Context, when height is limited, preserving both quota windows and all four token categories. Quota bars shrink before values are clipped, reset countdowns move inline in shorter panes, and Models combines overflow when needed. These automatic layout changes do not alter saved visibility settings.
+The desktop layout reserves minimum widths for enabled panes and switches to tabs when they cannot fit (134 columns with all panes enabled). In the Usage tab, Token rate and Context share one row; when height is limited, Models shows one entry and then Quota drops its summary before that row is hidden (below 23 rows), always preserving both quota windows and all four token categories. Quota bars shrink before values are clipped, reset countdowns move inline in shorter panes, and Models combines overflow when needed. These automatic layout changes do not alter saved visibility settings.
 
 ![Narrow Usage tab](../assets/remix/narrow-usage.png)
 
