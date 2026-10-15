@@ -168,6 +168,10 @@ fn resolve_parent_cli(ppid: u32, process_info: &HashMap<u32, ProcInfo>) -> &'sta
         "claude"
     } else if process::cmd_has_binary(cmd, "codex") {
         "codex"
+    } else if super::pi::cmd_matches_harness(cmd, "omp") {
+        "omp"
+    } else if super::pi::cmd_matches_harness(cmd, "pi") {
+        "pi"
     } else {
         "?"
     }

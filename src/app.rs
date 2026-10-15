@@ -1408,6 +1408,8 @@ fn is_supported_agent_command(cmd: &str) -> bool {
     crate::collector::process::cmd_has_binary(cmd, "claude")
         || crate::collector::process::cmd_has_binary(cmd, "codex")
         || crate::collector::process::cmd_has_binary(cmd, "opencode")
+        || crate::collector::pi::cmd_matches_harness(cmd, "omp")
+        || crate::collector::pi::cmd_matches_harness(cmd, "pi")
 }
 
 fn is_killable_agent_command(cmd: &str) -> bool {

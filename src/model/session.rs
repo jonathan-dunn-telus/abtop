@@ -149,19 +149,31 @@ impl AgentCounts {
 pub struct AgentTotals {
     pub claude: AgentCounts,
     pub codex: AgentCounts,
+    pub omp: AgentCounts,
+    pub pi: AgentCounts,
 }
 
 impl AgentTotals {
     pub fn working(self) -> u32 {
-        self.claude.working.saturating_add(self.codex.working)
+        self.claude
+            .working
+            .saturating_add(self.codex.working)
+            .saturating_add(self.omp.working)
+            .saturating_add(self.pi.working)
     }
     pub fn unknown(self) -> u32 {
-        self.claude.unknown.saturating_add(self.codex.unknown)
+        self.claude
+            .unknown
+            .saturating_add(self.codex.unknown)
+            .saturating_add(self.omp.unknown)
+            .saturating_add(self.pi.unknown)
     }
     pub fn add_subagents(&mut self, session: &AgentSession) {
         match session.agent_cli {
             "claude" => self.claude.add(session.subagent_counts),
             "codex" => self.codex.add(session.subagent_counts),
+            "omp" => self.omp.add(session.subagent_counts),
+            "pi" => self.pi.add(session.subagent_counts),
             _ => {}
         }
     }
@@ -172,6 +184,8 @@ impl AgentTotals {
         let counts = match session.agent_cli {
             "claude" => &mut self.claude,
             "codex" => &mut self.codex,
+            "omp" => &mut self.omp,
+            "pi" => &mut self.pi,
             _ => return,
         };
         counts.add(session.subagent_counts);

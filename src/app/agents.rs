@@ -30,7 +30,7 @@ impl App {
         let mut seen = HashSet::new();
         self.sessions.iter().filter(move |s| {
             live(s)
-                && matches!(s.agent_cli, "claude" | "codex")
+                && matches!(s.agent_cli, "claude" | "codex" | "omp" | "pi")
                 && seen.insert((s.agent_cli, s.config_root.as_str(), s.session_id.as_str()))
         })
     }

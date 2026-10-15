@@ -31,7 +31,7 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect, theme: &Theme, active: 
     if app.agent_scope == StatsScope::Selected {
         let message = match app.sessions.get(app.selected) {
             None => Some("No session selected"),
-            Some(s) if !matches!(s.agent_cli, "claude" | "codex") => {
+            Some(s) if !matches!(s.agent_cli, "claude" | "codex" | "omp" | "pi") => {
                 Some("Agent activity unavailable")
             }
             _ => None,
@@ -75,8 +75,20 @@ pub(crate) fn draw(f: &mut Frame, app: &App, area: Rect, theme: &Theme, active: 
             format!("Codex {}  ", counts.codex.working),
             Style::default().fg(grad_at(&codex_gradient, 50.0)),
         ),
-        Span::raw(format!("Peak {peak}")),
     ];
+    if counts.omp.working > 0 {
+        summary.push(Span::styled(
+            format!("OMP {}  ", counts.omp.working),
+            Style::default().fg(grad_at(&codex_gradient, 50.0)),
+        ));
+    }
+    if counts.pi.working > 0 {
+        summary.push(Span::styled(
+            format!("Pi {}  ", counts.pi.working),
+            Style::default().fg(grad_at(&codex_gradient, 50.0)),
+        ));
+    }
+    summary.push(Span::raw(format!("Peak {peak}")));
     if counts.unknown() > 0 {
         summary.push(Span::styled(
             format!(" · Unknown {}", counts.unknown()),
