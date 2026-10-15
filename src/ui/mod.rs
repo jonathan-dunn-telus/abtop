@@ -529,15 +529,25 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
     let top_ideal: u16 = (app.sessions.len() as u16 + 4).clamp(top_min_ideal, 10);
 
     let available = area.height.saturating_sub(FIXED);
+    // Every pane reserves its floor before any pane grows, so the top graphs
+    // only yield when the floors alone exceed the terminal height.
     // Tokens need five content rows for the total and all four categories.
     let mid_min = if app.show_tokens { 7 } else { 6 };
     let mid_reserved = if any_mid { mid_min.min(available) } else { 0 };
+    let sessions_floor = if app.show_sessions { 5 } else { 0 };
     let agents_min = if app.show_agents {
-        3.min(available.saturating_sub(mid_reserved + if app.show_sessions { 5 } else { 0 }))
+        3.min(available.saturating_sub(mid_reserved + sessions_floor))
     } else {
         0
     };
-    let sessions_budget = available.saturating_sub(mid_reserved + agents_min);
+    let top_enabled = app.show_context || app.show_token_rate;
+    let top_reserved =
+        if top_enabled && mid_reserved + sessions_floor + agents_min + TOP_MIN <= available {
+            TOP_MIN
+        } else {
+            0
+        };
+    let sessions_budget = available.saturating_sub(mid_reserved + agents_min + top_reserved);
     let sessions_h = if app.show_sessions {
         sessions_ideal
             .min(sessions_budget)
@@ -546,11 +556,11 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
         0
     };
     let agents_h = if agents_min > 0 {
-        7.min(available.saturating_sub(sessions_h + mid_reserved))
+        7.min(available.saturating_sub(sessions_h + mid_reserved + top_reserved))
     } else {
         0
     };
-    let after_sessions = available.saturating_sub(sessions_h + agents_h);
+    let after_sessions = available.saturating_sub(sessions_h + agents_h + top_reserved);
     let mid_h = if any_mid {
         mid_h_ideal
             .min(after_sessions)
@@ -558,10 +568,8 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
     } else {
         0
     };
-    let surplus = available.saturating_sub(sessions_h + mid_h + agents_h);
-    let top_enabled = app.show_context || app.show_token_rate;
-    let top_h = if top_enabled && sessions_h >= sessions_ideal && surplus >= TOP_MIN {
-        top_ideal.min(surplus)
+    let top_h = if top_reserved > 0 {
+        top_ideal.min(available.saturating_sub(sessions_h + mid_h + agents_h))
     } else {
         0
     };
@@ -601,17 +609,7 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
     let (token_rate, context) = if top_h > 0 {
         let area = chunks[idx];
         idx += 1;
-        match (app.show_token_rate, app.show_context) {
-            (true, true) => {
-                let panes =
-                    Layout::horizontal([Constraint::Percentage(65), Constraint::Percentage(35)])
-                        .split(area);
-                (Some(panes[0]), Some(panes[1]))
-            }
-            (true, false) => (Some(area), None),
-            (false, true) => (None, Some(area)),
-            (false, false) => (None, None),
-        }
+        graph_band(area, app.show_token_rate, app.show_context)
     } else {
         (None, None)
     };
@@ -658,6 +656,28 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
         mid,
         sessions,
         footer: chunks[idx],
+    }
+}
+
+/// Context's three table columns (10 each, plus spacing and borders).
+const CONTEXT_MIN_WIDTH: u16 = 34;
+
+/// Lay out Token rate and Context side by side: Context takes 35% (never less
+/// than its full table), and Token rate takes the rest.
+fn graph_band(area: Rect, show_rate: bool, show_context: bool) -> (Option<Rect>, Option<Rect>) {
+    match (show_rate, show_context) {
+        (true, true) => {
+            let context_w = ((u32::from(area.width) * 35 / 100) as u16)
+                .max(CONTEXT_MIN_WIDTH)
+                .min(area.width);
+            let [rate, context] =
+                Layout::horizontal([Constraint::Fill(1), Constraint::Length(context_w)])
+                    .areas(area);
+            (Some(rate), Some(context))
+        }
+        (true, false) => (Some(area), None),
+        (false, true) => (None, Some(area)),
+        (false, false) => (None, None),
     }
 }
 
@@ -755,7 +775,7 @@ fn draw_active_narrow_panel(f: &mut Frame, app: &App, area: Rect, theme: &Theme)
 }
 
 fn narrow_section_areas(app: &App, tab: NarrowTab, area: Rect) -> Vec<(NarrowSection, Rect)> {
-    let mut sections = if let Some(section) = app.maximized_narrow_section() {
+    let sections = if let Some(section) = app.maximized_narrow_section() {
         if section.tab() == tab {
             vec![section]
         } else {
@@ -772,36 +792,11 @@ fn narrow_section_areas(app: &App, tab: NarrowTab, area: Rect) -> Vec<(NarrowSec
         return vec![(sections[0], area)];
     }
 
-    let constraints = if tab == NarrowTab::Usage {
-        let min_height = |section| match section {
-            NarrowSection::Agents => 3,
-            NarrowSection::Context | NarrowSection::TokenRate => 5,
-            NarrowSection::Quota => 6,
-            NarrowSection::Tokens => 7,
-            NarrowSection::Models => 4,
-            _ => 0,
-        };
-        // Optional graphs yield before the core usage rows, without changing
-        // saved visibility. Keep context usage available longer than token rate.
-        for optional in [NarrowSection::TokenRate, NarrowSection::Context] {
-            if sections.iter().copied().map(min_height).sum::<u16>() > area.height {
-                sections.retain(|section| *section != optional);
-            }
-        }
-        let mut minima: Vec<_> = sections.iter().copied().map(min_height).collect();
-        if minima.iter().sum::<u16>() > area.height {
-            // At the minimum terminal height, omit quota's summary and show
-            // one Models row (with overflow) to preserve every token category.
-            for (section, minimum) in sections.iter().zip(&mut minima) {
-                match section {
-                    NarrowSection::Quota => *minimum = 5,
-                    NarrowSection::Models => *minimum = 3,
-                    _ => {}
-                }
-            }
-        }
-        minimum_constraints(&minima, area.height)
-    } else if tab == NarrowTab::Work && sections.contains(&NarrowSection::Agents) {
+    if tab == NarrowTab::Usage {
+        return usage_section_areas(&sections, app.show_cache_read_rate, area);
+    }
+
+    let constraints = if tab == NarrowTab::Work && sections.contains(&NarrowSection::Agents) {
         let mut heights: Vec<u16> = sections
             .iter()
             .map(|s| match s {
@@ -838,6 +833,80 @@ fn narrow_section_areas(app: &App, tab: NarrowTab, area: Rect) -> Vec<(NarrowSec
         .split(area);
 
     sections.into_iter().zip(chunks.iter().copied()).collect()
+}
+
+/// Usage tab: the graphs share one band, which yields only when the stats
+/// panes' floors leave no room for it. Rows above the floors then go, in order,
+/// to Quota's summary, the second Models row, and the cache chart's sixth band
+/// row, before spare rows are shared evenly.
+fn usage_section_areas(
+    sections: &[NarrowSection],
+    cache_chart: bool,
+    area: Rect,
+) -> Vec<(NarrowSection, Rect)> {
+    const GRAPH_BAND_MIN: u16 = 5;
+    let has = |section| sections.contains(&section);
+    let graphs = has(NarrowSection::TokenRate) || has(NarrowSection::Context);
+    let stats: Vec<_> = sections
+        .iter()
+        .copied()
+        .filter(|s| !matches!(s, NarrowSection::TokenRate | NarrowSection::Context))
+        .collect();
+    // Floors omit quota's summary and keep one Models row (with overflow);
+    // Tokens always keeps the total and all four categories.
+    let floor = |section| match section {
+        NarrowSection::Quota => 5,
+        NarrowSection::Tokens => 7,
+        NarrowSection::Models => 3,
+        _ => 0,
+    };
+    let full = |section| match section {
+        NarrowSection::Quota => 6,
+        NarrowSection::Models => 4,
+        section => floor(section),
+    };
+    let stats_floor = stats.iter().copied().map(floor).sum::<u16>();
+    let band = if graphs && (stats.is_empty() || stats_floor + GRAPH_BAND_MIN <= area.height) {
+        GRAPH_BAND_MIN
+    } else {
+        0
+    };
+    // Matches the desktop top row's ideal minimum with the cache chart on.
+    let band_full = if band > 0 && cache_chart && has(NarrowSection::TokenRate) {
+        6
+    } else {
+        band
+    };
+
+    let offset = usize::from(band > 0);
+    let mut minima: Vec<u16> = (band > 0).then_some(band).into_iter().collect();
+    minima.extend(stats.iter().copied().map(floor));
+    let mut spare = area.height.saturating_sub(minima.iter().sum());
+    let growth = stats
+        .iter()
+        .enumerate()
+        .map(|(i, &section)| (offset + i, full(section) - floor(section)))
+        .chain((band > 0).then_some((0, band_full - band)));
+    for (index, rows) in growth {
+        let rows = rows.min(spare);
+        minima[index] += rows;
+        spare -= rows;
+    }
+    let rows = Layout::vertical(minimum_constraints(&minima, area.height)).split(area);
+    let mut rows = rows.iter().copied();
+
+    let mut out = Vec::with_capacity(sections.len());
+    if band > 0 {
+        let (rate, context) = graph_band(
+            rows.next().unwrap(),
+            has(NarrowSection::TokenRate),
+            has(NarrowSection::Context),
+        );
+        out.extend(rate.map(|r| (NarrowSection::TokenRate, r)));
+        out.extend(context.map(|r| (NarrowSection::Context, r)));
+    }
+    out.extend(stats.into_iter().zip(rows));
+    out
 }
 
 /// Reserve each pane's essential content, then share spare space evenly.
@@ -1528,7 +1597,7 @@ mod tests {
         let body = narrow_chunks(area)[1];
 
         let usage_sections = narrow_section_areas(&app, NarrowTab::Usage, body);
-        assert_eq!(usage_sections.len(), 4);
+        assert_eq!(usage_sections.len(), 5);
         for (section, area) in usage_sections {
             let minimum = match section {
                 NarrowSection::Agents => 3,
@@ -1913,9 +1982,20 @@ mod tests {
         }
         app.show_token_rate = true;
         app.show_context = true;
-        let short = desktop_layout(&app, Rect::new(0, 0, 160, 24));
-        assert!(short.token_rate.is_none() && short.context.is_none());
+        // Floors: header and footer 2, middle row 7, Sessions 5, Agents 3, graphs 5.
+        let short = desktop_layout(&app, Rect::new(0, 0, 160, 22));
+        assert_eq!(short.token_rate.unwrap().height, 5);
+        assert_eq!(short.sessions.unwrap().height, 5);
+        let shorter = desktop_layout(&app, Rect::new(0, 0, 160, 21));
+        assert!(shorter.token_rate.is_none() && shorter.context.is_none());
         assert!(app.show_token_rate && app.show_context);
+
+        // Sessions grow after the graphs' floor, so a long list cannot hide them.
+        let template = app.sessions[0].clone();
+        app.sessions.resize(20, template);
+        let crowded = desktop_layout(&app, area);
+        assert_eq!(crowded.token_rate.unwrap().height, 5);
+        assert_eq!(crowded.sessions.unwrap().height, 23);
     }
 
     #[test]
@@ -1943,13 +2023,14 @@ mod tests {
         for height in [24, 27, 30, 40] {
             let area = Rect::new(0, 0, 80, height);
             let body = narrow_chunks(area)[1];
-            app.show_cache_read_rate = false;
-            let without_cache = narrow_section_areas(&app, NarrowTab::Usage, body);
-            app.show_cache_read_rate = true;
-            assert_eq!(
-                narrow_section_areas(&app, NarrowTab::Usage, body),
-                without_cache
-            );
+            // The band grows to six rows once the stats panes are full (26 rows).
+            let sections = narrow_section_areas(&app, NarrowTab::Usage, body);
+            let rate = sections
+                .iter()
+                .find(|(s, _)| *s == NarrowSection::TokenRate)
+                .unwrap()
+                .1;
+            assert_eq!(rate.height >= 6, height >= 26, "{height} rows");
             sync_narrow_section(&mut app, area);
             app.toggle_narrow_section_zoom(NarrowSection::TokenRate);
             let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
@@ -1983,23 +2064,28 @@ mod tests {
     }
 
     #[test]
-    fn token_rate_yields_before_context_with_visible_focus_and_independent_zoom() {
+    fn graphs_share_a_band_and_yield_together_with_visible_focus_and_independent_zoom() {
         let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
         crate::demo::populate_demo(&mut app);
         app.set_narrow_tab(NarrowTab::Usage);
-        for (height, show_rate, show_context) in
-            [(40, true, true), (27, false, true), (24, false, false)]
-        {
+        // The band needs five rows above the stats floors (15), plus header,
+        // tabs, and footer.
+        for (height, show_graphs) in [(40, true), (23, true), (22, false)] {
             let area = Rect::new(0, 0, 80, height);
             let sections = narrow_section_areas(&app, NarrowTab::Usage, narrow_chunks(area)[1]);
-            assert_eq!(
-                sections.iter().any(|(s, _)| *s == NarrowSection::TokenRate),
-                show_rate
-            );
-            assert_eq!(
-                sections.iter().any(|(s, _)| *s == NarrowSection::Context),
-                show_context
-            );
+            let pane = |kind| {
+                sections
+                    .iter()
+                    .find(|(s, _)| *s == kind)
+                    .map(|(_, pane)| *pane)
+            };
+            let (rate, context) = (pane(NarrowSection::TokenRate), pane(NarrowSection::Context));
+            assert_eq!(rate.is_some(), show_graphs, "{height} rows");
+            assert_eq!(context.is_some(), show_graphs, "{height} rows");
+            if let (Some(rate), Some(context)) = (rate, context) {
+                assert_eq!(rate.right(), context.x);
+                assert_eq!((rate.y, rate.height), (context.y, context.height));
+            }
             assert!(app.show_token_rate && app.show_context);
             sync_narrow_section(&mut app, area);
             let active = app.active_narrow_section().unwrap();
@@ -2021,6 +2107,26 @@ mod tests {
             );
             app.restore_narrow_sections();
         }
+
+        // At the minimum width, Context keeps its full table beside Token rate.
+        let area = Rect::new(0, 0, 60, 23);
+        let sections = narrow_section_areas(&app, NarrowTab::Usage, narrow_chunks(area)[1]);
+        let mut terminal = Terminal::new(TestBackend::new(60, 23)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        for (section, expected) in [
+            (NarrowSection::TokenRate, vec!["token rate", "/min"]),
+            (
+                NarrowSection::Context,
+                vec!["webshop", "72%", "200k C2", "Window"],
+            ),
+        ] {
+            let pane = sections.iter().find(|(s, _)| *s == section).unwrap().1;
+            let text = area_text(terminal.backend().buffer(), pane);
+            for value in expected {
+                assert!(text.contains(value), "{section:?} missing {value}:\n{text}");
+            }
+        }
+
         let area = Rect::new(0, 0, 80, 24);
         for section in [NarrowSection::TokenRate, NarrowSection::Context] {
             app.toggle_narrow_section_zoom(section);
@@ -2084,17 +2190,48 @@ mod tests {
     }
 
     #[test]
-    fn context_yields_to_usage_without_changing_visibility_or_breaking_zoom() {
+    fn usage_rows_above_floors_restore_stats_before_the_band_grows() {
         let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
         crate::demo::populate_demo(&mut app);
         app.set_narrow_tab(NarrowTab::Usage);
-        let area = Rect::new(0, 0, 80, 24);
+        let heights = |app: &App, rows| {
+            let area = Rect::new(0, 0, 80, rows);
+            let sections = narrow_section_areas(app, NarrowTab::Usage, narrow_chunks(area)[1]);
+            let height = |kind| sections.iter().find(|(s, _)| *s == kind).unwrap().1.height;
+            (
+                height(NarrowSection::TokenRate),
+                height(NarrowSection::Context),
+                height(NarrowSection::Quota),
+                height(NarrowSection::Tokens),
+                height(NarrowSection::Models),
+            )
+        };
+        // Floors: band 5, Quota 5, Tokens 7, Models 3, plus header, tabs, and footer.
+        assert_eq!(heights(&app, 23), (5, 5, 5, 7, 3));
+        assert_eq!(heights(&app, 24), (5, 5, 6, 7, 3));
+        assert_eq!(heights(&app, 25), (5, 5, 6, 7, 4));
+        assert_eq!(heights(&app, 27), (6, 6, 7, 7, 4));
+
+        // The cache chart's sixth row comes after the stats panes' full height.
+        app.show_cache_read_rate = true;
+        assert_eq!(heights(&app, 25), (5, 5, 6, 7, 4));
+        assert_eq!(heights(&app, 26), (6, 6, 6, 7, 4));
+        assert_eq!(heights(&app, 27), (7, 7, 6, 7, 4));
+    }
+
+    #[test]
+    fn graphs_yield_to_usage_floors_without_changing_visibility_or_breaking_zoom() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        app.set_narrow_tab(NarrowTab::Usage);
+        let area = Rect::new(0, 0, 80, 22);
         let body = narrow_chunks(area)[1];
         let sections = narrow_section_areas(&app, NarrowTab::Usage, body);
-        assert!(!sections
-            .iter()
-            .any(|(section, _)| *section == NarrowSection::Context));
-        assert!(app.show_context);
+        assert!(!sections.iter().any(|(section, _)| matches!(
+            section,
+            NarrowSection::Context | NarrowSection::TokenRate
+        )));
+        assert!(app.show_context && app.show_token_rate);
         for (section, pane) in sections {
             assert_eq!(
                 click_target(&app, area, pane.x + 1, pane.y + 1),
