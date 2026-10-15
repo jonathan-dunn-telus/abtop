@@ -1718,6 +1718,16 @@ fn map_pid_to_open_paths(pids: &[u32]) -> HashMap<u32, ProcessOpenPaths> {
     }
 }
 
+/// Name of the `terminal-sessions/` record for a tty device, as the harness writes
+/// it: the path after `/dev/` with `/` replaced by `-` (`/dev/pts/3` -> `pts-3`).
+#[cfg(any(target_os = "linux", test))]
+fn terminal_session_name(device: &str) -> Option<String> {
+    device
+        .strip_prefix("/dev/")
+        .filter(|s| !s.is_empty())
+        .map(|s| s.replace('/', "-"))
+}
+
 #[cfg(target_os = "linux")]
 fn map_pid_to_proc_open_paths(pids: &[u32]) -> HashMap<u32, ProcessOpenPaths> {
     let mut map = HashMap::new();
@@ -1728,14 +1738,9 @@ fn map_pid_to_proc_open_paths(pids: &[u32]) -> HashMap<u32, ProcessOpenPaths> {
         if let Ok(entries) = fs::read_dir(format!("/proc/{pid}/fd")) {
             for entry in entries.flatten() {
                 if let Ok(target) = fs::read_link(entry.path()) {
-                    if let Some(tty_name) = target
-                        .to_str()
-                        .and_then(|s| s.strip_prefix("/dev/"))
-                        .filter(|s| !s.is_empty())
-                    {
-                        let cleaned = tty_name.replace('/', "_");
-                        if !ttys.contains(&cleaned) {
-                            ttys.push(cleaned);
+                    if let Some(tty_name) = target.to_str().and_then(terminal_session_name) {
+                        if !ttys.contains(&tty_name) {
+                            ttys.push(tty_name);
                         }
                     }
                     if target.is_absolute() {
@@ -2034,6 +2039,14 @@ mod tests {
 
         let pids = collector.find_pids(&procs, 999);
         assert_eq!(pids, vec![101]);
+    }
+
+    #[test]
+    fn terminal_session_names_match_the_harness_records() {
+        assert_eq!(terminal_session_name("/dev/pts/34").as_deref(), Some("pts-34"));
+        assert_eq!(terminal_session_name("/dev/tty1").as_deref(), Some("tty1"));
+        assert_eq!(terminal_session_name("/dev/"), None);
+        assert_eq!(terminal_session_name("/home/u/file"), None);
     }
 
     #[test]
