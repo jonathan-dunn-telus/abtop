@@ -255,6 +255,8 @@ mod tests {
         crate::demo::populate_demo(&mut app);
         app.sessions.truncate(1);
         app.selected = 0;
+        // Start without the rate baseline the demo replay recorded.
+        app.sessions[0].session_id = "rates-fixture".into();
         let set_totals = |app: &mut App, values: [u64; 4]| {
             let session = &mut app.sessions[0];
             session.total_input_tokens = values[0];

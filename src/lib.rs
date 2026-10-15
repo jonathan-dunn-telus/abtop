@@ -279,9 +279,6 @@ fn run_app(
         if demo_mode {
             if last_tick.elapsed() >= tick_interval {
                 demo::advance_token_rates(&mut app);
-                if let Some(front) = app.live_token_history.pop_front() {
-                    app.live_token_history.push_back(front);
-                }
                 last_tick = std::time::Instant::now();
             }
         } else if !app.initializing() && !had_input && last_tick.elapsed() >= tick_interval {

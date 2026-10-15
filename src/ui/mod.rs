@@ -1777,6 +1777,15 @@ mod tests {
         let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
         crate::demo::populate_demo(&mut app);
         app.set_narrow_tab(NarrowTab::Usage);
+        // Demo totals grow with its synthetic activity, so read them back.
+        let selected = &app.sessions[app.selected];
+        let [input, output, cache_read, cache_write] = [
+            selected.total_input_tokens,
+            selected.total_output_tokens,
+            selected.total_cache_read,
+            selected.total_cache_create,
+        ]
+        .map(fmt_tokens);
         for width in [60, 80, 100, 110, 120, 133, 134, 160] {
             for height in [18, 24, 40] {
                 let area = Rect::new(0, 0, width, height);
@@ -1792,7 +1801,13 @@ mod tests {
                     (
                         NarrowSection::Tokens,
                         vec![
-                            "Total:", "48.2k", "12.8k", "CacheR:", "1.4M", "CacheW:", "185k",
+                            "Total:",
+                            &input,
+                            &output,
+                            "CacheR:",
+                            &cache_read,
+                            "CacheW:",
+                            &cache_write,
                         ],
                     ),
                     (NarrowSection::Models, vec!["models", "%", "/min"]),
@@ -1860,6 +1875,7 @@ mod tests {
     fn desktop_top_panes_split_expand_and_yield_without_changing_preferences() {
         let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
         crate::demo::populate_demo(&mut app);
+        app.sessions.truncate(5); // The 40-row budget below assumes five sessions.
         let area = Rect::new(0, 0, 160, 40);
         let layout = desktop_layout(&app, area);
         let rate = layout.token_rate.unwrap();

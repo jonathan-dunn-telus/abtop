@@ -1,4 +1,4 @@
-use crate::app::{App, TokenRates};
+use crate::app::{App, AGENT_HISTORY_WINDOW};
 use crate::model::{
     AgentSession, ChatMessage, ChatRole, ChildProcess, FileAccess, FileOp, LaunchSurface,
     ModelUsage, OrphanPort, RateLimitInfo, SessionStatus, SubAgent, ToolCall,
@@ -536,6 +536,75 @@ pub fn populate_demo(app: &mut App) {
             config_root: "~/.local/share/opencode".into(),
             file_accesses: vec![],
         },
+        AgentSession {
+            agent_cli: "claude",
+            launch_surface: LaunchSurface::Cli,
+            pid: 9731,
+            session_id: "f6a7b8c9-abcd-ef01-2345-666666666666".into(),
+            cwd: "/Users/demo/docs-site".into(),
+            project_name: "docs-site".into(),
+            started_at: now - 22 * 60 * 1000, // 22m ago
+            status: SessionStatus::Background,
+            model: "claude-opus-4-6".into(),
+            effort: String::new(),
+            context_percent: 28.0,
+            total_input_tokens: 9_600,
+            total_output_tokens: 4_100,
+            total_cache_read: 240_000,
+            total_cache_create: 38_000,
+            model_usage: Vec::new(),
+            turn_count: 7,
+            current_tasks: vec!["workflow audit · Check links".into()],
+            mem_mb: 118,
+            version: "2.1.87".into(),
+            git_branch: "docs/changelog".into(),
+            git_added: 0,
+            git_modified: 2,
+            token_history: vec![4000, 9000, 6000, 12000, 8000, 5000, 7000],
+            context_history: vec![],
+            compaction_count: 0,
+            context_window: 200_000,
+            subagent_counts: Default::default(),
+            subagents: vec![
+                SubAgent {
+                    activity_key: String::new(),
+                    name: "Collect changelog entries".into(),
+                    status: "done".into(),
+                    tokens: 6_300,
+                    workflow: Some("audit".into()),
+                },
+                SubAgent {
+                    activity_key: String::new(),
+                    name: "Check links".into(),
+                    status: "working".into(),
+                    tokens: 4_800,
+                    workflow: Some("audit".into()),
+                },
+            ],
+            pending_workflows: 1,
+            pending_bg_agents: 0,
+            mem_file_count: 1,
+            mem_line_count: 4,
+            children: vec![],
+
+            first_assistant_text: String::new(),
+            chat_messages: vec![
+                ChatMessage {
+                    role: ChatRole::User,
+                    text: "Audit the changelog and docs links before the release".into(),
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    text: "Started the audit workflow; it reports back when the link check finishes.".into(),
+                },
+            ],
+            initial_prompt: "Audit the changelog and docs links before the release".into(),
+            tool_calls: vec![],
+            pending_since_ms: 0,
+            thinking_since_ms: 0,
+            config_root: "~/.claude".into(),
+            file_accesses: vec![],
+        },
     ];
 
     for session in &mut app.sessions {
@@ -546,7 +615,7 @@ pub fn populate_demo(app: &mut App) {
             &session.model,
             total - child_tokens,
         );
-        ModelUsage::add(&mut session.model_usage, "claude-haiku-4-5", child_tokens);
+        ModelUsage::add(&mut session.model_usage, SUBAGENT_MODEL, child_tokens);
         // Synthetic values are shape weights; allocate only the parent's usage.
         let weight: u64 = session.token_history.iter().sum();
         let mut cumulative = 0;
@@ -582,6 +651,10 @@ pub fn populate_demo(app: &mut App) {
         "ses_e5f6a7b8-9abc-def0-1234-555555555555".into(),
         "Terraform multi-region refactor".into(),
     );
+    app.summaries.insert(
+        "f6a7b8c9-abcd-ef01-2345-666666666666".into(),
+        "Changelog and link audit".into(),
+    );
 
     // --- Rate limits ---
     app.rate_limits = vec![
@@ -607,36 +680,19 @@ pub fn populate_demo(app: &mut App) {
         },
     ];
 
-    // --- Token rates (synthetic sparkline) ---
-    let rates = [
-        0.0, 0.0, 120.0, 340.0, 580.0, 420.0, 0.0, 0.0, 890.0, 1200.0, 950.0, 680.0, 0.0, 0.0,
-        450.0, 780.0, 1100.0, 1350.0, 920.0, 610.0, 0.0, 340.0, 670.0, 890.0, 1050.0, 780.0, 520.0,
-        0.0, 0.0, 1400.0, 1180.0, 850.0, 620.0, 410.0, 0.0, 560.0, 820.0, 1060.0, 1280.0, 940.0,
-        700.0, 480.0, 0.0, 0.0, 380.0, 720.0, 1150.0, 1320.0, 980.0, 650.0,
-    ];
+    // --- Token activity (synthetic, replayed through the real rate accounting) ---
     app.clear_global_token_history();
+    app.live_token_history.clear();
     let now = Instant::now();
-    for (index, &rate) in rates.iter().enumerate() {
-        let cache = rate as u64 * (index as u64 % 5 + 2);
-        let at = now - Duration::from_secs((rates.len() - 1 - index) as u64 * 2);
-        app.record_global_token_delta(at, demo_token_delta(rate as u64, cache));
-        for (i, session) in app.sessions.iter_mut().enumerate() {
-            if matches!(session.agent_cli, "claude" | "codex") {
-                session.subagent_counts.working = if rate == 0.0 {
-                    0
-                } else {
-                    ((index + i) % 5 + 1) as u32
-                };
-            }
-        }
-        app.record_agents(at);
+    // Replay enough steps to fill the Agents pane's whole window.
+    let steps = (AGENT_HISTORY_WINDOW.as_secs() / DEMO_STEP.as_secs()) as usize;
+    let first = demo_step().wrapping_sub(steps - 1);
+    // Baseline the per-session counters before the replayed history starts.
+    app.update_session_token_rates(now - DEMO_STEP * steps as u32);
+    for offset in 0..steps {
+        let at = now - DEMO_STEP * (steps - 1 - offset) as u32;
+        apply_demo_step(app, first.wrapping_add(offset), at);
     }
-    // Synthetic rolling totals for the aggregate Tokens sparkline.
-    app.live_token_history = rates
-        .iter()
-        .enumerate()
-        .map(|(index, _)| rates[index.saturating_sub(29)..=index].iter().sum::<f64>() as u64)
-        .collect();
 
     // --- Orphan ports ---
     app.orphan_ports = vec![OrphanPort {
@@ -655,30 +711,76 @@ pub fn populate_demo(app: &mut App) {
     app.agent_aggregate = crate::host_info::AgentAggregate::from_sessions(&app.sessions);
 }
 
-fn demo_token_delta(rate: u64, cache_read: u64) -> TokenRates {
-    TokenRates {
-        input: rate / 2,
-        output: rate / 4,
-        cache_write: rate - rate / 2 - rate / 4,
-        cache_read,
+/// Synthetic tokens per refresh; the chart loops over this shape.
+const DEMO_RATES: [u64; 50] = [
+    0, 0, 120, 340, 580, 420, 0, 0, 890, 1200, 950, 680, 0, 0, 450, 780, 1100, 1350, 920, 610, 0,
+    340, 670, 890, 1050, 780, 520, 0, 0, 1400, 1180, 850, 620, 410, 0, 560, 820, 1060, 1280, 940,
+    700, 480, 0, 0, 380, 720, 1150, 1320, 980, 650,
+];
+const DEMO_STEP: Duration = Duration::from_secs(2);
+const SUBAGENT_MODEL: &str = "claude-haiku-4-5";
+
+fn demo_step() -> usize {
+    (now_secs() / DEMO_STEP.as_secs()) as usize
+}
+
+/// Grows the counters of working sessions by one step of the synthetic shape,
+/// then lets the app derive global, per-session, and per-model rates from them.
+fn apply_demo_step(app: &mut App, step: usize, at: Instant) {
+    let rate = DEMO_RATES[step % DEMO_RATES.len()];
+    let cache_read = rate * (step as u64 % 5 + 2);
+    let weights: Vec<u64> = app
+        .sessions
+        .iter()
+        .enumerate()
+        .map(|(i, session)| match session.status.is_active() {
+            true => ((step + i) % 4 + 1) as u64,
+            false => 0,
+        })
+        .collect();
+    let weight_sum: u64 = weights.iter().sum();
+    for (i, session) in app.sessions.iter_mut().enumerate() {
+        if weight_sum > 0 {
+            let share = |tokens: u64| tokens * weights[i] / weight_sum;
+            let (input, output) = (share(rate / 2), share(rate / 4));
+            let cache_write = share(rate - rate / 2 - rate / 4);
+            session.total_input_tokens += input;
+            session.total_output_tokens += output;
+            session.total_cache_create += cache_write;
+            if session.total_cache_read > 0 {
+                session.total_cache_read += share(cache_read);
+            }
+            add_demo_usage(session, input + output + cache_write);
+        }
+        if matches!(session.agent_cli, "claude" | "codex") {
+            // Busier steps run more subagents, so both charts share a shape.
+            session.subagent_counts.working = match rate {
+                0 => 0,
+                _ => (rate / 400 + (step + i) as u64 % 2) as u32,
+            };
+        }
     }
+    app.update_session_token_rates(at);
+    app.record_agents(at);
+}
+
+/// A Background root only waits, so its working subagents take all of its
+/// usage; other roots with a working subagent hand it a third.
+fn add_demo_usage(session: &mut AgentSession, tokens: u64) {
+    let model = session.model.clone();
+    let Some(child) = session.subagents.iter_mut().find(|c| c.status == "working") else {
+        ModelUsage::add(&mut session.model_usage, &model, tokens);
+        return;
+    };
+    let child_tokens = match session.status {
+        SessionStatus::Background => tokens,
+        _ => tokens / 3,
+    };
+    child.tokens += child_tokens;
+    ModelUsage::add(&mut session.model_usage, SUBAGENT_MODEL, child_tokens);
+    ModelUsage::add(&mut session.model_usage, &model, tokens - child_tokens);
 }
 
 pub(crate) fn advance_token_rates(app: &mut App) {
-    if let (Some(rate), Some(cache)) = (
-        app.token_rates.pop_front(),
-        app.cache_read_rates.pop_front(),
-    ) {
-        app.record_global_token_delta(Instant::now(), demo_token_delta(rate as u64, cache as u64));
-        for (i, session) in app.sessions.iter_mut().enumerate() {
-            if matches!(session.agent_cli, "claude" | "codex") {
-                session.subagent_counts.working = if rate == 0.0 {
-                    0
-                } else {
-                    ((rate as usize / 100 + i) % 5 + 1) as u32
-                };
-            }
-        }
-        app.record_agents(Instant::now());
-    }
+    apply_demo_step(app, demo_step(), Instant::now());
 }

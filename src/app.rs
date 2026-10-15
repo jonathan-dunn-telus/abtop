@@ -8,6 +8,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 mod agents;
+pub(crate) use agents::HISTORY_WINDOW as AGENT_HISTORY_WINDOW;
 mod collection;
 use collection::{Collected, CollectionState, StartupMessage};
 mod stats;

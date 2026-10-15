@@ -129,6 +129,7 @@ here, keep the fork's side and then add downstream's change by hand where the ru
 | `Cargo.lock` | Take downstream's dependency changes, then run `cargo build` so the `abtop` entry matches the fork's `Cargo.toml` version again. |
 | `on:` block of `.github/workflows/publish.yml` and `.github/workflows/release.yml` | Keep the fork's `workflow_dispatch`-only block and its `remix fork` comment. Downstream's changes to the rest of these files may be merged. |
 | `docs/remix-release.md` and the pointer to it at the top of `AGENTS.md` | Fork-only. Keep them. |
+| *Remix features* and *Installing the remix build* sections of `README.md`, `assets/remix/`, `scripts/remix-screenshots.sh`, `scripts/ansi_to_html.py`, `docs/remix-features.md` | Fork-only. Keep them; merge downstream's README changes around them. |
 | Fork features in `src/`, the rest of `AGENTS.md`, and `docs/` | Combine both sides by hand. Never resolve them by taking downstream's version. |
 
 **Never** run `git merge -X theirs`, `git checkout --theirs <path>`, or `git restore --theirs <path>`
