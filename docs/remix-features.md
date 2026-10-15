@@ -29,10 +29,13 @@ OMP (`omp`) and Pi (`pi`) sessions appear next to Claude Code, Codex CLI, and Op
 one collector handles both. Hide either with `hidden_agents = ["omp"]` or `["pi"]`.
 
 abtop finds running `omp` and `pi` processes, including Pi's npm launcher and the node process
-it starts (only the node child is shown). OMP background workers and Pi's non-interactive
-subcommands (`install`, `remove`, `uninstall`, `update`, `list`, `config`, `auth`, `mcp`) are
-skipped. Transcripts live in `<agent dir>/sessions/<project>/`, where the agent dir is
-`~/.omp/agent` or `~/.pi/agent` unless `PI_CODING_AGENT_DIR` overrides it (OMP reads the same
+it starts (only the node child is shown). Skipped: OMP background workers, subcommands that are
+not agent sessions (Pi's `install`, `update`, `config`, and similar; OMP's `models`, `config`,
+`usage`, and the rest of `omp --help` except `acp` and `join`), and one-shot `-p` runs with
+`--no-session`, which save nothing.
+
+Transcripts live in `<agent dir>/sessions/<project>/`, where the agent dir is `~/.omp/agent` or
+`~/.pi/agent` unless `PI_CODING_AGENT_DIR` overrides it (OMP reads the same
 `PI_` variables as Pi). `PI_CODING_AGENT_SESSION_DIR` instead names one folder that holds
 transcripts directly. abtop reads both variables from each agent process's environment on
 Linux, and from its own environment on every platform.

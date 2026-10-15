@@ -1029,35 +1029,96 @@ fn is_pi_package_entry(tok: &str) -> bool {
         || normalized.ends_with("/node_modules/.bin/pi")
 }
 
+/// Pi subcommands that are not agent sessions.
+const PI_SUBCOMMANDS: &[&str] = &[
+    "install",
+    "remove",
+    "uninstall",
+    "update",
+    "list",
+    "config",
+    "auth",
+    "mcp",
+];
+
+/// OMP subcommands that are not agent sessions, from `omp --help` in OMP 18.11.1.
+/// `acp` (an agent server for editors) and `join` (a shared session) are sessions.
+const OMP_SUBCOMMANDS: &[&str] = &[
+    "agents",
+    "anonymize",
+    "auth",
+    "auth-broker",
+    "auth-gateway",
+    "bench",
+    "browser-relay",
+    "cleanse",
+    "clip",
+    "collab",
+    "commit",
+    "completions",
+    "compress",
+    "config",
+    "dry-balance",
+    "find",
+    "gallery",
+    "gc",
+    "git",
+    "grep",
+    "grievances",
+    "if-bench",
+    "images",
+    "install",
+    "login",
+    "models",
+    "play",
+    "plugin",
+    "predict",
+    "ps",
+    "read",
+    "render",
+    "say",
+    "search",
+    "session",
+    "setup",
+    "share",
+    "shell",
+    "skill",
+    "ssh",
+    "stats",
+    "stream",
+    "tiny-models",
+    "token",
+    "toks",
+    "ttsr",
+    "update",
+    "usage",
+    "worktree",
+];
+
 fn is_background_worker_command(cmd: &str, name: &str) -> bool {
     if name == "omp" && cmd.contains("__omp_worker_") {
         return true;
     }
-    // Skip non-interactive subcommands for pi (`pi list`, `pi config`, `pi update`, `pi mcp`, `pi auth`),
-    // whether invoked through the launcher or its node child running the package entry.
-    if name == "pi" {
-        let tokens: Vec<&str> = cmd.split_whitespace().collect();
-        for (idx, tok) in tokens.iter().enumerate().take(2) {
-            if tok.ends_with("/pi") || *tok == "pi" || is_pi_package_entry(tok) {
-                if let Some(&sub) = tokens.get(idx + 1) {
-                    if matches!(
-                        sub,
-                        "install"
-                            | "remove"
-                            | "uninstall"
-                            | "update"
-                            | "list"
-                            | "config"
-                            | "auth"
-                            | "mcp"
-                    ) {
-                        return true;
-                    }
-                }
-            }
-        }
+    let tokens: Vec<&str> = cmd.split_whitespace().collect();
+    // One-shot runs that save no session leave nothing to show.
+    if tokens.contains(&"--no-session") && tokens.iter().any(|t| matches!(*t, "-p" | "--print")) {
+        return true;
     }
-    false
+    let subcommands = match name {
+        "omp" => OMP_SUBCOMMANDS,
+        "pi" => PI_SUBCOMMANDS,
+        _ => return false,
+    };
+    // A subcommand follows the binary, whether invoked directly, through Pi's
+    // launcher, or by its node child running the package entry.
+    tokens
+        .iter()
+        .take(2)
+        .position(|tok| {
+            tok.rsplit('/').next() == Some(name) || (name == "pi" && is_pi_package_entry(tok))
+        })
+        .and_then(|idx| tokens.get(idx + 1))
+        .is_some_and(|sub| subcommands.contains(sub))
 }
 
 fn update_transcript_state(path: &Path, state: &mut TranscriptState) {
@@ -2424,6 +2485,30 @@ INSERT INTO model_cache VALUES ('anthropic', '[{"id":"claude-opus-5-5","provider
             collector.resolve_session_file_for_pid(1, "pi --session sid-1", None, &HashSet::new()),
             expected
         );
+    }
+
+    #[test]
+    fn skips_omp_subcommands_and_unsaved_one_shot_runs() {
+        for cmd in [
+            "omp models",
+            "/home/u/.local/bin/omp config set browser.relay true",
+            "omp usage --json",
+            "omp --no-session --model anthropic/claude-sonnet-5 -p Reply with: pong",
+            "omp --print --no-session hi",
+        ] {
+            assert!(is_background_worker_command(cmd, "omp"), "{cmd}");
+        }
+        for cmd in [
+            "omp",
+            "omp --model anthropic/claude-opus-5-5 --auto-approve",
+            "omp acp",
+            "omp join abc123",
+            "omp fix the models list",
+            "omp -p summarize the diff",
+            "omp --no-session",
+        ] {
+            assert!(!is_background_worker_command(cmd, "omp"), "{cmd}");
+        }
     }
 
     #[test]
