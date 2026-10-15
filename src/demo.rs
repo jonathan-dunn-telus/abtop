@@ -605,6 +605,114 @@ pub fn populate_demo(app: &mut App) {
             config_root: "~/.claude".into(),
             file_accesses: vec![],
         },
+        AgentSession {
+            agent_cli: "omp",
+            launch_surface: LaunchSurface::Cli,
+            pid: 9612,
+            session_id: "01a2b3c4-d5e6-7f80-9a1b-777777777777".into(),
+            cwd: "/Users/demo/mobile-app".into(),
+            project_name: "mobile-app".into(),
+            started_at: now - 14 * 60 * 1000, // 14m ago
+            status: SessionStatus::Executing,
+            model: "claude-sonnet-4-6".into(),
+            effort: "high".into(),
+            context_percent: 41.0,
+            total_input_tokens: 7_800,
+            total_output_tokens: 2_900,
+            total_cache_read: 156_000,
+            total_cache_create: 21_000,
+            model_usage: Vec::new(),
+            turn_count: 11,
+            current_tasks: vec!["Edit src/screens/Checkout.tsx".into()],
+            mem_mb: 212,
+            version: "14.2.0".into(),
+            git_branch: "feat/apple-pay".into(),
+            git_added: 2,
+            git_modified: 4,
+            token_history: vec![6000, 9000, 14000, 11000, 16000, 12000, 18000],
+            context_history: vec![],
+            compaction_count: 0,
+            context_window: 200_000,
+            subagent_counts: Default::default(),
+            subagents: vec![],
+            pending_workflows: 0,
+            pending_bg_agents: 0,
+            mem_file_count: 0,
+            mem_line_count: 0,
+            children: vec![],
+
+            first_assistant_text: String::new(),
+            chat_messages: vec![
+                ChatMessage {
+                    role: ChatRole::User,
+                    text: "Add Apple Pay to the checkout screen".into(),
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    text: "Wiring the payment sheet into Checkout; the button state comes next.".into(),
+                },
+            ],
+            initial_prompt: "Add Apple Pay to the checkout screen".into(),
+            tool_calls: vec![],
+            pending_since_ms: 0,
+            thinking_since_ms: 0,
+            config_root: "~/.omp/agent".into(),
+            file_accesses: vec![],
+        },
+        AgentSession {
+            agent_cli: "pi",
+            launch_surface: LaunchSurface::Cli,
+            pid: 9688,
+            session_id: "01a2b3c4-d5e6-7f80-9a1b-888888888888".into(),
+            cwd: "/Users/demo/cli-tools".into(),
+            project_name: "cli-tools".into(),
+            started_at: now - 3 * 60 * 1000, // 3m ago
+            status: SessionStatus::Thinking,
+            model: "gpt-5.4".into(),
+            effort: "low".into(),
+            context_percent: 9.0,
+            total_input_tokens: 2_400,
+            total_output_tokens: 700,
+            total_cache_read: 31_000,
+            total_cache_create: 4_000,
+            model_usage: Vec::new(),
+            turn_count: 3,
+            current_tasks: vec!["thinking...".into()],
+            mem_mb: 88,
+            version: "1.0.0".into(),
+            git_branch: "main".into(),
+            git_added: 0,
+            git_modified: 1,
+            token_history: vec![2000, 4000, 3000],
+            context_history: vec![],
+            compaction_count: 0,
+            context_window: 200_000,
+            subagent_counts: Default::default(),
+            subagents: vec![],
+            pending_workflows: 0,
+            pending_bg_agents: 0,
+            mem_file_count: 0,
+            mem_line_count: 0,
+            children: vec![],
+
+            first_assistant_text: String::new(),
+            chat_messages: vec![
+                ChatMessage {
+                    role: ChatRole::User,
+                    text: "Add a --json flag to the export command".into(),
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    text: "Adding --json to export first, then a snapshot test for the output.".into(),
+                },
+            ],
+            initial_prompt: "Add a --json flag to the export command".into(),
+            tool_calls: vec![],
+            pending_since_ms: 0,
+            thinking_since_ms: 0,
+            config_root: "~/.pi/agent".into(),
+            file_accesses: vec![],
+        },
     ];
 
     for session in &mut app.sessions {
@@ -650,6 +758,14 @@ pub fn populate_demo(app: &mut App) {
     app.summaries.insert(
         "ses_e5f6a7b8-9abc-def0-1234-555555555555".into(),
         "Terraform multi-region refactor".into(),
+    );
+    app.summaries.insert(
+        "01a2b3c4-d5e6-7f80-9a1b-777777777777".into(),
+        "Apple Pay checkout".into(),
+    );
+    app.summaries.insert(
+        "01a2b3c4-d5e6-7f80-9a1b-888888888888".into(),
+        "Export --json flag".into(),
     );
     app.summaries.insert(
         "f6a7b8c9-abcd-ef01-2345-666666666666".into(),
@@ -752,7 +868,7 @@ fn apply_demo_step(app: &mut App, step: usize, at: Instant) {
             }
             add_demo_usage(session, input + output + cache_write);
         }
-        if matches!(session.agent_cli, "claude" | "codex") {
+        if matches!(session.agent_cli, "claude" | "codex" | "omp" | "pi") {
             // Busier steps run more subagents, so both charts share a shape.
             session.subagent_counts.working = match rate {
                 0 => 0,
