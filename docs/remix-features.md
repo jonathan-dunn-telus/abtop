@@ -43,8 +43,9 @@ Linux, and from its own environment on every platform.
 Each process is matched to its transcript by trying, in order: an open transcript file, an open
 session lock file, a `--session` or `--resume` argument, the agent's
 `terminal-sessions/<tty>` record, and finally the newest unclaimed transcript in the folder for
-the process's working directory. A process with no match but a known working directory shows as
-`pid-<N>` without usage.
+the process's working directory whose header records that same directory. That last step can
+still mix up two sessions running in one directory. A process with no match but a known working
+directory shows as `pid-<N>` without usage.
 
 The transcript provides the title, model, thinking level (the effort column), tokens, context,
 tool calls, current task, and chat. Subagents are the JSONL files in the folder named after the

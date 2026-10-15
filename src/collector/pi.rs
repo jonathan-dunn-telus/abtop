@@ -498,7 +498,8 @@ impl PiCollector {
             }
         }
 
-        // 5. Fallback: most recent `.jsonl` in the encoded cwd directory under `<agent_dir>/sessions/`
+        // 5. Fallback: most recent unclaimed `.jsonl` in the cwd's folder under `<agent_dir>/sessions/`
+        //    whose session header records the same cwd
         let fallback_cwd = open_paths
             .and_then(|o| o.cwd.clone())
             .or_else(|| get_process_cwd(pid));
@@ -506,7 +507,7 @@ impl PiCollector {
             for agent_dir in &self.agent_dirs {
                 let sessions_root = agent_dir.join("sessions");
                 for dir in candidate_cwd_session_dirs(&sessions_root, cwd) {
-                    if let Some(best) = most_recent_jsonl_in_dir(&dir, claimed_files) {
+                    if let Some(best) = most_recent_jsonl_in_dir(&dir, claimed_files, cwd) {
                         return Some((best, agent_dir.clone()));
                     }
                 }
@@ -1842,37 +1843,33 @@ fn read_terminal_session_file(path: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(session_file))
 }
 
+/// Session folder names for a cwd, as the harnesses derive them: OMP uses `-tmp-<rel>`
+/// under the temp dir, then `-<rel>` under home; both fall back to `--<abs>--`.
 fn candidate_cwd_session_dirs(sessions_root: &Path, cwd: &Path) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
+    let dashed = |path: &str| path.replace(['/', '\\', ':'], "-");
     let cwd_str = cwd.to_string_lossy();
-    let trimmed = cwd_str.trim_start_matches(['/', '\\']);
-    let dashed: String = trimmed
-        .chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' => '-',
-            _ => c,
-        })
-        .collect();
-    // Pi format: `--<full-path-with-dashes>--`
-    dirs.push(sessions_root.join(format!("--{dashed}--")));
-
-    // OMP format: when under home dir, `-<rel-path-with-dashes>`
-    if let Some(home) = dirs::home_dir() {
-        if let Ok(rel) = cwd.strip_prefix(&home) {
-            let rel_str = rel.to_string_lossy();
-            if rel_str.is_empty() {
-                dirs.push(sessions_root.join("-"));
-            } else {
-                let rel_dashed: String = rel_str
-                    .chars()
-                    .map(|c| match c {
-                        '/' | '\\' | ':' => '-',
-                        _ => c,
-                    })
-                    .collect();
-                dirs.push(sessions_root.join(format!("-{rel_dashed}")));
-            }
-        }
+    let mut dirs = vec![sessions_root.join(format!(
+        "--{}--",
+        dashed(cwd_str.trim_start_matches(['/', '\\']))
+    ))];
+    // OMP compares resolved paths and checks the temp dir before home.
+    let relative_to = |base: PathBuf| {
+        let base = fs::canonicalize(&base).unwrap_or(base);
+        cwd.strip_prefix(base)
+            .ok()
+            .map(|rel| dashed(&rel.to_string_lossy()))
+    };
+    let omp_name = match relative_to(std::env::temp_dir()) {
+        Some(rel) => Some(("-tmp", rel)),
+        None => dirs::home_dir().and_then(relative_to).map(|rel| ("-", rel)),
+    };
+    if let Some((prefix, rel)) = omp_name {
+        let name = match (rel.is_empty(), prefix.ends_with('-')) {
+            (true, _) => prefix.to_string(),
+            (false, true) => format!("{prefix}{rel}"),
+            (false, false) => format!("{prefix}-{rel}"),
+        };
+        dirs.push(sessions_root.join(name));
     }
     dirs
 }
@@ -1895,9 +1892,13 @@ fn find_file_with_suffix_or_name(dir: &Path, sid: &str, suffix: &str) -> Option<
     None
 }
 
-fn most_recent_jsonl_in_dir(dir: &Path, claimed_files: &HashSet<PathBuf>) -> Option<PathBuf> {
+fn most_recent_jsonl_in_dir(
+    dir: &Path,
+    claimed_files: &HashSet<PathBuf>,
+    cwd: &Path,
+) -> Option<PathBuf> {
     let entries = fs::read_dir(dir).ok()?;
-    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    let mut candidates = Vec::new();
     for entry in entries.flatten() {
         if entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(true) {
             continue;
@@ -1917,11 +1918,35 @@ fn most_recent_jsonl_in_dir(dir: &Path, claimed_files: &HashSet<PathBuf>) -> Opt
         let Ok(mtime) = meta.modified() else {
             continue;
         };
-        if best.as_ref().is_none_or(|(b_mtime, _)| mtime > *b_mtime) {
-            best = Some((mtime, path));
-        }
+        candidates.push((mtime, path));
     }
-    best.map(|(_, p)| p)
+    candidates.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
+    candidates
+        .into_iter()
+        .map(|(_, path)| path)
+        .find(|path| transcript_cwd(path).is_some_and(|recorded| same_dir(&recorded, cwd)))
+}
+
+/// The cwd recorded in a transcript's `session` header, which follows OMP's padded
+/// `title` line within the first few hundred bytes.
+fn transcript_cwd(path: &Path) -> Option<PathBuf> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(8 * 1024)
+        .read_to_end(&mut head)
+        .ok()?;
+    String::from_utf8_lossy(&head)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|val| val.get("type").and_then(Value::as_str) == Some("session"))
+        .and_then(|val| val.get("cwd").and_then(Value::as_str).map(PathBuf::from))
+}
+
+/// The harness records the cwd unresolved, while `/proc` reports it resolved.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b || matches!((fs::canonicalize(a), fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b)
 }
 
 fn is_symlink(path: &Path) -> bool {
@@ -2484,6 +2509,84 @@ INSERT INTO model_cache VALUES ('anthropic', '[{"id":"claude-opus-5-5","provider
         assert_eq!(
             collector.resolve_session_file_for_pid(1, "pi --session sid-1", None, &HashSet::new()),
             expected
+        );
+    }
+
+    #[test]
+    fn cwd_session_dirs_follow_the_harness_naming() {
+        let root = Path::new("/s");
+        let names = |cwd: &Path| -> Vec<String> {
+            candidate_cwd_session_dirs(root, cwd)
+                .iter()
+                .map(|d| d.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        let tmp = fs::canonicalize(std::env::temp_dir()).unwrap();
+        assert_eq!(
+            names(&tmp),
+            [
+                format!(
+                    "--{}--",
+                    tmp.display()
+                        .to_string()
+                        .trim_start_matches('/')
+                        .replace('/', "-")
+                ),
+                "-tmp".to_string()
+            ]
+        );
+        assert!(names(&tmp.join("proj/sub")).contains(&"-tmp-proj-sub".to_string()));
+        let home = dirs::home_dir().unwrap();
+        assert!(names(&home.join("projects/abtop")).contains(&"-projects-abtop".to_string()));
+        assert!(names(&home).contains(&"-".to_string()));
+        assert_eq!(names(Path::new("/var/tmp")), ["--var-tmp--"]);
+    }
+
+    #[test]
+    fn cwd_fallback_only_claims_transcripts_recorded_for_that_cwd() {
+        let root = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        let proj_path = fs::canonicalize(proj.path()).unwrap();
+        let agent_dir = root.path().join("agent");
+        let folder = agent_dir.join("sessions").join(format!(
+            "-tmp-{}",
+            proj_path.file_name().unwrap().to_string_lossy()
+        ));
+        fs::create_dir_all(&folder).unwrap();
+        let header = |cwd: &Path| {
+            format!(
+                "{{\"type\":\"title\",\"v\":1,\"title\":\"t\",\"source\":\"auto\"}}\n{{\"type\":\"session\",\"version\":3,\"id\":\"x\",\"timestamp\":\"2026-10-15T20:00:00.000Z\",\"cwd\":\"{}\"}}\n",
+                cwd.display()
+            )
+        };
+        let own = folder.join("2026-10-15T20-00-00-000Z_own.jsonl");
+        let other = folder.join("2026-10-15T20-05-00-000Z_other.jsonl");
+        fs::write(&own, header(&proj_path)).unwrap();
+        fs::write(&other, header(Path::new("/somewhere/else"))).unwrap();
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        fs::File::options()
+            .write(true)
+            .open(&own)
+            .unwrap()
+            .set_modified(hour_ago)
+            .unwrap();
+
+        let mut collector = PiCollector::new_omp();
+        collector.agent_dirs = vec![agent_dir.clone()];
+        let paths = ProcessOpenPaths {
+            cwd: Some(proj_path.clone()),
+            paths: Vec::new(),
+            ttys: Vec::new(),
+        };
+        // The newer transcript records another cwd, so the older one wins.
+        assert_eq!(
+            collector.resolve_session_file_for_pid(1, "omp", Some(&paths), &HashSet::new()),
+            Some((own.clone(), agent_dir))
+        );
+        let claimed = HashSet::from([own]);
+        assert_eq!(
+            collector.resolve_session_file_for_pid(1, "omp", Some(&paths), &claimed),
+            None
         );
     }
 
