@@ -872,23 +872,29 @@ pub(crate) fn cmd_matches_harness(cmd: &str, name: &str) -> bool {
         return true;
     }
     if name == "pi" {
-        let normalized = cmd.replace('\\', "/");
-        return normalized.contains("/@earendil-works/pi-coding-agent/")
-            || normalized.contains("/node_modules/.bin/pi ")
-            || normalized.ends_with("/node_modules/.bin/pi");
+        return cmd.split_whitespace().any(is_pi_package_entry);
     }
     false
+}
+
+/// A pi entry point reached through the npm package rather than a `pi` binary
+/// (e.g. `node .../@earendil-works/pi-coding-agent/dist/bundle/cli.js`).
+fn is_pi_package_entry(tok: &str) -> bool {
+    let normalized = tok.replace('\\', "/");
+    normalized.contains("/@earendil-works/pi-coding-agent/")
+        || normalized.ends_with("/node_modules/.bin/pi")
 }
 
 fn is_background_worker_command(cmd: &str, name: &str) -> bool {
     if name == "omp" && cmd.contains("__omp_worker_") {
         return true;
     }
-    // Skip non-interactive subcommands for pi (`pi list`, `pi config`, `pi update`, `pi mcp`, `pi auth`)
+    // Skip non-interactive subcommands for pi (`pi list`, `pi config`, `pi update`, `pi mcp`, `pi auth`),
+    // whether invoked through the launcher or its node child running the package entry.
     if name == "pi" {
         let tokens: Vec<&str> = cmd.split_whitespace().collect();
         for (idx, tok) in tokens.iter().enumerate().take(2) {
-            if tok.ends_with("/pi") || *tok == "pi" {
+            if tok.ends_with("/pi") || *tok == "pi" || is_pi_package_entry(tok) {
                 if let Some(&sub) = tokens.get(idx + 1) {
                     if matches!(
                         sub,
@@ -2028,6 +2034,51 @@ mod tests {
 
         let pids = collector.find_pids(&procs, 999);
         assert_eq!(pids, vec![101]);
+    }
+
+    #[test]
+    fn skips_pi_subcommands_through_launcher_and_node_child() {
+        let collector = PiCollector::new_pi();
+        let entry = "/Users/test/.pi/agent/install/releases/1.0.0/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js";
+        for (launcher, child) in [
+            (
+                "/bin/sh /Users/test/.pi/agent/bin/pi update".to_string(),
+                format!("node {entry} update"),
+            ),
+            (
+                "pi config".to_string(),
+                "node /Users/test/proj/node_modules/.bin/pi config".to_string(),
+            ),
+        ] {
+            let mut procs = HashMap::new();
+            for (pid, ppid, command) in [(100, 1, launcher), (101, 100, child)] {
+                procs.insert(
+                    pid,
+                    ProcInfo {
+                        pid,
+                        ppid,
+                        rss_kb: 1000,
+                        cpu_pct: 0.0,
+                        command,
+                    },
+                );
+            }
+            assert!(collector.find_pids(&procs, 999).is_empty());
+        }
+
+        // A prompt that happens to be a subcommand name is not the subcommand position.
+        let mut procs = HashMap::new();
+        procs.insert(
+            101,
+            ProcInfo {
+                pid: 101,
+                ppid: 1,
+                rss_kb: 1000,
+                cpu_pct: 0.0,
+                command: format!("node {entry} --model x update"),
+            },
+        );
+        assert_eq!(collector.find_pids(&procs, 999), vec![101]);
     }
 
     #[test]
