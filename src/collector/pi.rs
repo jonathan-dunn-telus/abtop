@@ -37,27 +37,30 @@ struct SubagentCacheEntry {
 pub struct PiHarnessSpec {
     pub agent_cli: &'static str,
     pub default_dot_dir: &'static str,
-    pub env_agent_dir: &'static str,
-    pub env_session_dir: &'static str,
 }
 
 pub const OMP_SPEC: PiHarnessSpec = PiHarnessSpec {
     agent_cli: "omp",
     default_dot_dir: ".omp",
-    env_agent_dir: "OMP_CODING_AGENT_DIR",
-    env_session_dir: "OMP_CODING_AGENT_SESSION_DIR",
 };
 
 pub const PI_SPEC: PiHarnessSpec = PiHarnessSpec {
     agent_cli: "pi",
     default_dot_dir: ".pi",
-    env_agent_dir: "PI_CODING_AGENT_DIR",
-    env_session_dir: "PI_CODING_AGENT_SESSION_DIR",
 };
+
+/// Overrides the agent dir (default `~/<dot dir>/agent`). OMP reads the same
+/// `PI_`-prefixed variables as Pi.
+const AGENT_DIR_ENV: &str = "PI_CODING_AGENT_DIR";
+/// A directory that holds session transcripts directly, with no per-cwd folders.
+const SESSION_DIR_ENV: &str = "PI_CODING_AGENT_SESSION_DIR";
 
 pub struct PiCollector {
     spec: PiHarnessSpec,
+    /// Dirs whose `sessions/<project>/` folders hold transcripts.
     agent_dirs: Vec<PathBuf>,
+    /// `(session dir, agent dir)`: flat transcript dirs from `PI_CODING_AGENT_SESSION_DIR`.
+    session_dirs: Vec<(PathBuf, PathBuf)>,
     transcript_cache: HashMap<PathBuf, TranscriptState>,
     subagent_cache: HashMap<PathBuf, HashMap<PathBuf, SubagentCacheEntry>>,
     cached_git_branch: HashMap<String, String>,
@@ -135,6 +138,7 @@ impl PiCollector {
         Self {
             spec,
             agent_dirs: Vec::new(),
+            session_dirs: Vec::new(),
             transcript_cache: HashMap::new(),
             subagent_cache: HashMap::new(),
             cached_git_branch: HashMap::new(),
@@ -150,26 +154,58 @@ impl PiCollector {
         Self::new(PI_SPEC)
     }
 
+    /// Reset the search dirs to the default agent dir plus overrides in abtop's own
+    /// environment. Each agent process's overrides are merged on every tick.
     fn refresh_agent_dirs(&mut self) {
-        let mut dirs = BTreeSet::new();
-        if let Some(home) = dirs::home_dir() {
-            dirs.insert(home.join(self.spec.default_dot_dir).join("agent"));
-        }
-        if let Ok(env_dir) = std::env::var(self.spec.env_agent_dir) {
-            let p = PathBuf::from(env_dir);
-            if p.is_dir() {
-                dirs.insert(p);
+        self.agent_dirs = self.default_agent_dir().into_iter().collect();
+        self.session_dirs.clear();
+        let cwd = std::env::current_dir().ok();
+        self.add_env_dirs(
+            cwd.as_deref(),
+            std::env::var_os(AGENT_DIR_ENV).map(PathBuf::from),
+            std::env::var_os(SESSION_DIR_ENV).map(PathBuf::from),
+        );
+    }
+
+    fn default_agent_dir(&self) -> Option<PathBuf> {
+        dirs::home_dir().map(|home| home.join(self.spec.default_dot_dir).join("agent"))
+    }
+
+    /// Record directory overrides, resolving relative paths against `cwd` as the
+    /// harness does. Sessions in a session dir belong to the agent dir set next to
+    /// it, or to the default one.
+    fn add_env_dirs(
+        &mut self,
+        cwd: Option<&Path>,
+        agent_dir: Option<PathBuf>,
+        session_dir: Option<PathBuf>,
+    ) {
+        let resolve = |dir: PathBuf| match dir.is_absolute() {
+            true => Some(dir),
+            false => cwd.map(|cwd| cwd.join(dir)),
+        };
+        let agent_dir = agent_dir
+            .filter(|d| !d.as_os_str().is_empty())
+            .and_then(resolve)
+            .filter(|d| d.is_dir());
+        if let Some(dir) = &agent_dir {
+            if !self.agent_dirs.contains(dir) {
+                self.agent_dirs.push(dir.clone());
             }
         }
-        if let Ok(session_dir) = std::env::var(self.spec.env_session_dir) {
-            let p = PathBuf::from(session_dir);
-            if let Some(parent) = p.parent() {
-                if parent.is_dir() {
-                    dirs.insert(parent.to_path_buf());
-                }
-            }
+        let Some(session_dir) = session_dir
+            .filter(|d| !d.as_os_str().is_empty())
+            .and_then(resolve)
+            .filter(|d| d.is_dir())
+        else {
+            return;
+        };
+        let Some(owner) = agent_dir.or_else(|| self.default_agent_dir()) else {
+            return;
+        };
+        if !self.session_dirs.iter().any(|(dir, _)| dir == &session_dir) {
+            self.session_dirs.push((session_dir, owner));
         }
-        self.agent_dirs = dirs.into_iter().collect();
     }
 
     fn find_pids(&self, process_info: &HashMap<u32, ProcInfo>, self_pid: u32) -> Vec<u32> {
@@ -219,6 +255,11 @@ impl PiCollector {
         }
 
         let open_paths = map_pid_to_open_paths(&pids);
+        for &pid in &pids {
+            let (agent_dir, session_dir) = process_env_dirs(pid);
+            let cwd = open_paths.get(&pid).and_then(|o| o.cwd.as_deref());
+            self.add_env_dirs(cwd, agent_dir, session_dir);
+        }
         self.merge_agent_dirs_from_open_paths(&open_paths);
 
         let mut sessions = Vec::new();
@@ -313,7 +354,7 @@ impl PiCollector {
         if let Some(open) = open_paths {
             for path in &open.paths {
                 if let Some((session_path, agent_dir)) =
-                    classify_open_session_path(path, &self.agent_dirs)
+                    classify_open_session_path(path, &self.agent_dirs, &self.session_dirs)
                 {
                     if !claimed_files.contains(&session_path)
                         && session_path.is_file()
@@ -398,7 +439,11 @@ impl PiCollector {
         {
             if stripped.ends_with(".jsonl") {
                 let session_path = path.with_file_name(stripped);
-                let agent_dir = infer_agent_dir_from_session_path(&session_path, &self.agent_dirs);
+                let agent_dir = infer_agent_dir_from_session_path(
+                    &session_path,
+                    &self.agent_dirs,
+                    &self.session_dirs,
+                );
                 return Some((session_path, agent_dir));
             }
         }
@@ -423,7 +468,8 @@ impl PiCollector {
             && !is_symlink(&path)
             && !claimed_files.contains(&path)
         {
-            let agent_dir = infer_agent_dir_from_session_path(&path, &self.agent_dirs);
+            let agent_dir =
+                infer_agent_dir_from_session_path(&path, &self.agent_dirs, &self.session_dirs);
             return Some((path, agent_dir));
         }
         self.find_session_by_id(arg, cwd)
@@ -435,6 +481,11 @@ impl PiCollector {
             return None;
         }
         let suffix = format!("_{sid}.jsonl");
+        for (dir, agent_dir) in &self.session_dirs {
+            if let Some(found) = find_file_with_suffix_or_name(dir, sid, &suffix) {
+                return Some((found, agent_dir.clone()));
+            }
+        }
         for agent_dir in &self.agent_dirs {
             let sessions_root = agent_dir.join("sessions");
             if let Some(cwd) = cwd {
@@ -1526,11 +1577,24 @@ fn session_id_from_filename(path: &Path) -> String {
     stem.to_string()
 }
 
-fn classify_open_session_path(path: &Path, agent_dirs: &[PathBuf]) -> Option<(PathBuf, PathBuf)> {
+fn classify_open_session_path(
+    path: &Path,
+    agent_dirs: &[PathBuf],
+    session_dirs: &[(PathBuf, PathBuf)],
+) -> Option<(PathBuf, PathBuf)> {
     if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
         return None;
     }
     let project_dir = path.parent()?;
+    // A flat session dir holds `<file>.jsonl`, and subagent logs in `<session_stem>/...`
+    for (dir, agent_dir) in session_dirs {
+        if project_dir == dir {
+            return Some((path.to_path_buf(), agent_dir.clone()));
+        }
+        if project_dir.parent() == Some(dir.as_path()) {
+            return Some((project_dir.with_extension("jsonl"), agent_dir.clone()));
+        }
+    }
     let sessions_dir = project_dir.parent()?;
     if sessions_dir.file_name().and_then(|n| n.to_str()) != Some("sessions") {
         // Could be a subagent or eval log inside `<sessions>/<project>/<session_stem>/...`
@@ -1551,7 +1615,17 @@ fn classify_open_session_path(path: &Path, agent_dirs: &[PathBuf]) -> Option<(Pa
     None
 }
 
-fn infer_agent_dir_from_session_path(session_path: &Path, known_dirs: &[PathBuf]) -> PathBuf {
+fn infer_agent_dir_from_session_path(
+    session_path: &Path,
+    known_dirs: &[PathBuf],
+    session_dirs: &[(PathBuf, PathBuf)],
+) -> PathBuf {
+    if let Some((_, agent_dir)) = session_dirs
+        .iter()
+        .find(|(dir, _)| session_path.parent() == Some(dir.as_path()))
+    {
+        return agent_dir.clone();
+    }
     for ancestor in session_path.ancestors() {
         if ancestor.file_name().and_then(|n| n.to_str()) == Some("sessions") {
             if let Some(parent) = ancestor.parent() {
@@ -1909,6 +1983,37 @@ fn get_process_cwd(pid: u32) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// The agent dir and session dir overrides in a process's environment. Only Linux
+/// exposes another process's environment cheaply; elsewhere abtop's own is used.
+#[cfg(target_os = "linux")]
+fn process_env_dirs(pid: u32) -> (Option<PathBuf>, Option<PathBuf>) {
+    fs::read(format!("/proc/{pid}/environ"))
+        .map(|environ| parse_env_dirs(&environ))
+        .unwrap_or_default()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_env_dirs(_pid: u32) -> (Option<PathBuf>, Option<PathBuf>) {
+    (None, None)
+}
+
+/// Parse a NUL-separated `KEY=value` environment block.
+#[cfg(any(target_os = "linux", test))]
+fn parse_env_dirs(environ: &[u8]) -> (Option<PathBuf>, Option<PathBuf>) {
+    let mut dirs = (None, None);
+    for entry in environ.split(|&b| b == 0) {
+        let Ok(entry) = std::str::from_utf8(entry) else {
+            continue;
+        };
+        match entry.split_once('=') {
+            Some((AGENT_DIR_ENV, dir)) => dirs.0 = Some(PathBuf::from(dir)),
+            Some((SESSION_DIR_ENV, dir)) => dirs.1 = Some(PathBuf::from(dir)),
+            _ => {}
+        }
+    }
+    dirs
+}
+
 fn resolve_git_branch(cwd: &str) -> String {
     if !Path::new(cwd).is_dir() {
         return String::new();
@@ -2043,10 +2148,73 @@ mod tests {
 
     #[test]
     fn terminal_session_names_match_the_harness_records() {
-        assert_eq!(terminal_session_name("/dev/pts/34").as_deref(), Some("pts-34"));
+        assert_eq!(
+            terminal_session_name("/dev/pts/34").as_deref(),
+            Some("pts-34")
+        );
         assert_eq!(terminal_session_name("/dev/tty1").as_deref(), Some("tty1"));
         assert_eq!(terminal_session_name("/dev/"), None);
         assert_eq!(terminal_session_name("/home/u/file"), None);
+    }
+
+    #[test]
+    fn parses_dir_overrides_from_a_process_environment() {
+        let environ =
+            b"HOME=/home/u\0PI_CODING_AGENT_DIR=/data/agent\0PI_CODING_AGENT_SESSION_DIR=logs\0";
+        assert_eq!(
+            parse_env_dirs(environ),
+            (
+                Some(PathBuf::from("/data/agent")),
+                Some(PathBuf::from("logs"))
+            )
+        );
+        assert_eq!(parse_env_dirs(b"OMP_CODING_AGENT_DIR=/x\0"), (None, None));
+    }
+
+    #[test]
+    fn finds_transcripts_directly_in_a_session_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let agent_dir = root.path().join("agent");
+        let session_dir = root.path().join("pi-logs");
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::create_dir_all(session_dir.join("2026-10-15T19-22-15-457Z_sid-1")).unwrap();
+        let transcript = session_dir.join("2026-10-15T19-22-15-457Z_sid-1.jsonl");
+        fs::write(&transcript, "").unwrap();
+        let subagent = session_dir
+            .join("2026-10-15T19-22-15-457Z_sid-1")
+            .join("0-explore.jsonl");
+        fs::write(&subagent, "").unwrap();
+
+        let mut collector = PiCollector::new_pi();
+        // Relative session dirs resolve against the process's cwd.
+        collector.add_env_dirs(
+            Some(root.path()),
+            Some(agent_dir.clone()),
+            Some(PathBuf::from("pi-logs")),
+        );
+        assert_eq!(
+            collector.session_dirs,
+            vec![(session_dir.clone(), agent_dir.clone())]
+        );
+        // The session dir's parent is not an agent dir.
+        assert!(!collector.agent_dirs.contains(&root.path().to_path_buf()));
+
+        let expected = Some((transcript.clone(), agent_dir.clone()));
+        for open in [&transcript, &subagent] {
+            let paths = ProcessOpenPaths {
+                cwd: None,
+                paths: vec![open.clone()],
+                ttys: Vec::new(),
+            };
+            let found =
+                collector.resolve_session_file_for_pid(1, "pi", Some(&paths), &HashSet::new());
+            assert_eq!(found, expected);
+        }
+        assert_eq!(collector.find_session_by_id("sid-1", None), expected);
+        assert_eq!(
+            collector.resolve_session_file_for_pid(1, "pi --session sid-1", None, &HashSet::new()),
+            expected
+        );
     }
 
     #[test]

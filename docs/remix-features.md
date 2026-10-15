@@ -31,9 +31,11 @@ one collector handles both. Hide either with `hidden_agents = ["omp"]` or `["pi"
 abtop finds running `omp` and `pi` processes, including Pi's npm launcher and the node process
 it starts (only the node child is shown). OMP background workers and Pi's non-interactive
 subcommands (`install`, `remove`, `uninstall`, `update`, `list`, `config`, `auth`, `mcp`) are
-skipped. Agent directories are `~/.omp/agent` and `~/.pi/agent`, plus `OMP_CODING_AGENT_DIR` /
-`PI_CODING_AGENT_DIR` and the parent of `OMP_CODING_AGENT_SESSION_DIR` /
-`PI_CODING_AGENT_SESSION_DIR` as set in abtop's own environment.
+skipped. Transcripts live in `<agent dir>/sessions/<project>/`, where the agent dir is
+`~/.omp/agent` or `~/.pi/agent` unless `PI_CODING_AGENT_DIR` overrides it (OMP reads the same
+`PI_` variables as Pi). `PI_CODING_AGENT_SESSION_DIR` instead names one folder that holds
+transcripts directly. abtop reads both variables from each agent process's environment on
+Linux, and from its own environment on every platform.
 
 Each process is matched to its transcript by trying, in order: an open transcript file, an open
 session lock file, a `--session` or `--resume` argument, the agent's
