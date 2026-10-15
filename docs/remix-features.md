@@ -8,6 +8,7 @@ Every screenshot comes from `abtop --demo` and is regenerated with
 
 | Pane or feature | Key | Config | Section |
 |---|---|---|---|
+| OMP and Pi sessions | — | `hidden_agents` | [OMP and Pi](#omp-and-pi-sessions) |
 | Agents concurrency chart | `0`, scope `g` | `show_agents`, `agent_scope` | [Agents](#agents-pane) |
 | Context | `1` | `show_context` | [Token rate and Context](#token-rate-and-context-panes) |
 | Models with per-model rates | `8` | `show_models` | [Models](#models-pane) |
@@ -20,6 +21,35 @@ Every screenshot comes from `abtop --demo` and is regenerated with
 | Totals exclude cache reads | — | — | [Token accounting](#token-accounting) |
 
 ![abtop remix overview, with the cache-read chart enabled](../assets/remix/overview.png)
+
+## OMP and Pi sessions
+
+OMP (`omp`) and Pi (`pi`) sessions appear next to Claude Code, Codex CLI, and OpenCode, tagged
+`~OM` and `^PI`. Both write the same JSONL transcript format under `<agent dir>/sessions/`, so
+one collector handles both. Hide either with `hidden_agents = ["omp"]` or `["pi"]`.
+
+abtop finds running `omp` and `pi` processes, including Pi's npm launcher and the node process
+it starts (only the node child is shown). OMP background workers and Pi's non-interactive
+subcommands (`install`, `remove`, `uninstall`, `update`, `list`, `config`, `auth`, `mcp`) are
+skipped. Agent directories are `~/.omp/agent` and `~/.pi/agent`, plus `OMP_CODING_AGENT_DIR` /
+`PI_CODING_AGENT_DIR` and the parent of `OMP_CODING_AGENT_SESSION_DIR` /
+`PI_CODING_AGENT_SESSION_DIR` as set in abtop's own environment.
+
+Each process is matched to its transcript by trying, in order: an open transcript file, an open
+session lock file, a `--session` or `--resume` argument, the agent's
+`terminal-sessions/<tty>` record, and finally the newest unclaimed transcript in the folder for
+the process's working directory. A process with no match but a known working directory shows as
+`pid-<N>` without usage.
+
+The transcript provides the title, model, thinking level (the effort column), tokens, context,
+tool calls, current task, and chat. Subagents are the JSONL files in the folder named after the
+transcript; their tokens and models are included in the session's totals. Status is `● Exec`
+while a tool call is pending, `◉ Think` while the model generates, and `◐ Bg` while a subagent
+works after the turn ended; otherwise CPU of the process and its descendants decides.
+
+Not supported: quota (neither agent exposes an account-level rate limit), memory status, and
+model-specific context windows. Context % uses the Claude window sizes (200K, or 1M once the
+context goes past 200K), so it is approximate for other models.
 
 ## Token accounting
 
@@ -75,9 +105,9 @@ Both rate labels use tokens observed during the preceding 60 seconds, based on e
 
 ## Agents pane
 
-The **Agents** panel (`0`) sits above Sessions and charts the preceding 15 minutes of concurrent Claude Code and Codex agent work, including main sessions and subagents. Braille bars use the same rendering style as Token rate, with theme gradients distinguishing the two stacked providers; the legend shows current counts and the observed peak. Press `g` (or click the panel title with `--mouse`) to switch between **All live**, the default, and **Selected**. This scope is independent of Tokens/Models. Each actively working main session counts once, even without subagents. Its working descendants each count once as well: one working main session with two working subagents counts as three. Waiting and rate-limited main sessions do not contribute to the working count; their working children still do. Shell commands and workflow containers are excluded. The narrow Work tab supports the same panel and zoom controls. Short layouts retain its summary before hiding its chart.
+The **Agents** panel (`0`) sits above Sessions and charts the preceding 15 minutes of concurrent Claude Code, Codex, OMP, and Pi agent work, including main sessions and subagents. Braille bars use the same rendering style as Token rate, with theme gradients distinguishing Claude from the other providers, which share the Codex gradient; the legend shows current counts and the observed peak. Press `g` (or click the panel title with `--mouse`) to switch between **All live**, the default, and **Selected**. This scope is independent of Tokens/Models. Each actively working main session counts once, even without subagents. Its working descendants each count once as well: one working main session with two working subagents counts as three. Waiting and rate-limited main sessions do not contribute to the working count; their working children still do. Shell commands and workflow containers are excluded. The narrow Work tab supports the same panel and zoom controls. Short layouts retain its summary before hiding its chart.
 
-A child counts as working during an unfinished work turn, including model generation and tool execution. Quiet periods do not automatically mark it done. Claude uses child transcripts, launch/completion records, and workflow journal starts, results, and failures; Codex uses child-thread relationships and turn start/completion/interruption events. A small **Unknown** count identifies incomplete lifecycle evidence. Discovery is best-effort and can lag a refresh; filesystem-only Codex children can take up to the 10-second discovery interval to appear. OpenCode subagent tracking is unavailable.
+A child counts as working during an unfinished work turn, including model generation and tool execution. Quiet periods do not automatically mark it done. Claude uses child transcripts, launch/completion records, and workflow journal starts, results, and failures; Codex uses child-thread relationships and turn start/completion/interruption events; OMP and Pi use the subagent transcripts next to the session's. A small **Unknown** count identifies incomplete lifecycle evidence. Discovery is best-effort and can lag a refresh; filesystem-only Codex children can take up to the 10-second discovery interval to appear. OpenCode subagent tracking is unavailable.
 
 Agent history starts when abtop observes activity, continues while the pane is hidden, and remains in memory for 15 minutes. Closing a session lowers the current count without deleting its history. Each bar preserves a real simultaneous peak sample when the window is wider than the chart. History resets when abtop exits; it is not reconstructed from old transcripts. Token and model totals keep their existing accounting.
 
@@ -93,8 +123,8 @@ the work: `workflow <name> · <working agent>`, `waiting on N workflows`,
 
 A Background root does not count toward the Agents pane; its working children do. Background
 Bash (`run_in_background`) and Monitor tasks are not tracked, so a session waiting only on those
-still shows `◌ Wait`. Codex and OpenCode never report `◐ Bg`. The on-disk signals and their
-caveats are in [claude-code-background-work.md](claude-code-background-work.md).
+still shows `◌ Wait`. OMP and Pi report `◐ Bg` while a subagent works; Codex and OpenCode never
+do. The on-disk signals and their caveats are in [claude-code-background-work.md](claude-code-background-work.md).
 
 ## Progressive startup
 
@@ -123,4 +153,4 @@ Each JSON session includes `model_usage`, an array of `{ "model": "...", "total_
 
 Stats scope affects the TUI only; `--once` and JSON snapshots retain their per-session output. Library users constructing `AppConfig` literals must supply `stats_scope` (or use `..Default::default()`). Existing `App` constructors default to `StatsScope::Selected`; set `app.stats_scope` explicitly to use another scope when rendering the TUI.
 
-JSON snapshots add `subagent_counts` to each session (`working`, `unknown`) and to the top level (separate `claude` and `codex` counts). These remain child-only counts. The top-level `agent_counts` field includes working main sessions and their working children, matching the Agents chart. Both are complete current counts, independent of UI scope and the capped subagent detail list; history is not exported. A one-shot snapshot may precede background discovery of Codex children without open file descriptors.
+JSON snapshots add `subagent_counts` to each session (`working`, `unknown`) and to the top level (separate `claude`, `codex`, `omp`, and `pi` counts). These remain child-only counts. The top-level `agent_counts` field includes working main sessions and their working children, matching the Agents chart. Both are complete current counts, independent of UI scope and the capped subagent detail list; history is not exported. A one-shot snapshot may precede background discovery of Codex children without open file descriptors.

@@ -2,7 +2,7 @@
 
 AI agent monitor for your terminal. Like btop++, but for AI coding agents.
 
-Supports Claude Code, Codex CLI, and OpenCode sessions.
+Supports Claude Code, Codex CLI, OpenCode, OMP, and Pi sessions.
 
 > **Fork:** this repo is the `raphberube/abtop` fork, and its default branch is `remix`. Releases, merges from downstream (`graykode/abtop`), and GitHub Actions follow [docs/remix-release.md](docs/remix-release.md), which overrides the *Release Process* section below.
 >
@@ -33,6 +33,7 @@ src/
 │   ├── claude.rs           # Claude Code: session discovery, transcript parsing
 │   ├── codex.rs            # Codex CLI: session discovery via ps+lsof, JSONL parsing
 │   ├── opencode.rs         # OpenCode: session discovery via ps + SQLite DB parsing
+│   ├── pi.rs               # OMP and Pi: session discovery via ps + open files, JSONL parsing
 │   ├── process.rs          # Child process tree (ps) + open ports (lsof) + git stats
 │   └── rate_limit.rs       # Rate limit file reading (~/.claude/abtop-rate-limits.json)
 └── model/
@@ -81,7 +82,7 @@ Desktop rows (`desktop_layout`): every enabled pane reserves its floor before an
 The narrow Usage tab places Token rate and Context side by side in one `graph_band`, then Quota, Tokens, and Models. Stats floors come first (Quota 5 without its summary, Tokens 7, Models 3); the graph band (5 rows) comes next and yields as a unit only when those floors leave no room (below 23 terminal rows); rows above the floors then go, in order, to Quota's summary, a second Models row, and a sixth band row when the cache-read chart is on; spare rows are shared evenly. None of this changes persisted visibility. Short quota panes show reset countdowns inline; bars and aggregate summaries yield before quota values. Mouse targeting and keyboard zoom use the visible layout.
 
 Panel descriptions:
-- **⁰agents**: Full-width row directly above Sessions; also first in the narrow Work tab. Shows a stacked Claude/Codex braille histogram using the Token rate renderer and theme gradients for concurrent working main agents and subagents (all nesting levels), current provider counts, peak, and a compact Unknown annotation. Each working main session contributes one, including sessions with no children; working descendants contribute independently. Waiting/rate-limited/background main sessions contribute zero themselves. `0` toggles persisted `show_agents` (default true); `g` toggles independent `agent_scope` (default `all_live`, alternative `selected`). History retains timestamped samples for 15 minutes while hidden and after sessions close, with no disk persistence/backfill. Each rendered bucket keeps the provider counts from one simultaneous peak sample. Reserve a three-row summary after essential pane minima, grow Sessions to ideal first, then grow the chart to seven rows. Claude lifecycle uses launch/completion records, child turns, workflow journal `started`/`result`/`failed`, and the run's `workflows/{runId}.json` completion record; Codex uses child metadata and own-turn start/end events, excluding inherited history. Quiet unfinished work stays active. Token/model accounting remains separate; JSON exposes child-only `subagent_counts` and combined `agent_counts` without history. OpenCode subagent tracking is unavailable.
+- **⁰agents**: Full-width row directly above Sessions; also first in the narrow Work tab. Shows a stacked Claude/Codex braille histogram (OMP and Pi stack in the Codex layer) using the Token rate renderer and theme gradients for concurrent working main agents and subagents (all nesting levels), current provider counts, peak, and a compact Unknown annotation. Each working main session contributes one, including sessions with no children; working descendants contribute independently. Waiting/rate-limited/background main sessions contribute zero themselves. `0` toggles persisted `show_agents` (default true); `g` toggles independent `agent_scope` (default `all_live`, alternative `selected`). History retains timestamped samples for 15 minutes while hidden and after sessions close, with no disk persistence/backfill. Each rendered bucket keeps the provider counts from one simultaneous peak sample. Reserve a three-row summary after essential pane minima, grow Sessions to ideal first, then grow the chart to seven rows. Claude lifecycle uses launch/completion records, child turns, workflow journal `started`/`result`/`failed`, and the run's `workflows/{runId}.json` completion record; Codex uses child metadata and own-turn start/end events, excluding inherited history. Quiet unfinished work stays active. Token/model accounting remains separate; JSON exposes child-only `subagent_counts` and combined `agent_counts` without history. OpenCode subagent tracking is unavailable.
 - **¹context**: Project-labeled per-session context usage bars, percentages, window sizes, and compaction counts. `1` toggles persisted `show_context`.
 - **⁹token rate**: Global token rate braille chart (200-point history) and tokens/min, counting input, output, and cache creation but excluding cache reads. Independent of selection and Tokens/Models stats scope. `9` toggles persisted `show_token_rate`. A missing setting inherits `show_context` for compatibility; fresh configurations enable both. The narrow Usage tab places Token rate beside Context, above Quota, Tokens, and Models. The optional cache-read chart (`C`, persisted `show_cache_read_rate`, default false) appears below the original chart with independent scaling and the theme's cache gradient. Both charts use synchronized per-refresh category deltas and 200-point histories; their numeric tokens/min summaries use timestamped activity from the preceding 60 seconds, retaining observed activity until expiry after sessions close. Reuse is `cache reads / (input + cache reads + cache writes) × 100`, excluding output; show `—` without input-side activity. Short panes retain a cache summary. Enabling it raises the top row's ideal minimum to six rows on desktop and in the narrow graph band, with five-row compact fallback; pane-level controls remain unchanged. It measures token reuse, not dollar savings.
 - **²quota**: Claude + Codex rate limit gauges side-by-side (5h and 7d windows with reset countdown). Quota is intentionally limited to Claude and Codex; do not add an OpenCode row unless OpenCode exposes a reliable account-level provider rate-limit source.
@@ -183,7 +184,15 @@ Rate limits extracted from `token_count` events:
 - Match live PIDs to DB sessions by process cwd. OpenCode does not expose a PID/session mapping, so when multiple DB rows share one cwd, only live PIDs should be assigned and older rows should not be shown as live duplicates.
 - OpenCode contributes session/token/project/port data, but not quota data. Quota remains Claude + Codex only.
 
-### 5. Subagents and workflows: `~/.claude/projects/{path}/{sessionId}/`
+### 5. OMP and Pi sessions: `~/.omp/agent/sessions/`, `~/.pi/agent/sessions/`
+- One collector (`PiCollector`) serves both; `OMP_SPEC` / `PI_SPEC` hold the binary name, dot dir, and env vars.
+- Discover `omp` / `pi` processes via shared `ps` data (`cmd_matches_harness`, which also accepts Pi's npm package entry). Drop a launcher wrapper when its child is also a candidate; skip `__omp_worker_*` and Pi's non-interactive subcommands.
+- Agent dirs: `~/.{omp,pi}/agent`, `{OMP,PI}_CODING_AGENT_DIR`, the parent of `{OMP,PI}_CODING_AGENT_SESSION_DIR` (read from abtop's environment), plus any `<dir>/sessions/` ancestor of an open file.
+- Map PID → transcript, first match wins: open `sessions/<project>/<file>.jsonl`; open lock file (`run/session-owners/<sid>.lock` or `.<file>.jsonl.owner.lock`); `--session` / `--resume` argument; `terminal-sessions/<tty>`; newest unclaimed `.jsonl` in the cwd's session folder. The last step is a guess and can pick another session's file when several share a cwd.
+- Transcript lines: `session` (id, cwd, timestamp), `title` / `title_change`, `model_change`, `thinking_level_change` (effort), `message` with `usage` (`input`, `output`, `cacheRead`, `cacheWrite`) and `contextSnapshot`. Subagents are JSONL files under the folder named after the transcript, minus `.jsonl`.
+- Context % uses `context_window_for_model` (Claude sizes), so it is approximate for non-Claude models. No quota and no memory status.
+
+### 6. Subagents and workflows: `~/.claude/projects/{path}/{sessionId}/`
 - `subagents/agent-{hash}.jsonl` — same JSONL format as main transcript
 - `subagents/agent-{hash}.meta.json` — `{ "agentType": "general-purpose", "description": "..." }`
 - `subagents/workflows/{runId}/agent-{hash}.{jsonl,meta.json}` — agents of a Workflow run (`runId` like `wf_f13c2bf8-4a9`), same format
@@ -199,7 +208,7 @@ Each `pending*` key is omitted when its count is 0, so the latest `turn_duration
 
 Full on-disk reference for background work (launch results, task notifications, completion records, signals that look useful but aren't): [docs/claude-code-background-work.md](./docs/claude-code-background-work.md).
 
-### 6. Process tree: `ps` + `lsof`
+### 7. Process tree: `ps` + `lsof`
 ```bash
 ps -eo pid,ppid,rss,%cpu,command    # All processes
 lsof -i -P -n -sTCP:LISTEN         # Open ports
@@ -207,16 +216,16 @@ lsof -i -P -n -sTCP:LISTEN         # Open ports
 - Build parent→children map from ppid
 - Map listening PID → parent agent PID → session
 
-### 7. Git status per project
+### 8. Git status per project
 ```bash
 git -C {cwd} status --porcelain     # added/modified file counts
 ```
 
-### 8. Memory status
+### 9. Memory status
 - Path: `~/.claude/projects/{encoded-path}/memory/`
 - Count files in directory + lines in `MEMORY.md`
 
-### 9. Rate limit (Claude Code)
+### 10. Rate limit (Claude Code)
 
 NOT in transcript JSONL. Collected via StatusLine mechanism.
 
@@ -236,7 +245,7 @@ File format read by abtop:
 - Account-level metric, shared across all sessions.
 - Show "—" when not configured or data unavailable.
 
-### 10. Other files
+### 11. Other files
 - `~/.claude/stats-cache.json` — daily aggregates. Only updated on `/stats`, NOT real-time.
 - `~/.claude/history.jsonl` — prompt history with sessionId.
 
@@ -254,9 +263,9 @@ Claude Code (`src/collector/claude.rs`), checked in order, first match wins:
 ◌ Wait  = none of the above
 ```
 
-There is no transcript-mtime gate: Claude Code writes an assistant turn atomically, so mtime goes stale during long streamed replies. `◐ Bg` is checked before descendant CPU because a workflow agent's Bash calls are descendants of the session's pid. A Claude session whose pid is gone is dropped, not shown as Done. Codex and OpenCode have their own rules in their collectors and never emit `◐ Bg`. `⏳ Rate` is applied afterwards (`app.rs`) to `Waiting` sessions whose agent is above 90% rate-limit usage.
+There is no transcript-mtime gate: Claude Code writes an assistant turn atomically, so mtime goes stale during long streamed replies. `◐ Bg` is checked before descendant CPU because a workflow agent's Bash calls are descendants of the session's pid. A Claude session whose pid is gone is dropped, not shown as Done. Codex and OpenCode have their own rules in their collectors and never emit `◐ Bg`. OMP and Pi (`pi.rs`) check a pending tool call (`● Exec`), model generation (`◉ Think`), a working subagent (`◐ Bg`), then descendant and own CPU. `⏳ Rate` is applied afterwards (`app.rs`) to `Waiting` sessions whose agent is above 90% rate-limit usage.
 
-**PID reuse risk**: verify PID is still the expected agent process (Claude, Codex, or OpenCode) by checking `ps -p {pid} -o command=`. Don't trust PID alone.
+**PID reuse risk**: verify PID is still the expected agent process (Claude, Codex, OpenCode, OMP, or Pi) by checking `ps -p {pid} -o command=`. Don't trust PID alone.
 
 Current task (2nd line under each session):
 - Exec → last `tool_use` name + first arg (e.g. `Edit src/main.rs`)

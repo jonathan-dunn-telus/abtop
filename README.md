@@ -11,13 +11,14 @@ Claude Code, Codex CLI, OpenCode, OMP, and Pi sessions are discovered from local
 
 This is the [`raphberube/abtop`](https://github.com/raphberube/abtop) fork (`remix` branch). On top of upstream it adds:
 
-- **Agents pane** (`0`, scope `g`): a 15-minute chart of concurrent Claude Code and Codex agents, subagents included.
+- **OMP and Pi sessions**: discovered alongside Claude Code, Codex CLI, and OpenCode, with tokens, context, current task, subagents, and `◐ Bg`.
+- **Agents pane** (`0`, scope `g`): a 15-minute chart of concurrent Claude Code, Codex, OMP, and Pi agents, subagents included.
 - **Token rate** (`9`) and **Context** (`1`) as two independent top-row panes.
 - **Cache-read chart and Reuse %** (`C`): cache reads/min under Token rate, with the share of input-side tokens served from cache.
 - **Models pane** (`8`): per-model lifetime totals, share, and tokens/min.
 - **Per-category rates** in Tokens: Input, Output, CacheR, and CacheW each show tokens/min.
 - **Selected / All live scope** (`a`): Tokens and Models switch between the selected session and every live session.
-- **`◐ Bg` status**: a Claude session whose turn ended while a workflow or background agent keeps working no longer looks like it is waiting on you.
+- **`◐ Bg` status**: a Claude, OMP, or Pi session whose turn ended while a workflow or background agent keeps working no longer looks like it is waiting on you.
 - **Progressive startup**: sessions appear one by one as they are parsed instead of after the full scan.
 - **Token totals exclude cache reads**: totals count input + output + cache writes, and nested Claude subagents and workflow agents are included.
 
